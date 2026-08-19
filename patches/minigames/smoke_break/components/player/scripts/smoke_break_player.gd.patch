@@ -1,0 +1,34 @@
+diff --git a/minigames/smoke_break/components/player/scripts/smoke_break_player.gd b/minigames/smoke_break/components/player/scripts/smoke_break_player.gd
+--- a/minigames/smoke_break/components/player/scripts/smoke_break_player.gd
++++ b/minigames/smoke_break/components/player/scripts/smoke_break_player.gd
+@@ -27,6 +27,9 @@ var manager: SmokeBreakMinigame
+ var player_presence: PlayerPresence
+ 
+ var active_player_seat_index = 0
++# [MP8] 座位 4~7 的死亡动画名（由小游戏按最近邻算好发下来）。
++# 空串 = 原版四个座位之一，走 anim_handler 里那条 match。
++var mp8_death_anim: String = ""
+ 
+ var camera_offset_parent: Node3D
+ var default_camera_position: Vector3
+@@ -305,13 +308,19 @@ func set_player_presence_rpc(network_id: int):
+ 		handle_input = true
+ 
+ @rpc("any_peer", "call_local", "reliable")
+-func setup_rpc(_position: Vector3, _rotation: Vector3, _seat_index: int):
++func setup_rpc(_position: Vector3, _rotation: Vector3, _seat_index: int, _mp8_death_anim: String = ""):
+ 
+ 	global_position = _position
+ 	global_rotation = _rotation
+ 
+ 	active_player_seat_index = _seat_index
+ 
++	# [MP8] 新增座位（4~7）的死亡动画名。anim_handler 里那个 match 只写了 0~3，
++	# 新座位会落进缝里 → `anim_player.play("")`。这里把小游戏算好的名字带过来兜底。
++	# **第 4 个参数带默认值**（照猎鸭 setup_rpc 那次的做法），≤4 人时传空串，
++	# 走原版那条 match，逐值一致。
++	mp8_death_anim = _mp8_death_anim
++
+ 
+ 
+ func _on_paused():

@@ -1,0 +1,851 @@
+diff --git a/minigames/smoke_break/scripts/smoke_break.gd b/minigames/smoke_break/scripts/smoke_break.gd
+--- a/minigames/smoke_break/scripts/smoke_break.gd
++++ b/minigames/smoke_break/scripts/smoke_break.gd
+@@ -28,9 +28,126 @@ var active_players: Array[SmokeBreakPlayer]
+ var finished_players: Array[SmokeBreakPlayer]
+ var player_scores: Dictionary[int, int]
+ 
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] 吸烟小憩 8 人适配 —— 座位 4 → 8（用户 2026-08-17 定：在原弧上插空）
++# ═══════════════════════════════════════════════════════════════════════════
++#
++# ⚠️ **难点不是数组长度，是美术按 4 个固定座位手做了内容。**
++# 全项目按座位下标的手工内容一共**五处**（probe51 + grep 齐）：
++#   ① `trolley.rot_by_seat_index_array`          左轮转向每个座位的**手调角度**
++#   ② `trolley.blood_decals_by_seat_index_array`  每座位一组**手摆血迹**
++#   ③ `trolley.particles_smoke[index]`            每开一枪 index+1，**只有 4 个**
++#   ④ `trolley` 里 `if seat in [1, 2]` 开风扇血迹   **座位号硬编码**
++#   ⑤ `anim_handler` 的 `match seat: 0/3→death_window, 1/2→death_fan` **逐座位死亡动画**
++#
++# ⚠️ **③ 是必崩项，而且原版正好卡在边界上**：每轮前 3 名得分、其余全枪毙。
++#    4 人时最多 4 个败者 = 4 发，正好用满 4 个粒子；**8 人最多 8 发 → 第 5 发就越界**。
++#
++# 原版四个座位（probe51 量的世界坐标，y 都是 3.07）：
++#   座位0 (2.88, 2.20) yaw 0°　座位1 (1.55, 3.42) yaw -60°
++#   座位2 (-0.63, 3.55) yaw -45°　座位3 (2.87, 0.19) yaw +30°
++#
++# **关键发现：`rot_by_seat_index_array` 本身就是"角度坐标"** ——
++# 四个值 +16 / -8.5 / -33 / -55 排下来正好是座位在弧上的空间顺序 3→0→1→2，
++# 相邻差 22~24.5°。所以**不用拟合圆心、也不用反推那套瞄准机构**：
++# 直接拿它当排序键，往最大的角度间隙里插中点，位置/朝向/转角全由两侧邻居插值。
++#
++# 新座位的死亡动画**只能继承最近邻**（做不出新动画，这是明说的代价）。
++const MP8_MAX_PLAYERS: int = 8
++
++# ---- 左轮瞄准：从座位坐标算转角 ----
++#
++# 原版那四个转角是**手调**的，没有公式。用最小二乘从四个 (座位坐标, 转角) 反解出
++# 一组 (枢轴, 齿比, 偏置)，能把原版四个值复现到 **RMS 0.058°**：
++#   座位0 实测 -8.5 → 算出 -8.47　　座位2 实测 -55.0 → 算出 -55.04
++#
++# ⚠️ **但这组参数不是唯一解，别当成"找到了真正的枢轴"。**
++# 4 个点拟 4 个参数，完美拟合是必然的。实测**有 76 个不同枢轴都能拟到 0.5° 以内**，
++# 齿比 k 从 -10.2 到 -2.6 —— 也就是说：
++#   · 在原版四个座位的**角度跨度内**（+16° ~ -55°），所有候选解都穿过那四点 → **可靠**；
++#   · **一出这个跨度就完全不可信**，枪指哪儿算不出来也验证不了。
++# 所以编辑器里超出 [MP8_AIM_MIN, MP8_AIM_MAX] 就报黄灯（用户 2026-08-17 定的处理方式）。
++const MP8_AIM_PIVOT := Vector2(-13.0, -8.0)
++const MP8_AIM_K: float = -4.5126
++const MP8_AIM_C: float = 139.14
++const MP8_AIM_MIN: float = -55.0
++const MP8_AIM_MAX: float = 16.0
++
++const MP8_SEAT_FILE: String = "user://mp8_smoke_seats.txt"
++const MP8_EDIT_STEPS: Array[float] = [0.5, 0.2, 0.05]
++# 新座位配的"椅子"：原版 3 号座位坐的那个木箱（原版根本没有统一的椅子，
++# 四个人分别坐 seat device / ventilation box grate / 木箱 / 平台边沿）。
++# 用户 2026-08-17 定：**只给新座位配木箱，原版四个和它们坐的东西一字不动。**
++const MP8_CRATE_PATH: String = "smoke break near final3/base mesh/crate1_003"
++
++# [MP8] **哪几个座位屁股底下放木箱**（用户 2026-08-17 看过实机定的）：只要 4、5 号两个。
++# ⚠️ 这里是**下标**，面板/牌子上显示的号码是它 +1 —— 即下标 3、4 = 显示的「4 号」「5 号」。
++# 其余座位一律不放：原版那几个本来就坐在场景美术上（seat device / 通风箱 / 平台边沿），
++# 新增的几个用户看过画面后判定不需要。
++# 想换一组：改这一行就行；局内按 X 可以临时删/恢复看效果（不写回文件）。
++const MP8_CRATE_SEATS: Array[int] = [3, 4]
++
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] 座位定稿表（2026-08-19 从房主的 user://mp8_smoke_seats.txt 烘进代码）
++# ═══════════════════════════════════════════════════════════════════════════
++#
++# 🩸 **为什么必须烘**：`_mp8_setup_seats()` 挂在 `_ready()`，**每台机器都跑**，
++# 而它读的存盘文件只存在于用户（房主）那台机器上。烘之前是：
++#   房主 → 读到手摆定稿（8 个座位全按用户摆的）
++#   客机 → 读不到文件 → 走"弧上插空"（原版 4 个不动 + 自动插 4 个）
++# 两边座位、木箱位置全不一样，而日志两边都是干净的。
++# 这正是 2026-08-19 用户在**枪械工厂**报的那个「房主干净、客机路中间有桌子」
++# 的同一条根因（那边另加了房主广播，见 manufacture_gun.gd `_mp8_broadcast_layout()`；
++# 逆向行进早就烘过了，见 escalator_pit.gd 的 `MP8_LAYOUT_BAKED`）。
++#
++# 每行 = [Vector2(x, z), yaw度, 有没有木箱, 木箱位置或 null, 木箱yaw]
++# 与文件格式逐列对应：`x, z, yaw, 有箱(1/0)[, 箱x, 箱y, 箱z, 箱yaw]`。
++# **存盘文件仍然优先**——用户再手摆一次照样立刻生效；
++# 但定稿之后**一定要回来更新这张表**，否则客机看到的又是另一套场地。
++const MP8_SEATS_BAKED: Array = [
++	[Vector2(2.39, 2.70), 0.0, false, null, 0.0],
++	[Vector2(1.55, 3.42), -30.0, false, null, 0.0],
++	[Vector2(-0.63, 3.55), -60.0, false, null, 0.0],
++	[Vector2(3.35, -1.02), 30.0, true, Vector3(3.70, 0.00, -1.61), 113.5],
++	[Vector2(-2.02, 3.57), -60.0, true, Vector3(-1.87, 0.00, 3.90), 113.5],
++	[Vector2(2.95, 1.69), 15.0, false, null, 0.0],
++	[Vector2(0.46, 3.48), -52.5, false, null, 0.0],
++	[Vector2(3.15, 0.41), 22.5, false, null, 0.0],
++]
++
++# ⚠️ 出生点是数组式 @export（P1-C 那三个之一），通用补位会拿凸包点去填它。
++# 这里由本小游戏自己管，所以在**声明处**就立标志（写 _ready() 里可能就晚了）。
++var mp8_owns_spawns: bool = true
++var mp8_player_count: int = 0
++# 座位下标 → 死亡动画名。前 4 项是原版 match 的逐值复制，新座位继承最近邻。
++var mp8_death_anim_by_seat: Array[String] = []
++# 座位下标 → 给它配的木箱（只有 MP8_CRATE_SEATS 点名的那几个有）
++var _mp8_crates: Dictionary = {}
++# 木箱相对屁股的偏移，在任何座位被挪动之前从"原版 3 号座位 ↔ 它坐的那个箱子"量出来
++var _mp8_crate_offset: Vector3 = Vector3.ZERO
++# 局内手调
++var _mp8_edit_on: bool = false
++var _mp8_edit_sel: int = 4          # 只有新座位（4~7）能动，原版四个锁死
++var _mp8_edit_step_i: int = 0
++var _mp8_edit_panel: Label = null
++var _mp8_edit_canvas: CanvasLayer = null
++var _mp8_tags: Array[Label3D] = []
++var _mp8_seat_src: String = "内置弧上插空"
++# [MP8] I/K/J/L 现在挪谁：false = 座位（连人一起）、true = 那个座位的木箱。按 C 切换。
++# 箱子自动算出来的位置未必贴合重排过的座位，所以它也得能手调（用户 2026-08-17）。
++var _mp8_edit_crate: bool = false
++# [MP8] 手调时冻住回合倒计时（round_play_state 每秒查一次这个标志）。
++# 开了手调模式**默认就是暂停的** —— 不然人还没摆完这一轮就结束了。按 P 切换。
++var mp8_edit_paused: bool = false
++
++
+ func _ready() -> void :
+ 	super._ready()
+ 
++	# [MP8] 必须跑在 spawn_players() 之前：座位下标 = `counter` = 出生点数组下标，
++	# 三者同源，数组不够长第 5 个人就越界。
++	_mp8_setup_seats()
++
+ 	round_play_state.timer_updated.connect(_on_timer_updated)
+ 
+ 	if multiplayer.is_server():
+@@ -82,6 +199,694 @@ func all_players_loaded():
+ 	is_all_player_loaded = true
+ 	minigame_ready.emit(multiplayer.get_unique_id())
+ 
++# [MP8] 在原弧上插空，把 4 个座位补到 8 个。
++#
++# **原版那 4 个座位保持下标 0~3、节点一个字节不碰** —— 新座位一律追加在 4~7。
++# 空间上它们是插在中间的，但**数组下标是追加的**，所以原版四个的
++# rot / 血迹 / 死亡动画全部原样对得上，≤4 人局逐值一致。
++func _mp8_setup_seats() -> void :
++
++	var args := Array(OS.get_cmdline_args())
++	mp8_player_count = PlayerManager.player_presences.size()
++	_mp8_edit_on = args.has("mp8smokeedit")
++
++	var trolley: Node = _mp8_find_trolley()
++	var rots: Array = []
++	if trolley != null:
++		var r = trolley.get("rot_by_seat_index_array")
++		if r is Array:
++			rots = (r as Array).duplicate()
++
++	print("[MP8] 吸烟小憩：运行时真值 —— 座位 %d 个 / 左轮转角 %d 项 / 烟雾粒子 %d 个；本局 %d 人" % [
++		player_spawn_positions.size(), rots.size(),
++		(trolley.get("particles_smoke") as Array).size() if trolley != null else -1,
++		mp8_player_count,
++	])
++
++	# 原版那 4 个的死亡动画：逐值复制 anim_handler 里那个 match，别改语义
++	mp8_death_anim_by_seat = ["death_window", "death_fan", "death_fan", "death_window"]
++
++	# [MP8] 木箱相对屁股的偏移，**必须在任何座位被挪动之前量**。
++	# 原版 3 号座位坐的就是这个箱子，所以"箱子该摆在人下面多少"从那一对量出来。
++	var _src_crate: Node3D = get_node_or_null(MP8_CRATE_PATH) as Node3D
++	if _src_crate != null and player_spawn_positions.size() >= 4:
++		_mp8_crate_offset = _src_crate.global_position - player_spawn_positions[3].global_position
++
++	if args.has("mp8noexpand"):
++		print("[MP8] 吸烟小憩：mp8noexpand，座位一个字不改（纯原版对照组，⚠️ 必须配 4 人）")
++		return
++
++	if mp8_player_count <= 4:
++		print("[MP8] 吸烟小憩：%d 人，用原版 4 个座位，一个字不改" % mp8_player_count)
++		return
++
++	if trolley == null or rots.size() != player_spawn_positions.size():
++		push_warning("[MP8] 吸烟小憩：找不到推车、或转角表与座位数对不上（%d vs %d），座位没扩" % [
++			rots.size(), player_spawn_positions.size()
++		])
++		return
++
++	var want: int = mini(maxi(mp8_player_count, 5), MP8_MAX_PLAYERS)
++	var parent: Node3D = player_spawn_positions[0].get_parent() as Node3D
++	if parent == null:
++		push_warning("[MP8] 吸烟小憩：座位没有父节点，扩不了")
++		return
++
++	# 弧上的现有座位：(角度, 位置, yaw)。角度直接用左轮转角 —— 它就是角度坐标。
++	var arc: Array = []
++	for i in player_spawn_positions.size():
++		arc.append({
++			"deg": float((rots[i] as Vector3).x),
++			"pos": player_spawn_positions[i].global_position,
++			"yaw": player_spawn_positions[i].global_rotation.y,
++		})
++
++	var added := PackedStringArray()
++
++	# ---- 存盘文件优先：用户手摆过就用他摆的，没有文件就走**内置定稿表** ----
++	#
++	# ⚠️ 2026-08-19 起，没有存盘文件时回退的是 `MP8_SEATS_BAKED` 而**不是**弧上插空
++	# —— 存盘文件只在房主机器上，客机走的永远是这条，两边必须摆出同一套场地。
++	# 只有传 `mp8smokenofile` 才回到纯自动的弧上插空。
++	#
++	# ⚠️ 文件现在覆盖**全部 8 个座位**（用户 2026-08-17 改判：八个都能调），
++	# 所以前 4 行是**把原版那 4 个节点挪过去**，不是新建。
++	# ≤4 人时这整段不跑（上面已经 return），所以"4 人局与原版逐值一致"仍然成立。
++	var saved: Array = ([] if args.has("mp8smokenofile") else _mp8_load_seats())
++	if saved.size() >= want:
++		var y0: float = player_spawn_positions[0].global_position.y
++		for i in want:
++			var s: Dictionary = saved[i]
++			var sp: Vector2 = s["pos"]
++			var pos3 := Vector3(sp.x, y0, sp.y)
++			var yaw3: float = deg_to_rad(float(s["yaw"]))
++
++			var mk: Node3D
++			if i < player_spawn_positions.size():
++				mk = player_spawn_positions[i]      # 原版那 4 个：挪过去，不新建
++			else:
++				mk = Marker3D.new()
++				mk.name = "MP8Seat%d" % i
++				parent.add_child(mk)
++				player_spawn_positions.append(mk)
++			mk.global_position = pos3
++			mk.global_rotation = Vector3(0.0, yaw3, 0.0)
++
++			var d0: float = _mp8_aim_for(pos3)
++			if i < rots.size():
++				rots[i] = Vector3(d0, 0.0, 0.0)
++			else:
++				rots.append(Vector3(d0, 0.0, 0.0))
++
++			if i >= mp8_death_anim_by_seat.size():
++				mp8_death_anim_by_seat.append(_mp8_nearest_vanilla_anim(pos3))
++
++			added.append("座位%d(%.2f,%.2f) 转角%.1f°%s" % [
++				i + 1, pos3.x, pos3.z, d0, ("" if _mp8_aim_ok(d0) else "⚠超范围")])
++
++	# 文件不够或没有 → 剩下的用弧上插空补齐
++	while player_spawn_positions.size() < want:
++
++		arc.sort_custom(func(a, b): return a["deg"] < b["deg"])
++
++		# 挑角度间隙最大的一对，插中点
++		var bi: int = 0
++		var bw: float = -1.0
++		for i in arc.size() - 1:
++			var w: float = arc[i + 1]["deg"] - arc[i]["deg"]
++			if w > bw:
++				bw = w
++				bi = i
++		if bw <= 0.001:
++			push_warning("[MP8] 吸烟小憩：弧上没有可插的间隙了，停在 %d 个座位" % player_spawn_positions.size())
++			break
++
++		var a: Dictionary = arc[bi]
++		var b: Dictionary = arc[bi + 1]
++		var mid_pos: Vector3 = (a["pos"] as Vector3).lerp(b["pos"] as Vector3, 0.5)
++		# yaw 用 lerp_angle 走最短弧 —— 原版 yaw 沿弧不是单调的（-60 之后是 -45），
++		# 直接线性插会绕远路
++		var mid_yaw: float = lerp_angle(float(a["yaw"]), float(b["yaw"]), 0.5)
++		# 转角从**坐标**算，不再取两侧中点 —— 这样用户把座位手动挪到任意位置后，
++		# 转角能跟着重算（取中点的话一挪就失效了）。
++		var mid_deg: float = _mp8_aim_for(mid_pos)
++
++		var idx: int = player_spawn_positions.size()
++		var m := Marker3D.new()
++		m.name = "MP8Seat%d" % idx
++		parent.add_child(m)
++		m.global_position = mid_pos
++		m.global_rotation = Vector3(0.0, mid_yaw, 0.0)
++		player_spawn_positions.append(m)
++
++		# 左轮转角：同样取中点。**这一步是整套方案成立的关键** ——
++		# 因为转角和弧上方位是线性相关的（原版四个值实测如此），
++		# 所以插值出来的角度就是"真的瞄准了那个新座位"，不用反推瞄准机构。
++		rots.append(Vector3(mid_deg, 0.0, 0.0))
++
++		# 死亡动画：继承**空间上最近**的原版座位（做不出新动画，这是代价）
++		mp8_death_anim_by_seat.append(_mp8_nearest_vanilla_anim(mid_pos))
++
++		arc.append({"deg": mid_deg, "pos": mid_pos, "yaw": mid_yaw})
++		added.append("座位%d(%.2f,%.2f) 转角%.1f° %s" % [
++			idx, mid_pos.x, mid_pos.z, mid_deg, mp8_death_anim_by_seat[idx]
++		])
++
++	# [MP8] 木箱统一在这儿放 —— 等**所有座位都摆到最终位置之后**再放，
++	# 而且只给 MP8_CRATE_SEATS 点名的那几个（现在是 4、5 号）。
++	# 放在这里而不是建座位的循环里，是因为原版那几个座位不走那个循环，
++	# 而 4 号恰好就是原版座位之一。
++	for ci in MP8_CRATE_SEATS:
++		if ci < 0 or ci >= player_spawn_positions.size():
++			continue
++		_mp8_make_crate(ci, player_spawn_positions[ci].global_position)
++		# 文件里存过手调位置就照文件摆（否则会被自动偏移盖回去）
++		var cr = _mp8_crates.get(ci)
++		if cr != null and is_instance_valid(cr) and ci < saved.size():
++			var srow: Dictionary = saved[ci]
++			if srow.has("crate_pos"):
++				(cr as Node3D).global_position = srow["crate_pos"]
++				(cr as Node3D).global_rotation = Vector3(
++					0.0, deg_to_rad(float(srow.get("crate_yaw", 0.0))), 0.0)
++
++	# 把扩好的表交回推车（血迹在那边复制，它才有那些节点）
++	if trolley.has_method("mp8_extend_seat_arrays"):
++		trolley.call("mp8_extend_seat_arrays", rots, player_spawn_positions)
++	else:
++		push_warning("[MP8] 吸烟小憩：推车没有 mp8_extend_seat_arrays，转角/血迹没扩 —— 补丁没打全？")
++
++	print("[MP8] 吸烟小憩：座位 4 → %d（来源 %s）—— %s" % [
++		player_spawn_positions.size(), _mp8_seat_src, " | ".join(added)
++	])
++
++	if _mp8_edit_on:
++		_mp8_edit_begin()
++
++
++# ---- 存盘文件：只存**新座位**（4~7）的 x, z, yaw；原版四个不进文件 ----
++
++func _mp8_load_seats() -> Array :
++	# ⚠️ 没有存盘文件时**不是**回退到"弧上插空"，而是回退到定稿表 MP8_SEATS_BAKED。
++	# 客机永远走这条 —— 存盘文件只在房主机器上。要纯自动布局请传 mp8smokenofile。
++	if not FileAccess.file_exists(MP8_SEAT_FILE):
++		return _mp8_baked_seats()
++	var f := FileAccess.open(MP8_SEAT_FILE, FileAccess.READ)
++	if f == null:
++		push_warning("[MP8] 吸烟小憩：打不开 %s，用内置定稿表" % MP8_SEAT_FILE)
++		return _mp8_baked_seats()
++	var rows: Array = []
++	while not f.eof_reached():
++		var line: String = f.get_line().strip_edges()
++		if line.is_empty() or line.begins_with("#"):
++			continue
++		var c: PackedStringArray = line.split(",", false)
++		if c.size() < 3:
++			continue
++		var sx: String = c[0].strip_edges()
++		var sz: String = c[1].strip_edges()
++		var sy: String = c[2].strip_edges()
++		if not (sx.is_valid_float() and sz.is_valid_float() and sy.is_valid_float()):
++			continue
++		# 第 4 列（有没有木箱）是后加的，老文件没有就默认有
++		var has: bool = true
++		if c.size() >= 4 and c[3].strip_edges().is_valid_int():
++			has = (int(c[3].strip_edges()) != 0)
++		var row := {"pos": Vector2(float(sx), float(sz)), "yaw": float(sy), "crate": has}
++		# 第 5~8 列是**手调过的箱子位置**（x, y, z, yaw）。有就用，没有就走自动偏移。
++		if c.size() >= 8:
++			var cx: String = c[4].strip_edges()
++			var cy: String = c[5].strip_edges()
++			var cz: String = c[6].strip_edges()
++			var cw: String = c[7].strip_edges()
++			if cx.is_valid_float() and cy.is_valid_float() and cz.is_valid_float() and cw.is_valid_float():
++				row["crate_pos"] = Vector3(float(cx), float(cy), float(cz))
++				row["crate_yaw"] = float(cw)
++		rows.append(row)
++	f.close()
++
++	_mp8_seat_src = "存盘文件 %s" % MP8_SEAT_FILE
++
++	# ⚠️ 格式变过一次：老版本只存**新增的 4 个**座位，新版本存**全部 8 个**。
++	# 行数不到 8 行的一律当老文件丢掉 —— 拿 4 行去填 8 个座位会整体错位，
++	# 那种错位在画面上看着像"座位乱跳"，很难联想到是文件格式。
++	if rows.size() > 0 and rows.size() < MP8_MAX_PLAYERS:
++		push_warning("[MP8] 吸烟小憩：%s 只有 %d 行（旧格式，现在要 8 行），已忽略，用内置定稿表" % [
++			MP8_SEAT_FILE, rows.size()
++		])
++		print("[MP8] 吸烟小憩：座位文件是旧格式（%d 行），已忽略。重新摆一遍按 0 存盘即可覆盖。" % rows.size())
++		return _mp8_baked_seats()
++
++	if rows.is_empty():
++		# 文件在但一行有效数据都没有（被清空 / 全是注释）→ 也走定稿表，
++		# 不能掉回"弧上插空"：那样这台机器又和别人不一样了。
++		push_warning("[MP8] 吸烟小憩：%s 里没有有效行，用内置定稿表" % MP8_SEAT_FILE)
++		return _mp8_baked_seats()
++
++	return rows
++
++
++# [MP8] 定稿表 → 和 _mp8_load_seats() 一模一样的行结构。
++# **客机走的就是这条**（它们没有房主那份存盘文件），所以这张表必须与房主的文件一致。
++func _mp8_baked_seats() -> Array :
++
++	_mp8_seat_src = "内置定稿表 MP8_SEATS_BAKED"
++	var rows: Array = []
++	for r in MP8_SEATS_BAKED:
++		var row := {"pos": r[0] as Vector2, "yaw": float(r[1]), "crate": bool(r[2])}
++		if r[3] != null:
++			row["crate_pos"] = r[3] as Vector3
++			row["crate_yaw"] = float(r[4])
++		rows.append(row)
++	return rows
++
++
++func _mp8_save_seats() -> bool :
++	var f := FileAccess.open(MP8_SEAT_FILE, FileAccess.WRITE)
++	if f == null:
++		push_warning("[MP8] 吸烟小憩：写不了 %s" % MP8_SEAT_FILE)
++		return false
++	f.store_line("# 吸烟小憩（mp8game=4）座位表 —— **8 行，座位 1~8 各一行**")
++	f.store_line("# 每行 = x, z, yaw(度), 有没有木箱(1/0)")
++	f.store_line("# ⚠️ 只在 5 人及以上生效；≤4 人一律用原版那 4 个座位，一个字节不动。")
++	f.store_line("# ⚠️ 左轮转角是从坐标算的，只在原版四个座位的角度跨度内可靠：")
++	f.store_line("#    算出来要落在 %.0f° ~ %.0f° 之间，出了这个范围枪会瞄不准（编辑器里报黄灯）。" % [
++		MP8_AIM_MIN, MP8_AIM_MAX])
++	f.store_line("# 木箱只有新增座位才有（原版四个坐的是场景美术，删不掉也加不上）。")
++	f.store_line("# 删掉这个文件 = 回到内置的「弧上插空」。")
++	f.store_line("# 存于 %s" % Time.get_datetime_string_from_system())
++	f.store_line("")
++	for i in player_spawn_positions.size():
++		var n: Node3D = player_spawn_positions[i]
++		var crate = _mp8_crates.get(i)
++		var has: int = 0
++		var line: String = "%.2f, %.2f, %.1f" % [
++			n.global_position.x, n.global_position.z, rad_to_deg(n.global_rotation.y)
++		]
++		if crate != null and is_instance_valid(crate) and (crate as Node3D).visible:
++			has = 1
++			var c3: Node3D = crate
++			# 箱子的**绝对位置**也一起存（含高度）—— 它是手调的，
++			# 不能靠"座位 + 固定偏移"反算，否则下次开局又回到自动位置
++			line += ", 1, %.2f, %.2f, %.2f, %.1f" % [
++				c3.global_position.x, c3.global_position.y, c3.global_position.z,
++				rad_to_deg(c3.global_rotation.y)
++			]
++		else:
++			line += ", %d" % has
++		f.store_line(line)
++	f.close()
++	print("[MP8] 吸烟小憩：座位已存盘 → %s" % ProjectSettings.globalize_path(MP8_SEAT_FILE))
++	return true
++
++
++# ---- 局内手调（mp8smokeedit / play.ps1 -SmokeEdit）----
++
++func _mp8_edit_begin() -> void :
++
++	if player_spawn_positions.size() <= 4:
++		_mp8_edit_on = false
++		return
++
++	var lbl := Label.new()
++	lbl.name = "MP8SmokeEditPanel"
++	lbl.set_anchors_preset(Control.PRESET_BOTTOM_LEFT)
++	lbl.offset_left = 16.0
++	lbl.offset_top = -150.0
++	lbl.offset_right = 980.0
++	lbl.offset_bottom = -8.0
++	var f = load("res://fonts/Terminal F4.ttf")
++	if f != null:
++		lbl.add_theme_font_override("font", f)
++	lbl.add_theme_font_size_override("font_size", 20)
++	lbl.add_theme_color_override("font_color", Color(0.6, 0.95, 1.0))
++	lbl.add_theme_color_override("font_outline_color", Color.BLACK)
++	lbl.add_theme_constant_override("outline_size", 6)
++	lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
++	if _mp8_edit_canvas == null:
++		_mp8_edit_canvas = CanvasLayer.new()
++		_mp8_edit_canvas.layer = 100
++		add_child(_mp8_edit_canvas)
++	_mp8_edit_canvas.add_child(lbl)
++	_mp8_edit_panel = lbl
++
++	# 每个座位头顶挂号码牌 —— 座位是 Marker3D，看不见的
++	for i in player_spawn_positions.size():
++		var tag := Label3D.new()
++		tag.name = "MP8SeatTag"
++		tag.billboard = BaseMaterial3D.BILLBOARD_ENABLED
++		tag.font_size = 90
++		tag.outline_size = 20
++		tag.outline_modulate = Color.BLACK
++		tag.no_depth_test = true
++		if f != null:
++			tag.font = f
++		player_spawn_positions[i].add_child(tag)
++		tag.position = Vector3(0.0, 1.6, 0.0)
++		_mp8_tags.append(tag)
++
++	_mp8_edit_sel = 4
++	# 一开就先把倒计时冻住，给足摆位时间；按 P 放行
++	mp8_edit_paused = true
++	_mp8_edit_refresh()
++	print("[MP8] 吸烟小憩：座位手调已开 —— 可调 %d~%d（原版 0~3 锁死），回合倒计时已暂停（P 键继续）" % [
++		4, player_spawn_positions.size() - 1
++	])
++
++
++func _unhandled_key_input(event: InputEvent) -> void :
++
++	if not _mp8_edit_on or player_spawn_positions.size() <= 4:
++		return
++	var key := event as InputEventKey
++	if key == null or not key.pressed or key.echo:
++		return
++
++	var step: float = MP8_EDIT_STEPS[_mp8_edit_step_i]
++	var n: Node3D = player_spawn_positions[_mp8_edit_sel]
++
++	match key.keycode:
++		KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8:
++			# [MP8] 数字 1~8 对应座位下标 0~7，**面板和头顶牌子也一律显示 1~8**。
++			# 之前是"按键 5~8 → 牌子写 4~7"，错位一格，用户已经被坑过一次。
++			var want: int = key.keycode - KEY_1
++			if want >= player_spawn_positions.size():
++				return
++			_mp8_edit_sel = want
++			_mp8_edit_refresh()
++
++		KEY_X:
++			# 删掉/恢复当前座位的木箱（用户 2026-08-17：有的座位不要箱子）
++			mp8_toggle_crate_rpc.rpc(_mp8_edit_sel)
++
++		KEY_C:
++			# 切换 I/K/J/L 挪谁：座位（连人）还是那个座位的木箱
++			var cr0 = _mp8_crates.get(_mp8_edit_sel)
++			if cr0 == null or not is_instance_valid(cr0):
++				print("[MP8] 吸烟小憩：座位 %d 没有木箱，切不过去" % (_mp8_edit_sel + 1))
++				return
++			_mp8_edit_crate = not _mp8_edit_crate
++			_mp8_edit_refresh()
++
++		KEY_I, KEY_K, KEY_J, KEY_L:
++			var dir: Vector2 = _mp8_screen_axis(key.keycode)
++			if dir == Vector2.ZERO:
++				return
++			if _mp8_edit_crate:
++				var cr1 = _mp8_crates.get(_mp8_edit_sel)
++				if cr1 == null or not is_instance_valid(cr1):
++					return
++				var cp := (cr1 as Node3D).global_position
++				mp8_move_crate_rpc.rpc(_mp8_edit_sel,
++					Vector3(cp.x + dir.y * step, cp.y, cp.z + dir.x * step),
++					rad_to_deg((cr1 as Node3D).global_rotation.y))
++			else:
++				var p := n.global_position
++				mp8_move_seat_rpc.rpc(_mp8_edit_sel,
++					Vector2(p.x + dir.y * step, p.z + dir.x * step),
++					rad_to_deg(n.global_rotation.y))
++
++		KEY_U, KEY_O:
++			var d: float = (-15.0 if key.keycode == KEY_U else 15.0)
++			if _mp8_edit_crate:
++				var cr2 = _mp8_crates.get(_mp8_edit_sel)
++				if cr2 == null or not is_instance_valid(cr2):
++					return
++				mp8_move_crate_rpc.rpc(_mp8_edit_sel,
++					(cr2 as Node3D).global_position,
++					rad_to_deg((cr2 as Node3D).global_rotation.y) + d)
++			else:
++				mp8_move_seat_rpc.rpc(_mp8_edit_sel,
++					Vector2(n.global_position.x, n.global_position.z),
++					rad_to_deg(n.global_rotation.y) + d)
++
++		KEY_Y:
++			# 箱子高低（原版箱子是坐在地上的，重排座位后可能需要抬一点）
++			if not _mp8_edit_crate:
++				return
++			var cr3 = _mp8_crates.get(_mp8_edit_sel)
++			if cr3 == null or not is_instance_valid(cr3):
++				return
++			var q := (cr3 as Node3D).global_position
++			mp8_move_crate_rpc.rpc(_mp8_edit_sel,
++				Vector3(q.x, q.y + (step if key.shift_pressed else - step), q.z),
++				rad_to_deg((cr3 as Node3D).global_rotation.y))
++
++		KEY_M:
++			_mp8_edit_step_i = (_mp8_edit_step_i + 1) % MP8_EDIT_STEPS.size()
++			_mp8_edit_refresh()
++
++		KEY_P:
++			# 倒计时暂停/继续。⚠️ 必须走 RPC：计时循环只在**服务器**上跑，
++			# 改本地标志对它毫无影响（残骸平台落石那条坑同一个形状）。
++			mp8_set_pause_rpc.rpc(not mp8_edit_paused)
++
++		KEY_0:
++			var ok: bool = _mp8_save_seats()
++			_mp8_edit_refresh()
++			if _mp8_edit_panel != null:
++				_mp8_edit_panel.text = ("【已存盘】下次开局自动用这套座位\n" if ok
++					else "【存盘失败】看日志\n") + _mp8_edit_panel.text
++
++		KEY_N:
++			var parts := PackedStringArray()
++			for i in range(4, player_spawn_positions.size()):
++				var q := player_spawn_positions[i].global_position
++				parts.append("座位%d(%.2f,%.2f) 转角%.1f°" % [
++					i, q.x, q.z, _mp8_aim_for(q)])
++			print("[MP8] 吸烟小憩座位报告：%s" % " | ".join(parts))
++
++		_:
++			return
++
++	get_viewport().set_input_as_handled()
++
++
++func _mp8_screen_axis(code: int) -> Vector2 :
++	var cam: Camera3D = get_viewport().get_camera_3d()
++	if cam == null:
++		return Vector2.ZERO
++	var right: Vector3 = cam.global_transform.basis.x
++	var fwd: Vector3 = - cam.global_transform.basis.z
++	var r2 := Vector2(right.x, right.z)
++	var f2 := Vector2(fwd.x, fwd.z)
++	if r2.length() < 0.001 or f2.length() < 0.001:
++		return Vector2.ZERO
++	r2 = r2.normalized()
++	f2 = f2.normalized()
++	match code:
++		KEY_L: return Vector2(r2.y, r2.x)
++		KEY_J: return - Vector2(r2.y, r2.x)
++		KEY_I: return Vector2(f2.y, f2.x)
++		KEY_K: return - Vector2(f2.y, f2.x)
++	return Vector2.ZERO
++
++
++# [MP8] any_peer + call_local：8 台机器一起挪（座位标记、木箱、号码牌都是各机本地节点）。
++@rpc("any_peer", "call_local", "reliable")
++func mp8_move_seat_rpc(slot: int, pos: Vector2, yaw_deg: float) -> void :
++
++	# [MP8] 用户 2026-08-17 改判：**八个座位的位置和朝向都可以调**（原来只放开 4~7）。
++	# ≤4 人时这套自定义布局整段不跑，所以"4 人局与原版一致"仍然成立 —— 靠的是
++	# `_mp8_setup_seats()` 里那条人数判断，不再靠"锁死原版座位"。
++	if slot < 0 or slot >= player_spawn_positions.size():
++		return
++	var n: Node3D = player_spawn_positions[slot]
++	if n == null or not is_instance_valid(n):
++		return
++
++	var old: Vector3 = n.global_position
++	n.global_position = Vector3(pos.x, old.y, pos.y)
++	n.global_rotation = Vector3(0.0, deg_to_rad(yaw_deg), 0.0)
++
++	# ⚠️ **木箱不跟着走**（用户 2026-08-17 定：箱子位置固定，人自己往箱子上摆）。
++	# 原来是挪座位带着箱子一起动，现在箱子建好就钉死。
++
++	# [MP8] 让**坐在这个座位上的人**跟着一起挪 —— 光看一个号码牌摆不准，
++	# 要看见人坐过去才知道挤不挤、朝向对不对（用户 2026-08-17 要求）。
++	#
++	# ⚠️ 只有服务器发这一步：`setup_rpc` 本身是 RPC，
++	# 在广播 RPC 的处理函数里再发一次，8 台机器会各广播一遍（风暴）。
++	if multiplayer.is_server():
++		for p in players_node_parent.get_children():
++			if not (p is SmokeBreakPlayer):
++				continue
++			if (p as SmokeBreakPlayer).active_player_seat_index != slot:
++				continue
++			p.setup_rpc.rpc(
++				n.global_position, n.global_rotation, slot,
++				(mp8_death_anim_by_seat[slot] if slot < mp8_death_anim_by_seat.size() else "")
++			)
++			break
++
++	# 转角跟着重算，并交回推车
++	var trolley: Node = _mp8_find_trolley()
++	if trolley != null:
++		var rots = trolley.get("rot_by_seat_index_array")
++		if rots is Array and slot < (rots as Array).size():
++			var arr: Array[Vector3] = []
++			for r in (rots as Array):
++				arr.append(r as Vector3)
++			arr[slot] = Vector3(_mp8_aim_for(n.global_position), 0.0, 0.0)
++			trolley.set("rot_by_seat_index_array", arr)
++
++	_mp8_edit_refresh()
++
++
++# [MP8] 挪某个座位的木箱（位置 + 朝向）。箱子是各机本地的场景节点，所以广播到每台。
++@rpc("any_peer", "call_local", "reliable")
++func mp8_move_crate_rpc(slot: int, pos: Vector3, yaw_deg: float) -> void :
++
++	var crate = _mp8_crates.get(slot)
++	if crate == null or not is_instance_valid(crate):
++		return
++	(crate as Node3D).global_position = pos
++	(crate as Node3D).global_rotation = Vector3(0.0, deg_to_rad(yaw_deg), 0.0)
++	_mp8_edit_refresh()
++
++
++# [MP8] 删/恢复某个座位的木箱。箱子是各机本地的场景节点，所以广播到每台。
++# 用 visible 而不是 queue_free：这样能来回切，摆错了不用重开一局。
++@rpc("any_peer", "call_local", "reliable")
++func mp8_toggle_crate_rpc(slot: int) -> void :
++
++	var crate = _mp8_crates.get(slot)
++	if crate == null or not is_instance_valid(crate):
++		print("[MP8] 吸烟小憩：座位 %d 本来就没有木箱（原版座位坐的是场景美术）" % (slot + 1))
++		_mp8_edit_refresh()
++		return
++
++	(crate as Node3D).visible = not (crate as Node3D).visible
++	print("[MP8] 吸烟小憩：座位 %d 的木箱 %s" % [
++		slot + 1, ("显示" if (crate as Node3D).visible else "隐藏")
++	])
++	_mp8_edit_refresh()
++
++
++# [MP8] 暂停/继续回合倒计时。计时循环在服务器上，所以广播到每台（call_local）。
++@rpc("any_peer", "call_local", "reliable")
++func mp8_set_pause_rpc(paused: bool) -> void :
++	mp8_edit_paused = paused
++	_mp8_edit_refresh()
++	print("[MP8] 吸烟小憩：回合倒计时 %s" % ("已暂停" if paused else "继续"))
++
++
++func _mp8_edit_refresh() -> void :
++
++	for i in _mp8_tags.size():
++		var t: Label3D = _mp8_tags[i]
++		if t == null or not is_instance_valid(t):
++			continue
++		# [MP8] 一律显示 1~8，和按键 1~8 对上（之前牌子 0~7、按键 5~8，错位一格）
++		var sel: bool = (i == _mp8_edit_sel)
++		t.text = ("▼%d▼" % (i + 1)) if sel else str(i + 1)
++		t.modulate = (Color(1.0, 0.85, 0.2) if sel else Color(0.55, 0.75, 0.85))
++
++	if _mp8_edit_panel == null:
++		return
++
++	var n: Node3D = player_spawn_positions[_mp8_edit_sel]
++	var p := n.global_position
++	var aim: float = _mp8_aim_for(p)
++	var ok: bool = _mp8_aim_ok(aim)
++
++	# 离最近的另一个座位多远（"太挤"就是这个数太小）
++	var gap: float = INF
++	for i in player_spawn_positions.size():
++		if i == _mp8_edit_sel:
++			continue
++		gap = minf(gap, Vector2(p.x - player_spawn_positions[i].global_position.x,
++			p.z - player_spawn_positions[i].global_position.z).length())
++
++	var crate = _mp8_crates.get(_mp8_edit_sel)
++	var crate_txt: String = "无箱子（原版座位）"
++	if crate != null and is_instance_valid(crate):
++		crate_txt = ("有箱子" if (crate as Node3D).visible else "箱子已删")
++
++	var cr_now = _mp8_crates.get(_mp8_edit_sel)
++	var target: String = "▶ 正在调【座位/人】"
++	var line2: String = "位置 x=%.2f z=%.2f  朝向 %.0f°   离最近的座位 %.2f 米 %s" % [
++		p.x, p.z, rad_to_deg(n.global_rotation.y), gap, ("✓" if gap >= 0.9 else "⚠挤")]
++	if _mp8_edit_crate and cr_now != null and is_instance_valid(cr_now):
++		var c3: Node3D = cr_now
++		target = "▶ 正在调【木箱】"
++		line2 = "箱子 x=%.2f y=%.2f z=%.2f  朝向 %.0f°   （人在 %.2f, %.2f）" % [
++			c3.global_position.x, c3.global_position.y, c3.global_position.z,
++			rad_to_deg(c3.global_rotation.y), p.x, p.z]
++
++	_mp8_edit_panel.text = "\n".join([
++		"【手调】座位 %d / 共 %d   %s   步长 %.2f 米   %s   来源 %s" % [
++			_mp8_edit_sel + 1, player_spawn_positions.size(), target,
++			MP8_EDIT_STEPS[_mp8_edit_step_i], crate_txt, _mp8_seat_src],
++		line2,
++		"左轮转角 %.1f°  %s" % [aim,
++			("✓ 在原版跨度内，瞄得准" if ok
++			else "⚠️ 超出原版跨度 %.0f°~%.0f°，这个角度**算不准**，枪可能瞄空" % [
++				MP8_AIM_MIN, MP8_AIM_MAX])],
++		"倒计时 %s   1~8 选座位  C 切换调人/调箱子  I/K/J/L 挪  U/O 转  Y 箱子升降(Shift 抬)  M 步长  X 删箱子  P 暂停  0 存盘" % [
++			("⏸ 已暂停" if mp8_edit_paused else "▶ 走着")],
++	])
++
++
++# [MP8] 座位坐标 → 左轮转角。见上面 MP8_AIM_* 那段说明（含"这不是唯一解"的警告）。
++func _mp8_aim_for(pos: Vector3) -> float :
++	var b: float = rad_to_deg(atan2(pos.z - MP8_AIM_PIVOT.y, pos.x - MP8_AIM_PIVOT.x))
++	return MP8_AIM_K * b + MP8_AIM_C
++
++
++# 这个角度还在原版四个座位的跨度内吗（在 = 可靠，出 = 算不准）
++func _mp8_aim_ok(deg: float) -> bool :
++	return deg >= MP8_AIM_MIN - 0.5 and deg <= MP8_AIM_MAX + 0.5
++
++
++# [MP8] 给新座位配一个木箱当椅子（原版四个座位坐的三件道具一字不动）。
++# 复制 3 号座位那个木箱，摆到新座位脚下 —— 用**相对 3 号座位的偏移**放，
++# 这样箱子和人的相对位置和原版一样（不用知道箱子的绝对高度）。
++func _mp8_make_crate(seat_idx: int, seat_pos: Vector3) -> void :
++
++	# 只给点名的那几个座位放箱子
++	if not MP8_CRATE_SEATS.has(seat_idx):
++		return
++
++	var src: Node3D = get_node_or_null(MP8_CRATE_PATH) as Node3D
++	if src == null:
++		push_warning("[MP8] 吸烟小憩：找不到木箱 %s，座位 %d 没有箱子" % [MP8_CRATE_PATH, seat_idx + 1])
++		return
++
++	var dup: Node3D = src.duplicate()
++	dup.name = "MP8Crate%d" % seat_idx
++	src.get_parent().add_child(dup)
++	# ⚠️ 偏移量必须用**原版座位 3 还没被挪之前**的位置算（`_mp8_crate_offset`）。
++	# 这个箱子原本就是原版 3 号座位坐的那个，"箱子相对屁股的位置"从那儿量。
++	# 要是拿挪过之后的座位去算，箱子会整体偏掉 —— 而且偏多少取决于用户挪了多远，
++	# 看起来像"箱子随机乱跑"，很难联想到是参考系取错了。
++	dup.global_position = seat_pos + _mp8_crate_offset
++	_mp8_crates[seat_idx] = dup
++
++
++# 新座位挨着哪个原版座位，就用哪个的死亡动画（window / fan）
++func _mp8_nearest_vanilla_anim(p: Vector3) -> String :
++	var best: int = 0
++	var bd: float = INF
++	for i in mini(4, player_spawn_positions.size()):
++		var d: float = p.distance_to(player_spawn_positions[i].global_position)
++		if d < bd:
++			bd = d
++			best = i
++	return mp8_death_anim_by_seat[best]
++
++
++func _mp8_find_trolley() -> Node :
++	# 推车管理器挂在 `trolley gun main parent/trolley gun manager`（probe51 量的）
++	var t: Node = get_node_or_null("trolley gun main parent/trolley gun manager")
++	if t != null:
++		return t
++	# 路径万一变了就按"谁身上有那张转角表"找一遍，别硬依赖名字
++	for c in find_children("*", "", true, false):
++		if c.get("rot_by_seat_index_array") != null:
++			return c
++	return null
++
++
+ func spawn_players():
+ 
+ 
+@@ -93,11 +898,22 @@ func spawn_players():
+ 
+ 		players_node_parent.add_child(player_character, true)
+ 
++		# [MP8] 上界校验：座位没扩成时宁可少生成一个人，也不要越界崩掉
++		if counter >= player_spawn_positions.size():
++			push_warning("[MP8] 吸烟小憩：只有 %d 个座位，第 %d 个人没位置" % [
++				player_spawn_positions.size(), counter + 1
++			])
++			break
++
+ 		player_character.set_player_presence_rpc.rpc(player_presence.network_id)
+ 		player_character.setup_rpc.rpc(
+-			player_spawn_positions[counter].global_position, 
+-			player_spawn_positions[counter].global_rotation, 
+-			counter
++			player_spawn_positions[counter].global_position,
++			player_spawn_positions[counter].global_rotation,
++			counter,
++			# [MP8] 第 4 个参数**带默认值**，老调用方不受影响（照猎鸭 setup_rpc 那次的做法）。
++			# 死亡动画名跟着座位一起发下去 —— anim_handler 那个 match 只认 0~3，
++			# 新座位得靠这个值兜底。
++			(mp8_death_anim_by_seat[counter] if counter < mp8_death_anim_by_seat.size() else "")
+ 		)
+ 		player_character.register_camera_offset_rpc.rpc(
+ 			camera_offset_parent.get_path()

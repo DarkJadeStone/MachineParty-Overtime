@@ -1,0 +1,200 @@
+diff --git a/minigames/spine_breaker/components/device/spine_breaker_device.gd b/minigames/spine_breaker/components/device/spine_breaker_device.gd
+--- a/minigames/spine_breaker/components/device/spine_breaker_device.gd
++++ b/minigames/spine_breaker/components/device/spine_breaker_device.gd
+@@ -74,6 +74,34 @@ var can_proximity_attach: bool = true
+ 
+ var attached: bool = false
+ 
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] 多装置支持（2026-08-17）
++# ═══════════════════════════════════════════════════════════════════════════
++#
++# **退休**：用户定的规则 —— 第 4 个被机器弄死的人，机器杀完**不从他身上下来**，
++# 就此退出流通（画面上留着一具背着机器的尸体）。之后场上只剩一台机器，
++# 保证最后两人是"一台机器传来传去"的决战，不会两人各背一台同归于尽。
++# 具体不复位的动作在 break_spine_state.gd 里，这里只存标志。
++var mp8_retired: bool = false
++
++# 序号，只为日志读得懂（1 = 场景里原装那台，2 = 本 mod 加的第二台）
++var mp8_index: int = 1
++
++# [MP8] 速度基准 [default_speed, new_target_speed, speed_increase_over_time]，
++# 由小游戏在第一次缩放时记一次。之后一律"基准 × 系数"——
++# 装置是跨轮复用的，而设速度那段每轮都跑，拿当前值连乘两轮 1.2 就成了 1.44。
++var mp8_speed_base: Array = []
++
++# [MP8] 本台的机体颜色，由小游戏在 mp8_ensure_devices_rpc 里设（每个端各设一次）。
++# attach 时要把它转贴到被抱住那人背上的视觉去，所以装置自己得记着。
++var mp8_tint: Color = Color.WHITE
++
++# [MP8] 机体贴图名"最后一个下划线之后"的部分（实测 = "spinebreaker base1.png"）。
++# 用来在玩家背上那堆网格里认出"哪个面是机器" —— 两边是同一张贴图的不同拷贝。
++# 从装置自己的材质现取，不写死字符串。
++var mp8_tex_key: String = ""
++
++
+ func _ready() -> void :
+ 
+ 	set_multiplayer_authority(1, true)
+@@ -107,16 +135,42 @@ func _process(_delta: float) -> void :
+ 	if velocity.length() > Globals.Epsilon && can_rotate:
+ 
+ 		visuals.rotation.y = rotate_toward(
+-			visuals.rotation.y, 
++			visuals.rotation.y,
+ 			atan2(
+ 				- velocity.x, - velocity.z
+-			), 
++			),
+ 			_delta * rotation_speed
+ 		)
+ 
++# [MP8] 诊断：机器飞到天上去了 —— 抓现行。
++# 只报一次，报的时候把**当时的状态和速度**一起打出来，
++# 因为"飞"这件事在哪个状态发生，决定了根因在哪段代码：
++#   Follow  → 导航目标点在上层 navmesh（这张网格是多层的，y 到 6.5）
++#   Thrown  → 扔的初速带了向上分量
++#   Idle    → 那不可能，Idle 每帧强制 y=0
++var _mp8_y_warned: bool = false
++
++func _mp8_check_altitude() -> void :
++
++	if _mp8_y_warned or not multiplayer.is_server():
++		return
++	if global_position.y <= 3.0:
++		return
++
++	_mp8_y_warned = true
++	var sname := "?"
++	if state_machine != null and state_machine.current_state != null:
++		sname = String(state_machine.current_state.name)
++	print("[MP8] 碎骨者：⚠️ %d 号机飞到 y=%.2f —— 状态 %s，位置 (%.2f, %.2f)，速度 %s" % [
++		mp8_index, global_position.y, sname,
++		global_position.x, global_position.z, str(velocity)
++	])
++
++
+ func _physics_process(delta: float) -> void :
+ 	update_animations(delta)
+ 	check_target_proximity(delta)
++	_mp8_check_altitude()
+ 
+ var looping = false
+ func footsteps_loop():
+@@ -190,16 +244,21 @@ func set_lights_rpc():
+ 
+ @rpc("any_peer", "call_local", "reliable")
+ func try_throw_rpc(
+-	_start_position: Vector3, 
+-	_direction: Vector3, 
+-	_strength: float, 
+-	thrower: NodePath, 
++	_start_position: Vector3,
++	_direction: Vector3,
++	_strength: float,
++	thrower: NodePath,
+ 	kick: bool = false
+ ):
+ 
+ 	if not multiplayer.is_server():
+ 		return
+ 
++	# [MP8] 退休的那台钉死在尸体上，扔不动也踢不动。
++	# 人已经死了本来就不会按扔，这里挡的是**踢**：别人路过踹一脚会把它踹起来跑。
++	if mp8_retired:
++		return
++
+ 	if kick and not can_kick:
+ 		return
+ 
+@@ -210,9 +269,9 @@ func try_throw_rpc(
+ 	possible_thrower.set_spine_breaker_rpc.rpc(false)
+ 
+ 	state_machine.transition_to(&"Thrown", {
+-		"thrower": possible_thrower, 
+-		"start_position": _start_position, 
+-		"direction": _direction, 
++		"thrower": possible_thrower,
++		"start_position": _start_position,
++		"direction": _direction,
+ 		"strength": _strength
+ 	})
+ 
+@@ -265,6 +324,33 @@ func attach_entered_rpc():
+ 	set_collision_layer_value(1, false)
+ 	set_collision_mask_value(1, false)
+ 
++# [MP8] 退休那台熄灯（2026-08-17，用户实测"停机那个还在闪灯"）。
++#
++# 为什么不能直接复用 spine_broken_exited_rpc：它顺带 `visible = true`，
++# 会把本该留在地下 100 米的退休机器拽回画面里 —— 退休的整个画面效果就是
++# 「机器留在尸体背上」，机器本体必须继续隐形。所以另开一条只灭灯的。
++#
++# ⚠️ 真正在闪的是**尸体背上那个机器视觉**，不是这台本体（本体是隐形的）：
++# 玩家 _process 每帧都在做 `blink_animation_player.speed_scale =
++# 本台.light_animation_player.speed_scale`，而退休那台没人去停它的灯。
++# 所以这里 `speed_scale = 0` 是**载重的那一行** —— 它顺着既有的同步链
++# 自动传到每个客户端的尸体上。直接 stop() 尸体那份是双保险：
++# `break_spine_state.enter()` 里的 `target.blink_animation_player.stop()`
++# 只在状态机跑的那一端（服务器）执行过，客户端那份从来没被停过。
++@rpc("any_peer", "call_local", "reliable")
++func mp8_retire_quiet_rpc(victim_path: NodePath) -> void :
++
++	activation_timer.stop()
++	light_animation_player.stop()
++	light_animation_player.speed_scale = 0.0
++	status_light.light_color = Color.BLACK
++
++	var v = get_node_or_null(victim_path)
++	if v is SpineBreakerPlayer and v.blink_animation_player != null:
++		v.blink_animation_player.stop()
++		v.blink_animation_player.speed_scale = 0.0
++
++
+ @rpc("any_peer", "call_local", "reliable")
+ func spine_broken_exited_rpc():
+ 
+@@ -274,6 +360,43 @@ func spine_broken_exited_rpc():
+ 	visible = true
+ 
+ 
++# [MP8] 告诉玩家"现在背着你的是我这台"。
++#
++# 为什么非要有这条：玩家脚本里的 `spine_breaker_device` 是 setup_rpc() 时写死的**第一台**。
++# 两台机器一上场，背着第二台的人按扔，扔出去的会是第一台 —— 自己背的甩不掉、
++# 反而把另一台遥控走了。所以 attach 的时候由机器自报家门，玩家记住当前这台。
++#
++# ⚠️ 必须是 call_local 的 RPC，不能只在服务器上设：
++# 玩家的 _process 里拿这台的 light_animation_player.speed_scale 做闪烁同步，
++# 那段在**每个客户端**都跑；客户端上 attached_to 是空的（状态机只在服务器转），
++# 光靠服务器的数据反查不出来，背第二台的人会看到第一台的引信节奏。
++@rpc("any_peer", "call_local", "reliable")
++func mp8_bind_rpc(player_path: NodePath) -> void :
++
++	var p = get_node_or_null(player_path)
++	if p == null:
++		# 绑不上就是"背着 2 号机的人按扔却扔飞了 1 号机"的根因，必须看得见
++		push_warning("[MP8] 碎骨者：%d 号机绑不上玩家 —— 找不到节点 %s" % [
++			mp8_index, str(player_path)
++		])
++		if multiplayer.is_server():
++			print("[MP8] 碎骨者：⚠️ %d 号机绑定失败，路径 %s" % [mp8_index, str(player_path)])
++		return
++
++	p.mp8_current_device = self
++
++	# [MP8] 把本台的颜色贴到他背上那套视觉上 —— 装置本体这时候已经隐形了，
++	# 玩家看到的红不红全看这一行（见 spine_breaker_player.mp8_set_visual_tint）。
++	# 每次 attach 都重设一遍：上一台是红的、这一台是白的时，得能刷回来。
++	var painted: int = p.mp8_set_visual_tint(mp8_tint, mp8_tex_key)
++
++	if multiplayer.is_server():
++		# 把染了几个面一起打出来 —— 第一版就是"调用了但一个面都没染到"，
++		# 只看"绑定成功"这条日志完全看不出问题
++		print("[MP8] 碎骨者：%d 号机绑定到 %s（背上视觉染色 %d 面）" % [
++			mp8_index, String(p.name), painted
++		])
++
+ 
+ func _on_navigation_timer_timeout():
+ 

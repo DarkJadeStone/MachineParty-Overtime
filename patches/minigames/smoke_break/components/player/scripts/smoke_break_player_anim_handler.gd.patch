@@ -1,0 +1,21 @@
+diff --git a/minigames/smoke_break/components/player/scripts/smoke_break_player_anim_handler.gd b/minigames/smoke_break/components/player/scripts/smoke_break_player_anim_handler.gd
+--- a/minigames/smoke_break/components/player/scripts/smoke_break_player_anim_handler.gd
++++ b/minigames/smoke_break/components/player/scripts/smoke_break_player_anim_handler.gd
+@@ -173,6 +173,17 @@ func get_eliminated():
+ 			death_anim_active = "death_fan"
+ 		3:
+ 			death_anim_active = "death_window"
++
++	# [MP8] 死亡动画是**逐座位手做的**，原版只有 0~3 四条分支；
++	# 座位 4~7 会整条落进缝里 → `anim_player.play("")`（人被枪毙了却不倒）。
++	# 小游戏按"空间上最近的原版座位"算好动画名、随 setup_rpc 发给玩家，这里兜底。
++	# ≤4 人时 match 一定命中，下面两段整个不执行，与原版逐值一致。
++	if death_anim_active == "":
++		death_anim_active = String(player.mp8_death_anim)
++	if death_anim_active == "":
++		death_anim_active = "death_window"
++		push_warning("[MP8] 吸烟小憩：座位 %d 没有死亡动画名，退回 death_window" % player.active_player_seat_index)
++
+ 	ik_right.stop()
+ 	anim_player.play(death_anim_active, 0.2)
+ 

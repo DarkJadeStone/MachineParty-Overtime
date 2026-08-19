@@ -1,0 +1,1519 @@
+diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_breaker/scripts/spine_breaker.gd
+--- a/minigames/spine_breaker/scripts/spine_breaker.gd
++++ b/minigames/spine_breaker/scripts/spine_breaker.gd
+@@ -24,23 +24,309 @@ var player_count: int = 0
+ 
+ var playing: bool = false
+ 
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] 出生点点池（2026-08-17）
++# ═══════════════════════════════════════════════════════════════════════════
++#
++# **为什么不用通用补位**（network_manager 的节点名白名单那条路）：
++# probe41 实测，本小游戏的容器名 `PlayerSpawnPositions` 确实在白名单里、数量也补得到 8，
++# 但通用算法取的是「相邻两点连线的中点」，而原版这 4 个点是**围着场地中央那个结构物**
++# 摆的 —— 连线正好穿过它，4 个中点里有 2 个落在导航网格挖掉的洞里：
++#     补2 (8.35, 0.79)    补3 (9.79, -0.21)
++# 跟枪械工厂 v1 是同一个坑（HANDOFF 坑第 25 条 / T21）。所以这里挂 `mp8_owns_spawns`
++# 让通用补位整个不插手，出生点改由本小游戏自己管。
++#
++# **点池的规矩（用户 2026-08-17 定）**：
++#   1. 所有人数都用点池 —— 用户明确选了这条，**不再保留「4 人局与原版逐值一致」**；
++#   2. 点池顺序 = **添加顺序**（场景原版那 4 个是 1~4，用户在手调模式里一个个往后加）；
++#   3. 不同人数只启用**前 N 个**：人少用内圈一小撮（大家离得近、节奏紧），人满才铺开；
++#   4. 抽签是随机的，但抽中的点之间保证最小间距，免得随机出一堆挤在一起的脏局。
++#
++# ⚠️ 内置默认值**不烘坐标**：点池的底就是场景里现有那 4 个 Marker 的实际值，
++#    运行时读出来即可。抄坐标是这个项目翻过车的事（HANDOFF 反复强调），能不抄就不抄。
++# ⚠️ 池子加点之后**这张表要跟着改**，否则新加的点永远抽不到：
++# 用户 2026-08-17 手摆定稿了 25 个点，原表 8 人只启用前 20 个 → 第 21~25 个是死点。
++# 现在 8 人 = 全池 25 个。冗余度（启用数 ÷ 需要数，需要数 = 人数 + 装置数）保持 2 倍上下。
++const MP8_POOL_BY_COUNT: Dictionary = {
++	4: 10,
++	5: 13,
++	6: 16,
++	7: 20,
++	8: 25,
++}
++
++# 装置也从同一个点池抽（用户 2026-08-17 定），但要求离**每一个**玩家出生点都够远，
++# 否则开局就贴脸秒杀。原版装置在 (-8.79, -6.81)，离最近的原版出生点 15.3 米 ——
++# 那是"追过来有缓冲"的设计意图。但手摆的池子只铺在 x∈[-14,15]、z∈[-12,7] 这一片，
++# 8 个人占掉 8 个点之后很难再找到 15 米开外的，所以目标定 8 米、抽不到逐步放宽。
++const MP8_DEVICE_MIN_GAP: float = 8.0
++
++# 几台装置（用户 2026-08-17 定：6 人及以上 2 台）。逐个人数列举，不写成公式。
++const MP8_DEVICES_BY_COUNT: Dictionary = {
++	4: 1,
++	5: 1,
++	6: 2,
++	7: 2,
++	8: 2,
++}
++
++# 第几刀之后那台机器就钉在人身上不下来（用户 2026-08-17 定，同日实机改判过一次）。
++#
++# **目标是「最后 2 个人 1v1 时场上只剩 1 台机器」** —— 所以退休必须发生在
++# 「这一刀砍完正好剩 2 个人」那一刀上，阈值 = 总人数 − 2：
++#   6 人 → 第 4 刀    7 人 → 第 5 刀    8 人 → 第 6 刀
++#
++# ⚠️ 原来写死 4，是按"保证决战时只剩一台"推的 —— 那个条件确实满足，但**退早了**：
++#    8 人局第 4 刀砍完场上还有 4 个人，剩下一台机器要追 4 个人，追很久。
++#    用户实机判否（"场上还四个人的时候停机那个就不动了"）。
++#    **判据说得通不等于时机对**：这里要的是节奏，不是不等式成立。
++# [MP8] 结算时把名次/名字/得分打进日志（不改任何分数，纯为事后对账）。
++# 与残骸平台的 _mp8_log_scores 同一个格式，两个 A 族对照着看方便。
++func _mp8_log_scores() -> void :
++
++	var ranked: Array = player_scores.keys()
++	ranked.sort_custom(func(a, b): return player_scores[a] > player_scores[b])
++
++	var parts: PackedStringArray = []
++	for i in ranked.size():
++		var nid = ranked[i]
++		var nm: String = "id%d" % nid
++		if PlayerManager.player_presences.has(nid):
++			nm = String(PlayerManager.player_presences[nid].network_name)
++		parts.append("第%d名 %s %d分" % [i + 1, nm, player_scores[nid]])
++
++	print("[MP8] 碎骨者结算（%d 人在场 / %d 人阵亡）：%s" % [
++		player_count, dead_players.size(), " / ".join(parts)
++	])
++
++
++# 这一台杀完之后该等几秒。按 mp8_index（1 起）查表，表外退回 1 号机那档。
++func _mp8_wait_for(which) -> float :
++
++	var i: int = 0
++	if which != null and is_instance_valid(which):
++		i = maxi(0, int(which.mp8_index) - 1)
++
++	return float(MP8_DEVICE_WAIT[i] if i < MP8_DEVICE_WAIT.size() else MP8_DEVICE_WAIT[0])
++
++
++func _mp8_retire_at() -> int :
++
++	# player_count 只在服务器的 spawn_players() 里设过；客户端跑到这儿（日志那行）时是 0，
++	# 退回 PlayerManager 现查，免得客户端日志印出个"第 1 刀退休"误导人。
++	var n: int = (player_count if player_count > 0 else PlayerManager.player_presences.size())
++	return maxi(1, n - 2)
++
++
++# [MP8] 给某台装置的机体染色，返回染了几个面。
++#
++# ⚠️⚠️ **绝对不能直接改材质本身**（`mat.albedo_color = 红` 这种写法）：
++# probe44 查清楚了，机体材质是**嵌在 device.tscn 里的** `StandardMaterial3D_66jhi`，
++# 同一个 .tscn 实例化出来的两台**指向同一个资源对象** —— 改它 1 号机会跟着红，
++# 而且资源跨局缓存，下一局、下一个小游戏它还是红的（T19 那个"一局比一局跑得更远"
++# 就是改资源留下的）。
++#
++# 正确做法是 `set_surface_override_material()` —— 覆盖材质挂在 **MeshInstance3D 节点**上，
++# 节点是每台各一份的。复制一份材质再改副本，原资源一个字节不动。
++# （复制的是**资源**不是**节点**，不触犯"补数组时不要新建场景节点"那条坑第 14 条。）
++#
++# 只染"本来就有 StandardMaterial3D 且看得见"的面：
++# `Visuals/MeshInstance3D` 那个球是 `visible=false` 的辅助件、且没有材质，
++# 给它硬塞一个覆盖材质等于凭空造出一个红球。
++func _mp8_tint_device(d, c: Color) -> int :
++
++	if not is_instance_valid(d):
++		return 0
++
++	var n: int = 0
++
++	for mi in d.find_children("", "MeshInstance3D", true, false):
++
++		if not mi.visible or mi.mesh == null:
++			continue
++
++		for s in mi.mesh.get_surface_count():
++
++			var src = mi.get_active_material(s)
++			if not (src is StandardMaterial3D):
++				continue
++
++			var sd: StandardMaterial3D = src
++
++			# 顺手记下机体贴图的钥匙（**白色那台也要记**，跟染不染色无关）：
++			# attach 之后要拿它在玩家背上那堆网格里认出哪个面是机器。
++			if d.mp8_tex_key == "" and sd.albedo_texture != null:
++				var f: String = str(sd.albedo_texture.resource_path).get_file()
++				var us: int = f.rfind("_")
++				d.mp8_tex_key = (f.substr(us + 1) if us >= 0 else f)
++
++			if c == Color.WHITE:
++				continue
++
++			# 已经染过就跳过 —— 本函数每轮都会跑一遍，不挡住会每轮多复制一份材质
++			if mi.get_surface_override_material(s) != null:
++				continue
++
++			var m: StandardMaterial3D = sd.duplicate()
++			m.albedo_color = c
++			mi.set_surface_override_material(s, m)
++			n += 1
++
++	return n
++
++
++# 命令行 `mp8spinefuse=<秒>`：把**所有**装置的引信按同一个值覆盖，返回 0 表示没传。
++# 故意做成"覆盖全部" —— 它的用途正是**手动制造锁步**来复现"两个人同时死"那个现象
++# （两台引信一样长就会同帧杀人，见 MP8_DEVICE_FUSE 那段）。
++func _mp8_fuse_forced() -> float :
++
++	for a in OS.get_cmdline_args():
++		var s: String = str(a)
++		if s.begins_with("mp8spinefuse="):
++			var v: String = s.substr(len("mp8spinefuse="))
++			if v.is_valid_float():
++				return clampf(float(v), 1.0, 60.0)
++
++	return 0.0
++
++
++# 两台机器的性格差（用户 2026-08-17 定）：
++#   **1 号机 = 基准**（引信 10 秒、原速）  **2 号机 = 更凶**（引信 9 秒、1.2 倍速）
++# 差异全压在 2 号机上 —— 1 号机是场景原装那台，"只动新增的"是本项目一贯的规矩。
++#
++# ⭐ **引信不等长才是打破锁步的那一条，速度差不是。**
++#   死亡时刻 = 派发时刻 + 引信，跟追得快慢无关（引信在 choose_new_target 里就开始烧了，
++#   路上跑的时间算在里面；而 7 m/s 跑完全场最多 4~5 秒，10 秒引信永远兜得住）。
++#   所以两台跑多快都会在同一秒杀人。改成 10/9 之后周期变 13 秒 / 12 秒，
++#   每一轮多错开 1 秒 → 死亡从成对变交替，名次不再取决于哪条 await 先返回。
++#
++# 速度差改的是另一件事：**你被抓到的早晚**，也就是你有几次挣脱机会 ——
++# 引信被扔飞时不会停，所以早被贴上 = 能扔能跑；引信烧完之后才碰到你 = 当场处决。
++#
++# ⚠️ 引信 10 秒对 4 人局也生效（原版主场景是 20 秒）。用户明确要的，同点池那次改判。
++# ⚠️ 下标 = 装置序号 − 1；表外的装置（真要开到 3~4 台时）一律退回 1 号机那档。
++# ⚠️⚠️ 2026-08-18 用户 6 人**真人局**实测定案：**1 号机 20 秒 / 2 号机 15 秒。**
++# （先说「太短，加 3 秒」，随即改判成这两个数 —— 以这条为准。）
++#
++# 加的是**引信**，不是别的：碎骨者没有回合计时器（纯淘汰制，只剩 1 人才结束），
++# 玩家能感觉到"时间"的只有这一个 —— 机器扑上来到处决之间那段逃命窗口。
++#
++# 1 号机 20 秒 = **回到原版主场景的值**（之前砍到 10 秒是 2026-08-17 定的，实机推翻了）。
++# 2 号机 15 秒，仍然更凶，且**两台差 5 秒**（原来只差 1 秒）——
++# 错开量是靠引信不等长维持的，差得越开越不容易锁步：
++# 周期 = 引信 + MP8_DEVICE_WAIT → 23 秒 vs 17 秒，每轮错开 6 秒（原来 2 秒）。
++#
++# 🩸 顺带修掉一个竞态：原来 10/9 只差 1 秒，而 break_spine_rpc 里
++# 「await 0.5 + await 0.5」正好也是 1 秒 —— 两台挂同一个人时，
++# 后一台 connect(spine_broken) 的时刻正撞上前一台的 emit，连晚一步就永远等不到信号。
++# 差 5 秒之后这个窗口不再重合（真正的修法在 thrown_state 与 break_spine_state，
++# 这里只是顺带把巧合拆掉）。
++const MP8_DEVICE_FUSE: Array[float] = [20.0, 15.0]
++const MP8_DEVICE_SPEED: Array[float] = [1.0, 1.2]
++
++# 杀完一个人之后隔多久再出发（用户 2026-08-17 定：2 秒和 3 秒）。
++#
++# ⚠️⚠️ **哪台拿哪个数不是随便配的，配反了等于把错开抵消掉。**
++# 周期 = 引信 + 这个等待，两台**周期差**才是每轮能拉开的量：
++#     1号3秒 / 2号2秒 → 13 秒 vs 11 秒 → 每轮错开 **2 秒**（1→3→5→7）✅
++#     1号2秒 / 2号3秒 → 12 秒 vs 12 秒 → **周期相同，永远锁在 1 秒差** ❌
++# 后者比不改还糟：不改至少还有 13 vs 12 的 1 秒漂移，配反了漂移直接归零。
++# 所以慢的那台（引信长的 1 号机）配长等待，快的那台配短等待，差值才叠加。
++const MP8_DEVICE_WAIT: Array[float] = [3.0, 2.0]
++
++# 机体颜色（用户 2026-08-17 定：新加那台涂红，好一眼认出哪台更凶）。
++# Color.WHITE = 不染色。albedo_color 是**乘**在贴图上的，所以别用纯 (1,0,0)：
++# 那会把贴图的绿蓝通道整个乘没，机体变成一块死红，细节全丢。
++const MP8_DEVICE_TINT: Array[Color] = [Color.WHITE, Color(1.0, 0.25, 0.2)]
++
++const MP8_DEVICE_SCENE: String = "res://minigames/spine_breaker/components/device/spine_breaker_device.tscn"
++# 抽中的点之间的最小间距。抽不满就逐步放宽（宁可挤，也不能少生成一个人：
++# 少一个人这局可能永远结束不了 —— check_game_end 要 active_players <= 1）。
++const MP8_PICK_MIN_GAP: float = 4.0
++
++# 用户 2026-08-17 在 -SpineEdit 里手摆定稿的 25 个点（从 mp8_spine_layout.txt 烘进来）。
++# 实测全部 25 个都在导航网格上、都在相机框内，点间最小间距 2.99 米。
++# ⚠️ 前 3 个是场景原版的 1~3 号；原版第 4 个被用户挪到了 (0.15, 6.38) ——
++#    这是允许的，用户明确选了「所有人数都用点池」，不再保留「4 人局与原版逐值一致」。
++# 存盘文件存在时以文件为准，这里只是删了文件之后的底。
++const MP8_POOL_BAKED: Array = [
++	[Vector3(3.05, 0.0, 2.85), 43.0],
++	[Vector3(7.20, 0.0, -1.58), 42.0],
++	[Vector3(9.49, 0.0, 3.17), 42.0],
++	[Vector3(0.15, 0.0, 6.38), 298.0],
++	[Vector3(-5.92, 0.0, 6.82), 283.0],
++	[Vector3(10.09, 0.0, 6.86), 43.0],
++	[Vector3(13.09, 0.0, 4.86), 43.0],
++	[Vector3(15.08, 0.0, -1.14), 43.0],
++	[Vector3(15.07, 0.0, -4.14), 43.0],
++	[Vector3(6.10, 0.0, 1.84), 43.0],
++	[Vector3(-0.91, 0.0, 1.80), 358.0],
++	[Vector3(3.07, 0.0, -2.18), 43.0],
++	[Vector3(-6.93, 0.0, -0.19), 283.0],
++	[Vector3(-7.93, 0.0, -3.20), 238.0],
++	[Vector3(-6.91, 0.0, 2.81), 313.0],
++	[Vector3(-9.89, 0.0, 6.80), 313.0],
++	[Vector3(-13.92, 0.0, 1.78), 313.0],
++	[Vector3(-13.97, 0.0, -5.22), 253.0],
++	[Vector3(-11.98, 0.0, -10.22), 208.0],
++	[Vector3(-4.98, 0.0, -10.21), 238.0],
++	[Vector3(4.02, 0.0, -10.18), 148.0],
++	[Vector3(10.02, 0.0, -10.14), 133.0],
++	[Vector3(14.01, 0.0, -12.13), 133.0],
++	[Vector3(2.06, 0.0, -6.20), 118.0],
++	[Vector3(-1.94, 0.0, -7.20), 118.0],
++]
++
++const MP8_LAYOUT_FILE: String = "user://mp8_spine_layout.txt"
++const MP8_EDIT_STEPS: Array[float] = [1.0, 0.5, 0.1]
++const MP8_EDIT_YAW_STEP: float = 15.0
++const MP8_MARKER_H: float = 2.0
++# 判「这个点在导航网格上吗」的容差：玩家胶囊半径 0.70，给到 0.75
++const MP8_NAV_TOL: float = 0.75
++
++# network_manager 用 Object.get() 读这个标志，读到 true 就不碰我们的出生点容器
++var mp8_owns_spawns: bool = true
++
++var _mp8_devices: Array = []             # [0] 永远是场景里原装那台
++var _mp8_retire_claimed: bool = false    # 本轮的退休名额发出去没有
++var _mp8_counted_victims: Array = []     # 本轮已经算过刀的人（network_id），防同一条命被算两次
++var _mp8_kills_started: int = 0          # 本轮机器"动手"的次数（刀下去就算，不等人死透）
++                                         # —— 退休判据数的是它，理由见 mp8_claim_retire()
++
++var _mp8_pool: Array = []                # [[Vector3 pos, float yaw], ...]，下标 = 优先级
++var _mp8_pool_src: String = "场景原版"
++var _mp8_edit_on: bool = false
++var _mp8_edit_sel: int = 0
++var _mp8_edit_step_i: int = 0
++var _mp8_edit_canvas: CanvasLayer = null
++var _mp8_edit_panel: Label = null
++var _mp8_markers: Array[Node3D] = []
++
++
+ func _ready() -> void :
+ 	super._ready()
+ 
+ 	camera.current = true
+ 
++	# [MP8] 场景里原装那台是 1 号机；第二台在 initialize() 里按人数追加
++	_mp8_devices = [device]
++	device.mp8_index = 1
++
+ 	if multiplayer.is_server():
+ 
+ 		countdown_state.countdown_started.connect(_on_countdown_started)
+ 		countdown_state.tick.connect(_on_countdown_tick)
+ 		countdown_state.expired.connect(_on_countdown_expired)
+ 
+-		device.request_new_target.connect(_on_device_requested_target)
++		# [MP8] 原版信号不带参数，两台机器就分不清是谁在要新目标 —— 用 bind 把自己带上
++		device.request_new_target.connect(_on_device_requested_target.bind(device))
+ 
+ 	if GameManager.local_game:
+ 		await get_tree().create_timer(1.0).timeout
+ 		minigame_ready.emit(1)
+ 
++	_mp8_ready()
++
+ func _physics_process(_delta: float) -> void :
+ 
+ 	if not playing:
+@@ -51,7 +337,7 @@ func _physics_process(_delta: float) -> void :
+ 			continue
+ 
+ 		var query = PhysicsRayQueryParameters3D.create(
+-			camera.global_position, 
++			camera.global_position,
+ 			p.global_position
+ 		)
+ 
+@@ -91,16 +377,31 @@ func initialize(_round_number: int, _total_rounds: int, _scores: Dictionary = {}
+ 
+ func spawn_players():
+ 
+-	var spawn_positions = player_spawn_positions_node.get_children()
+-	spawn_positions.shuffle()
+-
+ 	player_count = PlayerManager.player_presences.size()
+ 
++	# [MP8] 先把这一局要几台机器备齐（6 人及以上 2 台，用户 2026-08-17 定）。
++	# 走 RPC 是因为**每台机器都得自己建**：device.tscn 自带 MultiplayerSynchronizer，
++	# 它靠"两端节点路径一致"配对，所以名字和父节点必须两边一样。
++	# （PlayerSpawner 那条自动同步的路走不通 —— probe42 实测它的白名单里只有玩家场景。）
++	mp8_ensure_devices_rpc.rpc(_mp8_want_devices(player_count))
++
++	# 一个小游戏实例会被 initialize() 多次（每轮一次），所以退休名额和上一轮钉在
++	# 尸体上的那台都要按轮重置，否则第二轮开局就少一台机器、而且没人能再领退休。
++	_mp8_retire_claimed = false
++	_mp8_kills_started = 0
++	_mp8_counted_victims.clear()   # 去重名单也按轮清，否则第二轮开局就算不了刀
++	mp8_device_reset_rpc.rpc()
++
++	# [MP8] 原版是 `player_spawn_positions_node.get_children()` + shuffle 后按下标取。
++	# 容器里只有 4 个 Marker，第 5 个人就是 `spawn_positions[4]` 越界读 → null → 取属性报错。
++	# 改走点池（见文件头那段说明）。
++	var picks: Array = _mp8_pick_spawns(player_count)
++
+ 	for i in PlayerManager.player_presences.size():
+ 		var network_id = PlayerManager.player_presences.keys()[i]
+ 
+-		var position: Vector3 = spawn_positions[i].global_position
+-		var rot: Vector3 = spawn_positions[i].rotation_degrees
++		var position: Vector3 = picks[i][0]
++		var rot: Vector3 = Vector3(0.0, float(picks[i][1]), 0.0)
+ 		var player_character = player_scene.instantiate()
+ 		players_node.add_child(player_character, true)
+ 
+@@ -115,7 +416,16 @@ func spawn_players():
+ 
+ 		player_scores[network_id] = 0
+ 
+-	device.set_players_node(players_node)
++	# [MP8] 装置也从同一个点池抽（用户 2026-08-17 定）。放在生成玩家**之后**，
++	# 因为它的判据是"离每一个玩家出生点都够远"，得先知道人都站哪。
++	var taken: Array = []
++	for r in picks:
++		taken.append(r[0])
++	_mp8_place_devices(taken)
++
++	for d in _mp8_devices:
++		if is_instance_valid(d):
++			d.set_players_node(players_node)
+ 
+ func cleanup():
+ 
+@@ -144,17 +454,33 @@ func check_game_end():
+ 	finished = true
+ 
+ 	set_playing_rpc.rpc(false)
+-	device.deactive_rpc.rpc()
++	for d in _mp8_devices:                    # [MP8] 两台都要停
++		if is_instance_valid(d):
++			d.deactive_rpc.rpc()
+ 
+ 	for i in dead_players.size():
+ 		player_scores[dead_players[i]] = i
+ 
+ 	for network_id in active_players.keys():
+-		player_scores[network_id] = player_count
++
++		# [MP8] 幸存者从 `player_count` 改成 `dead_players.size()`（用户 2026-08-17 定：
++		# **按名次得分，全档步长统一为 1**）。跟残骸平台 T13 是同一个改法、同一个理由。
++		#
++		# 原版冠亚之间恒跳 2 分（8 人：最后一个死的拿 6，冠军拿 8），其余名次步长都是 1。
++		# 现在冠军 = "比最后一个死的多 1 分"：8 人 0…6 / **7**，4 人 0/1/2 / **3**。
++		#
++		# ⚠️ **为什么不用 `player_count - 1`**（写出来一样，扛不住掉线）：
++		# 中途掉线的人在 remove_player_rpc 里只被 active_players.erase()，
++		# **不会进 dead_players**。那时 player_count 比真正参与结算的人数大，
++		# 冠军会凭空多拿几分。用死亡人数推则掉线多少人都对；无人掉线时两者完全等价。
++		player_scores[network_id] = dead_players.size()
+ 
+ 
+ 		break
+ 
++	if multiplayer.is_server():
++		_mp8_log_scores()
++
+ 	player_scores_finalized.emit(player_scores)
+ 
+ 	await get_tree().create_timer(2.0).timeout
+@@ -172,7 +498,11 @@ func remove_player_rpc(_network_id: int):
+ 	if player_instance:
+ 
+ 		if multiplayer.is_server():
+-			device.player_disconnected(player_instance)
++			# [MP8] 断线的人身上可能背着任意一台，两台都要过一遍
++			# （device.player_disconnected 自己会判 attached_to 是不是这个人）
++			for d in _mp8_devices:
++				if is_instance_valid(d):
++					d.player_disconnected(player_instance)
+ 
+ 		player_instance.queue_free()
+ 		players.erase(_network_id)
+@@ -187,18 +517,127 @@ func set_playing_rpc(_playing: bool):
+ func _on_countdown_tick(time_left: int):
+ 	super._on_countdown_tick(time_left)
+ 
+-func choose_new_target():
++# [MP8] which = null 时给**所有**还在流通的装置各挑一个目标（开局用）；
++# 传具体某台时只管那一台（杀完人后重新出发用）。
++func choose_new_target(which = null):
+ 
++	# 诊断：这条路上有三个静默出口，任何一个都会让机器就此站着不动
+ 	if active_players.size() <= 1:
++		print("[MP8] 碎骨者：选目标中止 —— 场上只剩 %d 人" % active_players.size())
+ 		return
+ 
+-	var random_player = active_players.values().pick_random()
++	var list: Array = ([which] if which != null else _mp8_devices)
++
++	for d in list:
++
++		if not is_instance_valid(d):
++			print("[MP8] 碎骨者：选目标跳过 —— 装置引用已失效")
++			continue
++		if d.mp8_retired:
++			print("[MP8] 碎骨者：选目标跳过 —— %d 号机已退休" % d.mp8_index)
++			continue
++
++		var prey = _mp8_pick_prey(d)
++		if prey == null:
++			print("[MP8] 碎骨者：⚠️ %d 号机挑不到猎物（场上 %d 人），这台会停住" % [
++				d.mp8_index, active_players.size()
++			])
++			continue
++
++		d.state_machine.transition_to(&"Follow", {
++			"target": prey,
++			"new_target": true
++		})
++		d.start_timer()
++		print("[MP8] 碎骨者：%d 号机改追 %s（当前状态 %s）" % [
++			d.mp8_index, String(prey.name),
++			String(d.state_machine.current_state.name) if d.state_machine.current_state != null else "?"
++		])
++
++
++# 这台机器在追谁 / 骑在谁身上。
++# ⚠️ 不能读 device.target —— 那是个**死变量**：全脚本没有任何地方给它赋值，
++#    真正的目标存在 Follow 状态自己的 target 里（follow_state.gd 的 set_target）。
++#    （device 和 follow_state 都连了同一个 navigation_update_timer，
++#     device 那个 handler 因为 active 恒为 false 直接 return，所以原版才没出事。）
++func _mp8_hunting(d) -> SpineBreakerPlayer :
++
++	if not is_instance_valid(d):
++		return null
++	if d.attached_to != null and is_instance_valid(d.attached_to):
++		return d.attached_to
++	var st = d.state_machine.current_state
++	if st != null and String(st.name) == "Follow":
++		var t = st.get("target")
++		if t is SpineBreakerPlayer and is_instance_valid(t):
++			return t
++	return null
++
++
++# 挑猎物：优先挑**没被另一台盯上**的人，其次才随便挑。
++# 背着机器的人一律跳过（跟 follow_state 的互斥同一个理由：两条引信并行会把人杀两次）。
++func _mp8_pick_prey(me) -> SpineBreakerPlayer :
++
++	var busy: Array = []
++	for d in _mp8_devices:
++		if d == me or not is_instance_valid(d):
++			continue
++		var h = _mp8_hunting(d)
++		if h != null:
++			busy.append(h)
++
++	var free: Array = []
++	var all: Array = []
++	for p in active_players.values():
++		if not is_instance_valid(p) or not p.active:
++			continue
++		if p.has_spine_breaker:
++			continue
++		all.append(p)
++		if not busy.has(p):
++			free.append(p)
++
++	if not free.is_empty():
++		return free.pick_random()
++	if not all.is_empty():
++		return all.pick_random()
++
++	# 一个都挑不出来时，把每个人是被哪条判据筛掉的打出来 —— 否则只能看到"机器不动了"
++	var why := PackedStringArray()
++	for p in active_players.values():
++		if not is_instance_valid(p):
++			why.append("(失效引用)")
++		elif not p.active:
++			why.append("%s:未激活" % String(p.name))
++		elif p.has_spine_breaker:
++			why.append("%s:背着机器" % String(p.name))
++		else:
++			why.append("%s:?" % String(p.name))
++	print("[MP8] 碎骨者：候选全被筛掉 —— %s" % ", ".join(why))
++	return null
++
++
++# 这个人已经被**另一台**盯上了吗？（follow_state 的 _mp8_can_target 调它）
++#
++# 为什么非要有这个：_mp8_pick_prey 分配目标时已经避开了另一台（busy 那段），
++# 但机器在跑过去的路上，follow_state.update_proximity_check() 会把目标改成
++# "附近最近的那个" —— 那段原版逻辑完全不看另一台在追谁，于是两台又汇到同一个人身上
++# （用户实测："仇恨同时锁到一个人身上"）。**分配时避让 + 路上不避让 = 白避让。**
++#
++# ⚠️ 它只管"选不选得上目标"，不管"粘不粘得上"：都撞上了还不粘，玩家只会觉得机器坏了。
++#    两条判据的分工写在 follow_state 那两个函数的注释里。
++func mp8_is_claimed_by_other(p, me) -> bool :
++
++	if p == null or not is_instance_valid(p):
++		return false
++
++	for d in _mp8_devices:
++		if d == me or not is_instance_valid(d):
++			continue
++		if _mp8_hunting(d) == p:
++			return true
+ 
+-	device.state_machine.transition_to(&"Follow", {
+-		"target": random_player, 
+-		"new_target": true
+-	})
+-	device.start_timer()
++	return false
+ 
+ func _on_countdown_expired():
+ 	super._on_countdown_expired()
+@@ -211,14 +650,19 @@ func _on_countdown_expired():
+ 
+ 	set_playing_rpc.rpc(true)
+ 
+-func _on_device_requested_target():
++func _on_device_requested_target(which = null):
++
++	var wait: float = _mp8_wait_for(which)
+ 
+ 	if multiplayer.is_server():
+-		device.laugh_rpc.rpc()
++		var d = (which if which != null and is_instance_valid(which) else device)
++		print("[MP8] 碎骨者：%d 号机要新目标（%.1f 秒后出发）" % [d.mp8_index, wait])
++		d.laugh_rpc.rpc()
+ 
+-	await get_tree().create_timer(3.0).timeout
++	await get_tree().create_timer(wait).timeout
+ 
+-	choose_new_target()
++	# [MP8] 只让**发出请求的那一台**重新出发，别把另一台正在追人的目标也重置了
++	choose_new_target(which)
+ 
+ func _on_player_died(_network_id: int):
+ 
+@@ -226,6 +670,932 @@ func _on_player_died(_network_id: int):
+ 		active_players.erase(_network_id)
+ 		dead_players.append(_network_id)
+ 
++		# [MP8] 两个计数一起打：**退休判据数的是"动手次数"不是这里的死亡数**，
++		# 两者之间隔着整段死亡动画（正是老判据失效的原因，见 mp8_claim_retire()）。
++		# 对账时看的就是这两个数的差 —— 差多少，就是记账滞后了多少条命。
++		print("[MP8] 碎骨者：第 %d 个人死了，场上还剩 %d 人（机器已动手 %d 次，退休名额：%s）" % [
++			dead_players.size(), active_players.size(), _mp8_kills_started,
++			("已发出" if _mp8_retire_claimed else "还没发")
++		])
++
+ 	await get_tree().create_timer(1.0).timeout
+ 
+ 	check_game_end()
++
++
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] 以下全是新增
++# ═══════════════════════════════════════════════════════════════════════════
++
++func _mp8_ready() -> void :
++
++	var args := Array(OS.get_cmdline_args())
++
++	# 手调模式**故意不跟 -debug-tools 走**：它要抢一批按键，挂在 -debug-tools 上
++	# 会让每次普通测试都莫名其妙被抢键。发布版天然干净（照抄 -GunEdit 的规矩）。
++	_mp8_edit_on = args.has("mp8spineedit")
++
++	_mp8_init_pool(args.has("mp8spinenofile"))
++
++	if _mp8_edit_on:
++		_mp8_edit_begin()
++
++
++func _mp8_init_pool(ignore_file: bool) -> void :
++
++	_mp8_pool.clear()
++
++	# 底 = 用户手摆定稿、烘进代码的那套点池
++	for r in MP8_POOL_BAKED:
++		_mp8_pool.append([r[0], float(r[1])])
++	_mp8_pool_src = "内置定稿"
++
++	# 常量被清空时才退回场景里那几个 Marker（不抄坐标，现场读）
++	if _mp8_pool.is_empty() and player_spawn_positions_node != null:
++		for c in player_spawn_positions_node.get_children():
++			if not (c is Node3D):
++				continue
++			var n3: Node3D = c
++			var rot: Vector3 = n3.rotation_degrees
++			# 出生点只有水平朝向有意义（玩家那边是 visuals.rotation_degrees = rot）。
++			# 万一原版真带了 x/z 分量，先报出来再说，别默默吃掉。
++			if absf(rot.x) > 0.01 or absf(rot.z) > 0.01:
++				push_warning("[MP8] 碎骨者：出生点 %s 的 rotation 带 x/z 分量 %s，只取 y" % [
++					String(n3.name), str(rot)
++				])
++			_mp8_pool.append([n3.global_position, rot.y])
++		_mp8_pool_src = "场景原版"
++
++	var from_scene: int = _mp8_pool.size()
++
++	if not ignore_file:
++		var rows: Array = _mp8_load_layout_file()
++		if not rows.is_empty():
++			_mp8_pool = rows
++			_mp8_pool_src = "存盘文件（%d 个点）" % rows.size()
++
++	if _mp8_pool.is_empty():
++		push_warning("[MP8] 碎骨者：点池是空的，回退到原版容器")
++		return
++
++	print("[MP8] 碎骨者：出生点池 %d 个，来源=%s（内置底 %d 个）；启用 %s" % [
++		_mp8_pool.size(), _mp8_pool_src, from_scene, _mp8_enable_desc()
++	])
++
++
++func _mp8_load_layout_file() -> Array :
++
++	if not FileAccess.file_exists(MP8_LAYOUT_FILE):
++		return []
++
++	var f := FileAccess.open(MP8_LAYOUT_FILE, FileAccess.READ)
++	if f == null:
++		push_warning("[MP8] 碎骨者：读不了 %s（错误 %d）" % [
++			MP8_LAYOUT_FILE, FileAccess.get_open_error()
++		])
++		return []
++
++	var rows: Array = []
++	while not f.eof_reached():
++		var line: String = f.get_line().strip_edges()
++		if line.is_empty() or line.begins_with("#"):
++			continue
++		var parts: PackedStringArray = line.split(",", false)
++		if parts.size() < 2:
++			push_warning("[MP8] 碎骨者：布局文件这一行看不懂，跳过 —— '%s'" % line)
++			continue
++		var x: float = float(parts[0].strip_edges())
++		var z: float = float(parts[1].strip_edges())
++		var yaw: float = (float(parts[2].strip_edges()) if parts.size() >= 3 else 0.0)
++		rows.append([Vector3(x, 0.0, z), yaw])
++	f.close()
++	return rows
++
++
++func _mp8_save_layout_file() -> bool :
++
++	var f := FileAccess.open(MP8_LAYOUT_FILE, FileAccess.WRITE)
++	if f == null:
++		push_warning("[MP8] 碎骨者：写不了 %s（错误 %d）" % [
++			MP8_LAYOUT_FILE, FileAccess.get_open_error()
++		])
++		return false
++
++	f.store_line("# 碎骨者（mp8game=14）出生点池")
++	f.store_line("# 一行一个点：x, z, 朝向度数。**顺序 = 优先级**，人少时只启用前 N 个：")
++	# 动态生成，别写死 —— 表改了这行也得跟着变，否则文件里的说明会骗下一个人
++	f.store_line("#   %s" % _mp8_enable_desc())
++	f.store_line("# 装置也从这个池子里抽（离每个玩家 ≥%.0f 米，抽不到逐米放宽）。" % MP8_DEVICE_MIN_GAP)
++	f.store_line("# ⚠️ 本文件含**全部**点，包括场景原版那 4 个 —— 用户 2026-08-17 定：")
++	f.store_line("#    所有人数都用点池，不再保留「4 人局与原版逐值一致」。")
++	f.store_line("# 删掉这个文件 = 回到场景里原版那 4 个点。可以直接用记事本改。")
++	f.store_line("# 存于 %s" % Time.get_datetime_string_from_system())
++	f.store_line("")
++	for r in _mp8_pool:
++		var p: Vector3 = r[0]
++		f.store_line("%.2f, %.2f, %.0f" % [p.x, p.z, float(r[1])])
++	f.close()
++
++	# 定稿后可以直接贴回代码当内置默认，省得下一个 agent 再反推一次坐标
++	var snippet := PackedStringArray()
++	for r in _mp8_pool:
++		var p: Vector3 = r[0]
++		snippet.append("\t[Vector3(%.2f, 0.0, %.2f), %.1f]," % [p.x, p.z, float(r[1])])
++	print("[MP8] 碎骨者：点池已存盘（%d 个）→ %s" % [
++		_mp8_pool.size(), ProjectSettings.globalize_path(MP8_LAYOUT_FILE)
++	])
++	print("[MP8] 碎骨者：定稿后可直接贴进代码 —— \n%s" % "\n".join(snippet))
++	return true
++
++
++# 出生点**必须恰好 n 个**：少给一个，那个人就不会被生成，而 check_game_end() 要
++# active_players <= 1 才结束 —— 人没生成 = 这一小局可能永远结束不了（本局没有任何超时）。
++# 所以所有分支的结果统一过这一关，绝不让长度不足漏下去。
++func _mp8_pick_spawns(n: int) -> Array :
++	return _mp8_ensure_count(_mp8_pick_rows(n), n)
++
++
++func _mp8_ensure_count(rows: Array, n: int) -> Array :
++
++	if rows.size() == n:
++		return rows
++	if rows.size() > n:
++		return rows.slice(0, n)
++
++	if rows.is_empty():
++		push_warning("[MP8] 碎骨者：一个出生点都拿不到，%d 个人全落到原点" % n)
++		var zero: Array = []
++		for i in n:
++			zero.append([Vector3.ZERO, 0.0])
++		return zero
++
++	# 点池比人数还少（用户点还没加够就开了大局）：末尾循环复用。
++	# 会有人叠在一起，但**不少人** —— 叠着还能玩，少人这局就卡死了。
++	push_warning("[MP8] 碎骨者：点池只给出 %d 个点，%d 个人不够分，末尾循环复用" % [rows.size(), n])
++	var base: int = rows.size()
++	var out: Array = rows.duplicate()
++	for i in range(n - base):
++		out.append(out[i % base])
++	return out
++
++
++# 按人数启用前 N 个，再从里面随机抽 n 个，抽中的点之间保证最小间距。
++func _mp8_pick_rows(n: int) -> Array :
++
++	if _mp8_pool.is_empty():
++		# 兜底：点池没建起来就退回原版容器，至少不比原版差（长度交给 _mp8_ensure_count）
++		var out: Array = []
++		if player_spawn_positions_node != null:
++			for c in player_spawn_positions_node.get_children():
++				if c is Node3D:
++					out.append([(c as Node3D).global_position, (c as Node3D).rotation_degrees.y])
++		return out
++
++	# ⚠️ 上界只能是池子大小，别用 clampi(enabled, n, pool.size()) —— 人数比池子还多时
++	# （你从原版 4 个点起步、直接开 8 人局就是这个情况）min>max，clampi 会把下界原样吐回来，
++	# 于是 range() 生成出池子里根本不存在的下标。不足 n 由 _mp8_ensure_count 兜底，不在这里凑。
++	var enabled: int = int(MP8_POOL_BY_COUNT.get(n, _mp8_pool.size()))
++	enabled = maxi(mini(enabled, _mp8_pool.size()), 1)
++
++	var idx: Array = range(enabled)
++
++	# 手调模式下**不随机**：用户正在对着画面调点，每次开局站位都变会调不下去。
++	# 按顺序取前 n 个，"第几号点站着谁"一眼能对上。
++	if _mp8_edit_on:
++		return _mp8_rows(idx.slice(0, n))
++
++	idx.shuffle()
++
++	# 贪心：间距不够的先跳过；一轮下来没凑够就放宽一档再来。
++	# **绝不少给点** —— 少生成一个人，这局可能永远结束不了（本局没有任何超时）。
++	var gap: float = MP8_PICK_MIN_GAP
++	while gap > 0.0:
++		var chosen: Array = []
++		for i in idx:
++			var p: Vector3 = _mp8_pool[i][0]
++			var ok: bool = true
++			for c in chosen:
++				if p.distance_to(_mp8_pool[c][0]) < gap:
++					ok = false
++					break
++			if ok:
++				chosen.append(i)
++			if chosen.size() >= n:
++				break
++		if chosen.size() >= n:
++			if gap < MP8_PICK_MIN_GAP:
++				print("[MP8] 碎骨者：%d 人抽点时把最小间距放宽到 %.1f 米才凑齐（点池太挤或启用数太少）" % [n, gap])
++			return _mp8_rows(chosen)
++		gap -= 1.0
++
++	# 间距放到 0 还凑不齐 = 启用点数比人数还少，只能重复用点（会有人叠在一起，但不少人）
++	push_warning("[MP8] 碎骨者：启用点数 %d 凑不齐 %d 个人，出现重复出生点" % [enabled, n])
++	var fill: Array = []
++	for i in n:
++		fill.append(idx[i % idx.size()])
++	return _mp8_rows(fill)
++
++
++# 每台装置各挑一个落点：离所有玩家、以及**离另一台装置**都 ≥ gap 米，抽不到就逐米放宽。
++# 一台都找不到时保持场景原位 —— 原版那个位置离人远，比硬塞一个贴脸的点安全。
++func _mp8_place_devices(player_pts: Array) -> void :
++
++	if _mp8_pool.is_empty():
++		return
++
++	# 已占用的点：先是所有玩家出生点，每摆好一台装置就把它也加进去
++	var occupied: Array = player_pts.duplicate()
++
++	for d in _mp8_devices:
++
++		if not is_instance_valid(d):
++			continue
++
++		var spot = _mp8_find_device_spot(occupied, player_pts.size())
++		if spot == null:
++			print("[MP8] 碎骨者：%d 号机找不到离所有人 ≥%.0f 米的点，保持原位" % [
++				d.mp8_index, MP8_DEVICE_MIN_GAP
++			])
++			continue
++
++		mp8_device_place_rpc.rpc(d.get_path(), spot)
++		occupied.append(spot)
++		print("[MP8] 碎骨者：%d 号机落在 (%.2f, %.2f)，离最近的人 %.1f 米" % [
++			d.mp8_index, spot.x, spot.z, _mp8_min_dist(spot, player_pts)
++		])
++
++
++func _mp8_find_device_spot(occupied: Array, n: int):
++
++	var enabled: int = int(MP8_POOL_BY_COUNT.get(n, _mp8_pool.size()))
++	enabled = maxi(mini(enabled, _mp8_pool.size()), 1)
++
++	var cand: Array = range(enabled)
++	# 手调模式下不随机：用户正对着画面调点，装置每局跳一个地方没法对照
++	if not _mp8_edit_on:
++		cand.shuffle()
++
++	var gap: float = MP8_DEVICE_MIN_GAP
++	while gap > 0.0:
++		for i in cand:
++			var p: Vector3 = _mp8_pool[i][0]
++			if _mp8_min_dist(p, occupied) >= gap:
++				return p
++		gap -= 1.0
++
++	return null
++
++
++func _mp8_min_dist(p: Vector3, pts: Array) -> float :
++	var best: float = INF
++	for q in pts:
++		best = minf(best, p.distance_to(q))
++	return best
++
++
++func _mp8_enable_desc() -> String :
++	var parts := PackedStringArray()
++	for n in [4, 5, 6, 7, 8]:
++		parts.append("%d人→前%d" % [n, int(MP8_POOL_BY_COUNT.get(n, _mp8_pool.size()))])
++	return "  ".join(parts)
++
++
++# 每台机器各自摆自己那份 device。
++# ⚠️ 不直接在服务器上设 global_position 了事：device 的物理只在服务器跑
++# （它 _ready() 里对非服务器 set_physics_process(false)），客户端那份得靠这条 RPC 对齐，
++# 否则开局各机看到的装置位置不一样。
++@rpc("any_peer", "call_local", "reliable")
++func mp8_device_place_rpc(dev_path: NodePath, pos: Vector3) -> void :
++
++	var d = get_node_or_null(dev_path)
++	if d == null or not is_instance_valid(d):
++		return
++	d.global_position = pos
++	d.velocity = Vector3.ZERO
++
++
++# ───────────────────────────── 第二台装置
++
++func _mp8_want_devices(n: int) -> int :
++	return int(MP8_DEVICES_BY_COUNT.get(n, 1))
++
++
++# 每台机器各自把装置备齐。**必须每端都建**：device.tscn 自带 MultiplayerSynchronizer，
++# 它靠"两端节点路径一致"配对，所以名字（MP8Device2）和父节点都要两边一样。
++#
++# ⚠️ 用 load() 不用 preload()：preload 在脚本**加载期**解析，路径一旦写错就是
++# 整个脚本加载失败 → 8 个屏全黑（坑第 24 条那种）。load 失败只是这里拿到 null。
++@rpc("any_peer", "call_local", "reliable")
++func mp8_ensure_devices_rpc(want: int) -> void :
++
++	if device == null or not is_instance_valid(device):
++		return
++
++	want = clampi(want, 1, 4)
++
++	while _mp8_devices.size() < want:
++
++		var ps = load(MP8_DEVICE_SCENE)
++		if ps == null:
++			push_warning("[MP8] 碎骨者：装置场景加载不了 %s，第二台放弃" % MP8_DEVICE_SCENE)
++			return
++
++		var idx: int = _mp8_devices.size() + 1
++		var d = ps.instantiate()
++		d.name = "MP8Device%d" % idx
++		device.get_parent().add_child(d)
++
++		# @export 的反向引用：instantiate 出来的这台不知道自己属于哪个小游戏
++		d.game_instance = self
++		d.mp8_index = idx
++		d.global_position = device.global_position
++
++		# 引信不在这儿抄了 —— 两台都在下面按 MP8_DEVICE_FUSE 逐台设（而且故意不等长）。
++		# （probe43 逐属性比过：主场景对 Device 只盖了 activation_duration 这一项，
++		#  其余与 device.tscn 完全相同，所以除了引信没有别的要对齐。
++		#  上一版图省事抄了 11 项，等于在没有依据的地方引入 10 个变量 —— 不干这种事。）
++
++		# ⚠️ 两台装置之间**互不碰撞**。
++		# attach 的时候机器会被挪到 Vector3.DOWN * 100 —— 两台都在**同一个点**；
++		# 各自从人身上下来时又几乎同时复位、重新打开碰撞层，两个碰撞体一重叠，
++		# CharacterBody3D 会被物理引擎直接挤飞（用户实测：装置飞到天上去）。
++		# 原版只有一台，永远撞不到自己，所以这是第二台带进来的问题。
++		# 用碰撞例外而不是改 collision_layer：它只影响这两个刚体之间，
++		# 和地面、墙、玩家的碰撞一个字节都不动。
++		for other in _mp8_devices:
++			if is_instance_valid(other):
++				d.add_collision_exception_with(other)
++				other.add_collision_exception_with(d)
++
++		_mp8_devices.append(d)
++
++		# 信号只在服务器连（原版 _ready 里也是这么分的）
++		if multiplayer.is_server():
++			d.request_new_target.connect(_on_device_requested_target.bind(d))
++
++		print("[MP8] 碎骨者：第 %d 台装置就位（%s）" % [idx, str(d.get_path())])
++
++	# [MP8] 逐台设引信与速度。**1 号机也要设** —— 它是被主场景盖成 20 秒的那台。
++	# 本函数是 call_local 的广播，所以每台机器上的每个装置都会被设到。
++	var forced: float = _mp8_fuse_forced()
++	var parts: PackedStringArray = []
++
++	for i in _mp8_devices.size():
++
++		var d = _mp8_devices[i]
++		if not is_instance_valid(d):
++			continue
++
++		var fuse: float = (forced if forced > 0.0 else float(
++			MP8_DEVICE_FUSE[i] if i < MP8_DEVICE_FUSE.size() else MP8_DEVICE_FUSE[0]
++		))
++		var sp: float = float(
++			MP8_DEVICE_SPEED[i] if i < MP8_DEVICE_SPEED.size() else MP8_DEVICE_SPEED[0]
++		)
++
++		d.activation_duration = fuse
++
++		# ⚠️ 速度是**乘**出来的，所以必须记基准再乘，不能拿当前值连乘 ——
++		# 本函数每轮都跑一次，装置又是跨轮复用的，连乘两轮 1.2 就成了 1.44
++		# （枪械工厂落石倍率栽过这个，见 manufacture_gun_player 的 _mp8_cd_base）。
++		if d.mp8_speed_base.is_empty():
++			d.mp8_speed_base = [
++				d.default_speed, d.new_target_speed, d.speed_increase_over_time
++			]
++		d.default_speed = d.mp8_speed_base[0] * sp
++		d.new_target_speed = d.mp8_speed_base[1] * sp
++		d.speed_increase_over_time = d.mp8_speed_base[2] * sp
++
++		var tint: Color = (
++			MP8_DEVICE_TINT[i] if i < MP8_DEVICE_TINT.size() else MP8_DEVICE_TINT[0]
++		)
++		# 装置自己也记一份：attach 之后本体隐形，红不红要靠它转贴到人背上
++		d.mp8_tint = tint
++		var painted: int = _mp8_tint_device(d, tint)
++
++		var wait: float = _mp8_wait_for(d)
++
++		parts.append("%d号机 引信%.1f秒+等待%.1f秒=周期%.1f秒 %.2f倍速（%.1f→%.1f m/s）%s 贴图钥匙=%s" % [
++			i + 1, fuse, wait, fuse + wait,
++			sp, float(d.mp8_speed_base[1]), d.new_target_speed,
++			("" if painted <= 0 else " 染色%d面" % painted),
++			(d.mp8_tex_key if d.mp8_tex_key != "" else "❌没取到")
++		])
++
++	if _mp8_devices.size() > 0:
++		print("[MP8] 碎骨者：本局 %d 人 → %d 台装置，第 %d 刀退休 —— %s" % [
++			PlayerManager.player_presences.size(), _mp8_devices.size(),
++			_mp8_retire_at(), " | ".join(parts)
++		])
++
++
++# 每轮开局把装置擦干净。只碰**本 mod 引入的状态**和 attach 留下的痕迹：
++# 退休那台停在 BreakSpine 里、隐形、碰撞被关、位置在地下 100 米，
++# 不重置的话第二轮它就是个隐形的废物。位置不用管，_mp8_place_devices 每轮会重摆。
++#
++# ⚠️ 原版的 active / deactivated 两个字段**故意不碰** —— 全脚本没有任何地方读它们
++# （active 只在 device 那个恒 return 的 navigation handler 里读到），
++# 属于死变量，动它反而可能唤醒某条没人走过的分支。
++@rpc("any_peer", "call_local", "reliable")
++func mp8_device_reset_rpc() -> void :
++
++	for d in _mp8_devices:
++
++		if not is_instance_valid(d):
++			continue
++
++		# 先把还骑在人身上的那台摘干净再转 Idle：
++		# 转 Idle 只走 attached_state.exit()（它只清 can_kick / attached_to），
++		# **不会**去调 target.set_spine_breaker_rpc(false)，
++		# 于是上一轮那个人身上的机器视觉会一直留着 —— 下一轮开局就多个幽灵机器。
++		# 这里直接改属性而不发 RPC：本函数自己就是 call_local 的广播，每端各清各的。
++		if d.attached_to != null and is_instance_valid(d.attached_to):
++			var victim = d.attached_to
++			victim.has_spine_breaker = false
++			victim.mp8_current_device = null
++			if victim.spine_breaker_visual != null:
++				victim.spine_breaker_visual.visible = false
++			victim.set_spinebreaker_visuals()
++
++		d.mp8_retired = false
++		d.attached_to = null
++		d.is_attached = false
++		d.breaking_spine = false
++		d.can_kick = true
++		d.can_proximity_target = true
++		d.can_proximity_attach = true
++		d.players_in_proximity.clear()
++		d.visible = true
++		d.set_collision_layer_value(1, true)
++		d.set_collision_mask_value(1, true)
++
++		if multiplayer.is_server():
++			d.state_machine.transition_to(&"Idle")
++
++
++# 领"退休"资格：第 4 个被机器弄死的人，杀他那台就钉在他身上不下来（用户 2026-08-17 定）。
++#
++# 先到先得，而且**只发一次**。两台机器可能同时在杀人，不加这道闸两台会一起退休 ——
++# 场上一台不剩，active_players 再也减不下去，check_game_end() 永远等不到 <=1，
++# 这一小局就卡死了（本局没有任何超时兜底）。
++#
++# ⚠️⚠️ **判据不能数 dead_players —— 数它的那一版从来没生效过。**（2026-08-17 修）
++#
++#   原来写的是 `dead_players.size() != MP8_RETIRE_AFTER_DEATHS - 1` 就不发，
++#   即"要求恰好已经死了 3 个"。但 dead_players 是在 _on_player_died 里追加的，
++#   而本函数是在 BreakSpine.enter()（刀刚下去）被调的 —— 两者之间隔着整段死亡动画。
++#   BreakSpine 那边的注释自己就写明了这个滞后，却还是拿滞后的计数去做**严格相等**判断。
++#
++#   实测（08-17 02:41 那局 8 人，日志已被后来的枪械工厂那局覆盖）：
++#   第 1/2/3/4 次死亡打出来的全是"退休名额：还没发"，一次都没领到。
++#   两台机器接连动手时，两次 enter() 都发生在第 3 次死亡入账之前 → 那一刻计数是 2，
++#   等它入账时已经跳到 4 —— **严格相等的窗口被整个跨过去了**，
++#   而 dead_players 只增不减，越过 3 之后这个等式永远不再成立 = 这一轮再也发不出去。
++#
++#   现在改成数**机器自己动手的次数**（本函数被调一次 = 一刀），
++#   它和"第几个被机器弄死的人"是同一件事，且不受记账滞后影响。
++#   判据用 `<` 不用 `==`：万一哪次没数上，下一刀补发，不会再出现"错过就永远没有"。
++#
++# ⚠️ 只在服务器记账。客户端今天也从来领不到（它的 dead_players 恒为空，
++#    玩家节点是服务器侧生成并连的 emit_died），这里显式挡住 ——
++#    换了判据之后客户端的计数会自己涨起来，不挡的话它会把机器标成退休、
++#    而服务器侧没标，两边画面就此对不上。
++# victim 可以不传（老调用点），但传了才能去重 —— 见下面那段。
++func mp8_claim_retire(victim = null) -> bool :
++
++	if not multiplayer.is_server():
++		return false
++
++	# [MP8] 🩸 同一条命只算一刀。
++	#
++	# 2026-08-18 用户 6 人真人局：两台机器粘在同一个人身上，各自的引信到点后
++	# **对同一条命各调了一次本函数**，`_mp8_kills_started` 于是虚增 ——
++	# 6 人局本该第 4 刀才发退休名额，可能第 3 个人死的时候就发了，
++	# 场上过早只剩一台机器。（真正的"粘两台"已在 thrown_state 堵掉，
++	# 这里是第三道闸：即使又被绕过去，**退休时机也不会被算错**。）
++	#
++	# 用 network_id 去重而不是节点引用：节点在死亡动画里还活着，但 id 是稳定的。
++	if victim != null and is_instance_valid(victim):
++		var vid = victim.player_presence.network_id if victim.player_presence != null else -1
++		if vid != -1:
++			if _mp8_counted_victims.has(vid):
++				print("[MP8] 碎骨者：%s 已经被算过一刀了，本次不重复计数（说明有两台粘同一个人）" % String(victim.name))
++				return false
++			_mp8_counted_victims.append(vid)
++
++	_mp8_kills_started += 1
++
++	if _mp8_retire_claimed:
++		return false
++	if _mp8_devices.size() < 2:              # 只有一台的局（4~5 人）不退休
++		return false
++	if _mp8_kills_started < _mp8_retire_at():
++		return false
++
++	_mp8_retire_claimed = true
++	return true
++
++
++func _mp8_rows(indices: Array) -> Array :
++	var out: Array = []
++	for i in indices:
++		out.append([_mp8_pool[i][0], float(_mp8_pool[i][1])])
++	return out
++
++
++# ───────────────────────────── 判据（手调面板实时显示这两条）
++
++# 导航网格：device 靠 NavigationAgent3D 追人，出生点落在网格外的人追不到。
++# ⚠️ 用运行时的 NavigationServer3D 查，不要拿 navmesh 顶点自己做 XZ 内点测试 ——
++#    这张网格是**多层**的（probe41 实测 y∈[0.50, 6.50]），投影判据会误判。
++# ⚠️ 世界要从 camera 取，**不能写 self.get_world_3d()** —— `Minigame extends Node`（不是
++#    Node3D），self 上根本没有这个方法，运行时直接报 Nonexistent function。
++#    原版 `_physics_process` 里写的也是 `camera.get_world_3d()`，就是这个原因。
++#    （parsecheck 查的是作用域，不查方法存不存在，这一条它挡不住 —— 坑第 24 条的延伸。）
++func _mp8_on_navmesh(pos: Vector3) -> bool :
++	if camera == null:
++		return true
++	var map: RID = camera.get_world_3d().navigation_map
++	if not map.is_valid():
++		return true
++	var closest: Vector3 = NavigationServer3D.map_get_closest_point(map, pos)
++	return Vector2(closest.x - pos.x, closest.z - pos.z).length() <= MP8_NAV_TOL
++
++
++# 相机是**固定的**（不跟随），出生点在框外 = 那个人开局找不到自己。
++# 留 8% 边：正好卡在边缘的点，人一动就出画。
++func _mp8_in_frame(pos: Vector3) -> bool :
++	var cam: Camera3D = get_viewport().get_camera_3d()
++	if cam == null:
++		return true
++	if cam.is_position_behind(pos):
++		return false
++	var vr: Rect2 = get_viewport().get_visible_rect()
++	var m: Vector2 = vr.size * 0.08
++	return Rect2(vr.position + m, vr.size - m * 2.0).has_point(cam.unproject_position(pos))
++
++
++func _mp8_nearest_gap(i: int) -> float :
++	var best: float = INF
++	var pi: Vector3 = _mp8_pool[i][0]
++	for j in _mp8_pool.size():
++		if j == i:
++			continue
++		var pj: Vector3 = _mp8_pool[j][0]
++		best = minf(best, pi.distance_to(pj))
++	return best
++
++
++# ───────────────────────────── 手调模式
++
++# ⚠️ 这些可视标记是**运行时新建的场景节点**，只在传 mp8spineedit 时才建。
++# （坑第 14 条说的"补数组长度时别新建节点"针对的是往定长数组里塞 AudioStreamPlayer
++# 那种、会破坏流程的做法；这里和残骸平台的头顶名牌同类，是纯视觉件，正常游玩不建。）
++func _mp8_edit_begin() -> void :
++
++	if _mp8_pool.is_empty():
++		push_warning("[MP8] 碎骨者：点池是空的，手调模式不启动")
++		_mp8_edit_on = false
++		return
++
++	var lbl := Label.new()
++	lbl.name = "MP8SpineEditPanel"
++	lbl.set_anchors_preset(Control.PRESET_BOTTOM_LEFT)
++	lbl.offset_left = 16.0
++	lbl.offset_top = -190.0
++	lbl.offset_right = 1100.0
++	lbl.offset_bottom = -8.0
++	_mp8_style_label(lbl, Color(0.6, 0.95, 1.0))
++	_mp8_edit_layer().add_child(lbl)
++	_mp8_edit_panel = lbl
++
++	_mp8_rebuild_markers()
++	_mp8_edit_check_keys()
++	_mp8_edit_refresh()
++
++	print("[MP8] 碎骨者：出生点手调已开 —— 点池 %d 个，来源 %s" % [
++		_mp8_pool.size(), _mp8_pool_src
++	])
++
++
++func _mp8_edit_layer() -> CanvasLayer :
++	if _mp8_edit_canvas == null:
++		_mp8_edit_canvas = CanvasLayer.new()
++		_mp8_edit_canvas.layer = 100
++		add_child(_mp8_edit_canvas)
++	return _mp8_edit_canvas
++
++
++# ⚠️ 必须显式指定游戏自己的字体：默认主题字体**字距是坏的**
++# （实测会把 "P3  id 104..." 显示成 "P36idc104..."）。猎鸭、残骸平台、枪械工厂都栽过。
++func _mp8_style_label(lbl: Label, color: Color) -> void :
++	var f = load("res://fonts/Terminal F4.ttf")
++	if f != null:
++		lbl.add_theme_font_override("font", f)
++	lbl.add_theme_font_size_override("font_size", 22)
++	lbl.add_theme_color_override("font_color", color)
++	lbl.add_theme_color_override("font_outline_color", Color.BLACK)
++	lbl.add_theme_constant_override("outline_size", 6)
++	lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
++
++
++func _mp8_rebuild_markers() -> void :
++
++	for m in _mp8_markers:
++		if is_instance_valid(m):
++			m.queue_free()
++	_mp8_markers.clear()
++
++	var font = load("res://fonts/Terminal F4.ttf")
++
++	for i in _mp8_pool.size():
++
++		var root := Node3D.new()
++		root.name = "MP8SpawnMarker%d" % i
++		add_child(root)
++
++		var mi := MeshInstance3D.new()
++		var cyl := CylinderMesh.new()
++		cyl.top_radius = 0.35
++		cyl.bottom_radius = 0.35
++		cyl.height = MP8_MARKER_H
++		mi.mesh = cyl
++		var mat := StandardMaterial3D.new()
++		mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
++		mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
++		mat.albedo_color = Color(0.2, 1.0, 0.3, 0.45)
++		mi.material_override = mat
++		mi.position.y = MP8_MARKER_H * 0.5
++		root.add_child(mi)
++
++		# 朝向指示：从柱子往正前方伸一小截，好确认这个点的 yaw 对不对
++		var nose := MeshInstance3D.new()
++		var box := BoxMesh.new()
++		box.size = Vector3(0.18, 0.18, 1.2)
++		nose.mesh = box
++		nose.material_override = mat
++		nose.position = Vector3(0.0, 0.35, -0.8)
++		root.add_child(nose)
++
++		var tag := Label3D.new()
++		tag.billboard = BaseMaterial3D.BILLBOARD_ENABLED
++		tag.font_size = 180
++		tag.outline_size = 36
++		tag.outline_modulate = Color.BLACK
++		tag.no_depth_test = true      # 被墙挡住也要看得见，否则找不着自己在调哪个
++		if font != null:
++			tag.font = font
++		tag.text = str(i + 1)
++		tag.position = Vector3(0.0, MP8_MARKER_H + 0.6, 0.0)
++		root.add_child(tag)
++
++		_mp8_markers.append(root)
++
++	_mp8_sync_markers()
++
++
++func _mp8_sync_markers() -> void :
++
++	for i in _mp8_markers.size():
++		if i >= _mp8_pool.size():
++			break
++		var root: Node3D = _mp8_markers[i]
++		if not is_instance_valid(root):
++			continue
++		var p: Vector3 = _mp8_pool[i][0]
++		root.global_position = p
++		root.rotation_degrees = Vector3(0.0, float(_mp8_pool[i][1]), 0.0)
++
++		# 颜色 = 判据结果：选中黄，合法绿，不合法红
++		var col := Color(0.2, 1.0, 0.3, 0.45)
++		if not _mp8_on_navmesh(p) or not _mp8_in_frame(p):
++			col = Color(1.0, 0.25, 0.2, 0.55)
++		if i == _mp8_edit_sel:
++			col = Color(1.0, 0.9, 0.2, 0.75)
++		for c in root.get_children():
++			if c is MeshInstance3D:
++				var mat = (c as MeshInstance3D).material_override
++				if mat is StandardMaterial3D:
++					(mat as StandardMaterial3D).albedo_color = col
++
++
++func _mp8_edit_check_keys() -> void :
++
++	var mine: Dictionary = {
++		KEY_Q: "上一个点", KEY_E: "下一个点",
++		KEY_I: "远", KEY_K: "近", KEY_J: "左", KEY_L: "右",
++		KEY_U: "左转", KEY_O: "右转",
++		KEY_N: "新增", KEY_X: "删除", KEY_T: "试摆",
++		KEY_5: "步长", KEY_0: "存盘", KEY_9: "复位", KEY_8: "打报告",
++	}
++	var clash := PackedStringArray()
++
++	for action in InputMap.get_actions():
++		for ev in InputMap.action_get_events(action):
++			var k := ev as InputEventKey
++			if k == null:
++				continue
++			for code in [k.keycode, k.physical_keycode]:
++				if code != 0 and mine.has(code):
++					clash.append("%s(%s)↔动作 %s" % [
++						OS.get_keycode_string(code), mine[code], String(action)
++					])
++
++	if clash.is_empty():
++		print("[MP8] 碎骨者：手调按键与游戏 InputMap 无冲突（查了 %d 个动作）" % InputMap.get_actions().size())
++	else:
++		push_warning("[MP8] 碎骨者：手调按键和游戏动作撞车 —— %s" % ", ".join(clash))
++		print("[MP8] 碎骨者：⚠️ 按键撞车 —— %s" % ", ".join(clash))
++
++
++func _unhandled_key_input(event: InputEvent) -> void :
++
++	if not _mp8_edit_on or _mp8_pool.is_empty():
++		return
++	var key := event as InputEventKey
++	if key == null or not key.pressed or key.echo:
++		return
++
++	var step: float = MP8_EDIT_STEPS[_mp8_edit_step_i]
++	_mp8_edit_sel = clampi(_mp8_edit_sel, 0, _mp8_pool.size() - 1)
++
++	match key.keycode:
++
++		KEY_Q, KEY_E:
++			var d: int = (-1 if key.keycode == KEY_Q else 1)
++			_mp8_edit_sel = posmod(_mp8_edit_sel + d, _mp8_pool.size())
++			_mp8_sync_markers()
++			_mp8_edit_refresh()
++
++		KEY_I, KEY_K, KEY_J, KEY_L:
++			# 按**屏幕方向**推，不是世界坐标轴 —— 而且从当前相机基向量实时算，
++			# 相机哪天改了也不会反向（照抄枪械工厂 _mp8_screen_axis 的做法）。
++			var dir: Vector2 = _mp8_screen_axis(key.keycode)
++			if dir == Vector2.ZERO:
++				return
++			var cur: Vector3 = _mp8_pool[_mp8_edit_sel][0]
++			_mp8_pool[_mp8_edit_sel][0] = Vector3(cur.x + dir.y * step, cur.y, cur.z + dir.x * step)
++			_mp8_sync_markers()
++			_mp8_edit_refresh()
++
++		KEY_U, KEY_O:
++			var dy: float = (- MP8_EDIT_YAW_STEP if key.keycode == KEY_U else MP8_EDIT_YAW_STEP)
++			_mp8_pool[_mp8_edit_sel][1] = fposmod(float(_mp8_pool[_mp8_edit_sel][1]) + dy, 360.0)
++			_mp8_sync_markers()
++			_mp8_edit_refresh()
++
++		KEY_N:
++			# 新增：在当前点右边 2 米放一个，朝向照抄。加在**末尾**（顺序=优先级）
++			var base: Vector3 = _mp8_pool[_mp8_edit_sel][0]
++			var right: Vector2 = _mp8_screen_axis(KEY_L)
++			var np := Vector3(base.x + right.y * 2.0, base.y, base.z + right.x * 2.0)
++			_mp8_pool.append([np, float(_mp8_pool[_mp8_edit_sel][1])])
++			_mp8_edit_sel = _mp8_pool.size() - 1
++			_mp8_rebuild_markers()
++			_mp8_edit_refresh()
++			print("[MP8] 碎骨者：新增第 %d 个点 (%.2f, %.2f)" % [_mp8_pool.size(), np.x, np.z])
++
++		KEY_X:
++			if _mp8_pool.size() <= 1:
++				return
++			_mp8_pool.remove_at(_mp8_edit_sel)
++			_mp8_edit_sel = clampi(_mp8_edit_sel, 0, _mp8_pool.size() - 1)
++			_mp8_rebuild_markers()
++			_mp8_edit_refresh()
++			print("[MP8] 碎骨者：删掉一个点，现在 %d 个" % _mp8_pool.size())
++
++		KEY_T:
++			mp8_spine_tryout_rpc.rpc()
++
++		KEY_5:
++			_mp8_edit_step_i = (_mp8_edit_step_i + 1) % MP8_EDIT_STEPS.size()
++			_mp8_edit_refresh()
++
++		KEY_0:
++			var ok: bool = _mp8_save_layout_file()
++			_mp8_edit_refresh()
++			if _mp8_edit_panel != null:
++				_mp8_edit_panel.text = ("【已存盘】下次开局自动用这套点池\n" if ok
++					else "【存盘失败】看日志\n") + _mp8_edit_panel.text
++
++		KEY_9:
++			_mp8_init_pool(true)
++			_mp8_edit_sel = 0
++			_mp8_rebuild_markers()
++			_mp8_edit_refresh()
++			print("[MP8] 碎骨者：点池已复位成场景原版（存盘文件没删，要彻底回退请删掉它）")
++
++		KEY_8:
++			_mp8_edit_report()
++
++		_:
++			return
++
++	get_viewport().set_input_as_handled()
++
++
++# 屏幕方向 → 世界水平方向。返回 Vector2(dz, dx)：x 分量给世界 z，y 分量给世界 x。
++func _mp8_screen_axis(code: int) -> Vector2 :
++
++	var cam: Camera3D = get_viewport().get_camera_3d()
++	if cam == null:
++		return Vector2.ZERO
++
++	# 压平到水平面：俯角不该让"往上推"变成往天上飞（本局相机俯角 -67°，压平很关键）
++	var right: Vector3 = cam.global_transform.basis.x
++	var fwd: Vector3 = - cam.global_transform.basis.z
++	var r2 := Vector2(right.z, right.x)
++	var f2 := Vector2(fwd.z, fwd.x)
++	if r2.length() < 0.001 or f2.length() < 0.001:
++		return Vector2.ZERO
++	r2 = r2.normalized()
++	f2 = f2.normalized()
++
++	match code:
++		KEY_L: return r2
++		KEY_J: return - r2
++		KEY_I: return f2
++		KEY_K: return - f2
++	return Vector2.ZERO
++
++
++# 试摆：把在场的人按点池顺序摆到前 N 个点上，直接看 8 个人站上去是什么样。
++# ⚠️ 走 RPC 是因为要动**所有**玩家的位置，不是本地视觉件。
++@rpc("any_peer", "call_local", "reliable")
++func mp8_spine_tryout_rpc() -> void :
++
++	if not multiplayer.is_server():
++		return
++
++	var list: Array = players.values()
++	for i in list.size():
++		if i >= _mp8_pool.size():
++			break
++		var pl = list[i]
++		if not is_instance_valid(pl):
++			continue
++		pl.setup_rpc.rpc(
++			_mp8_pool[i][0],
++			device.get_path(),
++			Vector3(0.0, float(_mp8_pool[i][1]), 0.0)
++		)
++	print("[MP8] 碎骨者：试摆 —— %d 个人已摆到点池前 %d 个点上" % [
++		list.size(), mini(list.size(), _mp8_pool.size())
++	])
++
++
++func _mp8_edit_refresh() -> void :
++
++	if _mp8_edit_panel == null:
++		return
++
++	var i: int = clampi(_mp8_edit_sel, 0, _mp8_pool.size() - 1)
++	var p: Vector3 = _mp8_pool[i][0]
++	var n: int = PlayerManager.player_presences.size()
++	var need: int = int(MP8_POOL_BY_COUNT.get(n, _mp8_pool.size()))
++	var gap: float = _mp8_nearest_gap(i)
++
++	var lines := PackedStringArray()
++	lines.append("【碎骨者 出生点手调】点 %d/%d   步长 %.1f 米   来源：%s" % [
++		i + 1, _mp8_pool.size(), MP8_EDIT_STEPS[_mp8_edit_step_i], _mp8_pool_src
++	])
++	lines.append("坐标 (%.2f, %.2f)   朝向 %.0f°   离最近的点 %.1f 米" % [
++		p.x, p.z, float(_mp8_pool[i][1]), gap
++	])
++	lines.append("导航网格 %s     相机框 %s" % [
++		("✅在网格上" if _mp8_on_navmesh(p) else "❌在网格外，device 追不到"),
++		("✅在框内" if _mp8_in_frame(p) else "❌出框，开局看不见自己"),
++	])
++	lines.append("当前 %d 人局要启用前 %d 个点，池里有 %d 个%s" % [
++		n, need, _mp8_pool.size(),
++		("" if _mp8_pool.size() >= need else "  ⚠️ 还差 %d 个" % (need - _mp8_pool.size()))
++	])
++	lines.append("Q/E 选点  IKJL 推  U/O 转  N 新增  X 删除  T 试摆  5 步长  0 存盘  9 复位  8 报告")
++
++	_mp8_edit_panel.text = "\n".join(lines)
++
++
++func _mp8_edit_report() -> void :
++
++	print("[MP8] ========== 碎骨者点池报告（%d 个）==========" % _mp8_pool.size())
++	var bad: int = 0
++	for i in _mp8_pool.size():
++		var p: Vector3 = _mp8_pool[i][0]
++		var nav: bool = _mp8_on_navmesh(p)
++		var frm: bool = _mp8_in_frame(p)
++		if not nav or not frm:
++			bad += 1
++		print("  %2d. (%7.2f, %7.2f) 朝向 %3.0f°  离最近点 %5.2f 米  网格 %s  相机框 %s" % [
++			i + 1, p.x, p.z, float(_mp8_pool[i][1]), _mp8_nearest_gap(i),
++			("在" if nav else "❌外"), ("在" if frm else "❌外")
++		])
++	print("[MP8] 各人数启用：%s" % _mp8_enable_desc())
++	var maxn: int = int(MP8_POOL_BY_COUNT.get(8, 0))
++	if _mp8_pool.size() > maxn:
++		print("[MP8] ⚠️ 池里有 %d 个点，但 8 人局只启用前 %d 个 —— 第 %d~%d 个是死点，抽不到。改 MP8_POOL_BY_COUNT" % [
++			_mp8_pool.size(), maxn, maxn + 1, _mp8_pool.size()
++		])
++	if bad > 0:
++		print("[MP8] ⚠️ 有 %d 个点不合法（网格外或相机框外），存盘前先修掉" % bad)
++	else:
++		print("[MP8] ✅ 全部 %d 个点都在导航网格上、都在相机框内" % _mp8_pool.size())

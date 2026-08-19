@@ -1,0 +1,71 @@
+diff --git a/minigames/spine_breaker/components/device/states/break_spine_state.gd b/minigames/spine_breaker/components/device/states/break_spine_state.gd
+--- a/minigames/spine_breaker/components/device/states/break_spine_state.gd
++++ b/minigames/spine_breaker/components/device/states/break_spine_state.gd
+@@ -17,9 +17,41 @@ func enter(_msg: Dictionary = {}) -> void :
+ 
+ 	target = _msg.get("target")
+ 
++	# ═══════════════════════════════════════════════════════════════════════
++	# [MP8] 🩸 目标已经死了就别进这套流程 —— 会卡死
++	# ═══════════════════════════════════════════════════════════════════════
++	#
++	# 下面靠 `target.spine_broken` 这个**一次性信号**驱动复位。对一个已经死了的人
++	# 再走一遍：`break_spine_rpc` 里是 await 0.5 + await 0.5，信号可能在我们
++	# connect 之前就发完了 —— 那样 `_on_spine_broken` 永远不来，本状态的
++	# update/update_physics 又都是空的，这台机器就**永远停在 BreakSpine**。
++	#
++	# 这正是 2026-08-18 用户 6 人真人局报的"两个碎骨者都不动了"的后半段。
++	# 前半段（两台粘同一个人）已在 thrown_state 堵掉，这里是**第二道闸**：
++	# 就算将来又有哪条路径绕过去，也只是少杀一次，不会把机器卡死。
++	if target == null or not is_instance_valid(target) or not target.active:
++		if multiplayer.is_server():
++			print("[MP8] 碎骨者：%d 号机要处决的人已经死了 —— 跳过，直接去找新目标" % owner.mp8_index)
++		owner.light_animation_player.stop()
++		# ⚠️ 不能在 enter() 里同步 transition_to（状态机正在本次转换的中途），
++		# 用 call_deferred 推到本帧末尾。Idle 收到 after_break 会发 request_new_target。
++		state_machine.call_deferred("transition_to", &"Idle", {"after_break": true})
++		return
++
+ 	owner.light_animation_player.stop()
+ 	target.blink_animation_player.stop()
+ 
++	# [MP8] 这一刀下去是第几个死的？在这里问、而不是等人真死了再问 ——
++	# 原版顺序是 spine_broken.emit()（机器复位）**先**、emit_died（主脚本记账）**后**，
++	# 等主脚本知道"第 4 个死了"的时候，机器早就复位跑去找下一个目标了。
++	# mp8_claim_retire() 是先到先得的：两台机器同时在杀人时只有一台领得到退休，
++	# 否则两台一起退休，场上一台不剩，这一小局永远结束不了。
++	# [MP8] 把受害者一起传过去 —— 主脚本靠它去重（同一条命被两台各砍一次时只算一刀）。
++	if owner.game_instance != null and owner.game_instance.has_method("mp8_claim_retire"):
++		if owner.game_instance.mp8_claim_retire(target):
++			owner.mp8_retired = true
++			print("[MP8] 碎骨者：%d 号机杀完这个人就不下来了（砍完场上剩 2 人，留 1 台打 1v1），退出流通" % owner.mp8_index)
++
+ 	fallback_position = target.global_position
+ 	target.spine_broken.connect(_on_spine_broken, CONNECT_ONE_SHOT)
+ 	target.break_spine_rpc.rpc()
+@@ -37,6 +69,25 @@ func update_physics(_delta: float) -> void :
+ 
+ func _on_spine_broken():
+ 
++	# [MP8] 退休那台：整段复位一个都不做，就此停在 BreakSpine 状态里。
++	#   * 不 global_position = fallback_position → 机器留在 attached 时被挪去的地下 100 米，不碍事；
++	#   * 不 spine_broken_exited_rpc() → 不现形、不变绿灯；
++	#   * **不 target.set_spine_breaker_rpc(false)** → 尸体背上那台机器的视觉一直亮着，
++	#     这正是"机器不从他身上下来"的画面；
++	#   * 不 transition_to(Idle, after_break) → 不发 request_new_target，这台就此退出流通。
++	# 状态机停在 BreakSpine，本状态的 update/update_physics 都是空的，不会再动。
++	if owner.mp8_retired:
++		print("[MP8] 碎骨者：%d 号机钉在尸体上了（不复位、不找新目标、熄灯）" % owner.mp8_index)
++		# 熄灯要广播：尸体背上那个机器视觉的闪烁是**每个客户端自己**在 _process 里
++		# 按这台的 light_animation_player.speed_scale 驱动的（见 mp8_retire_quiet_rpc）。
++		if target != null and is_instance_valid(target):
++			owner.mp8_retire_quiet_rpc.rpc(target.get_path())
++		return
++
++	print("[MP8] 碎骨者：%d 号机杀完复位到 (%.2f, %.2f)" % [
++		owner.mp8_index, fallback_position.x, fallback_position.z
++	])
++
+ 	owner.global_position = fallback_position
+ 	owner.force_update_transform()
+ 

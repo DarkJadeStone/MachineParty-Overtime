@@ -1,0 +1,1441 @@
+diff --git a/minigames/escalator_pit/scripts/escalator_pit.gd b/minigames/escalator_pit/scripts/escalator_pit.gd
+--- a/minigames/escalator_pit/scripts/escalator_pit.gd
++++ b/minigames/escalator_pit/scripts/escalator_pit.gd
+@@ -42,6 +42,1242 @@ var camera_progress: float = PI + (PI * 0.5)
+ 
+ var collective_speed: float = 0.0
+ 
++
++# [MP8] ================ 逆向行进 8 人适配 v4：单场 8 车道 ================
++#
++# 用户 2026-08-16 定案：**8 个人必须在同一个场景里同场竞赛、互相看得见。**
++# （v3 的"两份场地 +120 米 + 两个相机"实测能跑、灯也修好了，但两组人永远看不见
++#   对方 —— 不满足这条，整套作废。）
++#
++# ⚠️ 三条死路，别重走：
++#   v1  art11 整体横向拉伸 1.8 倍 → 扶手只是被拉宽挪位，8 条履带对不上 4 套扶手。
++#   v2  挑几个"随车道走"的节点复制、其余背景拉宽 → 复制件和拉伸背景永远差一点。
++#   v3  整份场地平移复制 +120 米 + 两个相机 → 对齐完美，但劈成两组互相看不见。
++#
++# **v4 的分界线，全部关键就这一句：**
++#   > 跟车道走的件：**只平移，绝不缩放**；背景大件：**只拉伸，不平移**。
++#   v2 的"没对齐"正是把这两类混着处理出来的。v4 把两类逐个节点列死，
++#   名字与坐标全部来自 probe24 / 29 / 30 / 31 对**原装 PCK** 的实测，不是猜的。
++#
++# 几何事实：
++#   1. 4 条车道 x = -9.591 / -3.191 / +3.209 / +9.567，间距 6.4 米。
++#   2. **扶手是"一块管两条车道"的整雕网格**：`Plane_003` 管左两条，
++#      `BézierCurve` + `BézierCurve_001` 管右两条。拆不开 →
++#      **复制步长 = 两条车道 = 12.8 米**，车道间距因此被锁死在原版的 6.4 米。
++#   3. 8 条车道横跨 44.76 米 = 原版 19.16 米的 **2.34 倍**，所以背景必须同倍拉伸：
++#      站人的 `base platform` 只有 30 米宽、护栏在 ±13.5，不拉的话外侧 4 个人站在平台外。
++#   4. 灯只有 4 盏点光源（range 29.5），环境光是纯黑、两盏平行光 `visible = false`
++#      —— **灯不跟着场地走就是黑虚空**（v3 第一版的教训，见 `_mp8_local_delta`）。
++#   5. 相机：`move` 动画每帧写 `CameraTarget` 的 position 与 rotation，
++#      但 **`Camera3D:fov` 那条轨 0 个键**（probe23）→ 改 Camera3D 自己的位置是安全的。
++const MP8_LANES_MAX: int = 8
++
++## 复制步长 = 两条车道 = 一块扶手。**不许改成 6.4**，那样扶手会对不上。
++const MP8_PAIR_STEP_DEFAULT: float = 12.8
++
++## 背景 X 拉伸倍率 = 新跨度 / 原跨度 = 44.76 / 19.16
++const MP8_WIDE_SCALE_DEFAULT: float = 2.34
++
++## 相机拉远倍率。**默认 1.0 = 不拉远**（用户 2026-08-16 实测："单个相机里的太远了"）。
++## 留着只当对照旋钮，`mp8esccam=2.34` 可以回到"一台相机看全场"那版。
++const MP8_CAM_PULL_DEFAULT: float = 1.0
++
++## **两台原版相机**：左边一台框左 4 条道、右边一台框右 4 条道（用户 2026-08-16 定案）。
++## 数字是对上的：左半 4 条道从 -22.39 到 -3.19 = **19.2 米，正好等于原版 4 条道的跨度**，
++## 所以相机既不用拉远、也不用改 fov，**整体平移 ±12.8 米**（= 一个复制步长）就框得和原版一样满。
++## 相机是每台机器一份的本地表现，所以这条只发给当事人（`rpc_id`）。
++const MP8_CAM_SIDE_DEFAULT: float = 12.8
++
++## 摇摆幅度倍率：原版 `move` 动画的 `.:rotation` 让相机左右扫 26.7° ~ -31.1°（probe23）。
++## 放大它 = 每台相机能扫到对面那半场，8 个人互相看得见（用户要求"摇摆幅度大一点"）。
++const MP8_SWING_DEFAULT: float = 1.6
++
++## fov：0 = 不动（原版 68.5）。想再多带一点余光就传 `mp8escfov=78`。
++const MP8_FOV_DEFAULT: float = 0.0
++
++## `base platform`（贴图 `paint rusted1 painted bloody1`，那块锈铁板）单独的拉伸倍率。
++## 用户 2026-08-16 实测：按 2.34 倍拉之后它**从扶梯底下摊出来变成一大片裸露黄铁皮**
++## —— 原版 x 只有 ±15、被四条扶梯压着基本看不见。
++## **默认 1.0 = 不拉**（用户 2026-08-16 实测后定：黄铁皮不拉伸）。
++## 想让它跟着全局拉就传 `mp8escplat=2.34`，`mp8escplat=-1` = 跟随 `mp8escwide`。
++const MP8_PLAT_SCALE_DEFAULT: float = 1.0
++const MP8_PLAT_NODE: String = "base platform"
++
++## **跟车道走的件**（art11 的直接子节点）：只平移，一律不缩放。
++## x < 0 的往 -x 挪一个步长，x > 0 的往 +x 挪，x ≈ 0 的（中间那根分隔柱）两边各来一份。
++const MP8_LANE_ART: Array[String] = [
++	"Plane_003",        # 左两条车道的整块扶手
++	"BézierCurve",      # 右两条车道的整块扶手
++	"BézierCurve_001",  # 同上（两层）
++	"Cylinder",         # 车道间分隔柱（-6.4）
++	"Cylinder2",        # 车道间分隔柱（0）
++	"Cylinder3",        # 车道间分隔柱（+6.4）
++]
++
++## 头顶横梁：**本体是背景**（37.5 米长的横杆，要拉伸），
++## **子节点里的 CRT 是车道件**（要平移）。所以它两类都占，单独处理，见 `_mp8_widen_gantry()`。
++const MP8_GANTRY: String = "Cube_009"
++
++var _mp8_step: float = 0.0        # 车道件平移步长（0 = 本局没扩）
++var _mp8_wide: float = 1.0        # 背景 X 拉伸倍率
++var _mp8_cam_pull: float = 1.0    # 相机拉远倍率（1 = 不拉）
++var _mp8_cam_side: float = 0.0    # 左右两台相机各自平移多少米
++var _mp8_swing: float = 1.0       # 摇摆幅度倍率
++var _mp8_fov: float = 0.0         # fov 覆盖值（0 = 用原版）
++var _mp8_plat: float = -1.0       # base platform 的单独拉伸倍率（-1 = 跟随全局）
++var _mp8_light_check: Array[Node3D] = []   # 复制出来的灯，进树后打真实世界坐标自证
++
++# [MP8] 告诉 network_manager 的通用补位：这个小游戏自己管出生点，别插手。
++var mp8_owns_spawns: bool = true
++
++
++# ⚠️ 为什么写在 `_enter_tree()` 而不是 `_ready()`：
++# Godot 的顺序是「根 _enter_tree → 子孙 _enter_tree → 子孙 _ready → 根 _ready」，
++# 而 `StairHandler._ready()` 会把 `paths_parent.get_children()` 抄进自己的数组。
++# 写在根的 `_ready()` 里就晚了 —— 那时它已经只认得原版那 4 条履带。
++func _enter_tree() -> void :
++	_mp8_parse_gameplay_args()
++	_mp8_build_wide_venue()
++
++
++# ⚠️ 玩法开关和"8 人适配"是两回事：4 人局也该按新玩法跑，
++# 所以这段在 `_mp8_build_wide_venue()` 的人数判断**之前**单独解析。
++func _mp8_parse_gameplay_args() -> void :
++
++	var args := Array(OS.get_cmdline_args())
++	_mp8_info_on = args.has("mp8escinfo")
++
++	for a in args:
++		var s := String(a)
++		if s.begins_with("mp8escmode="):
++			_mp8_survival = (s.substr(11) != "vanilla")
++		elif s.begins_with("mp8escbase="):
++			_mp8_belt_base = float(s.substr(11))
++		elif s.begins_with("mp8escramp="):
++			_mp8_belt_ramp = float(s.substr(11))
++		elif s.begins_with("mp8esccapv="):
++			_mp8_belt_cap = float(s.substr(11))
++
++	if _mp8_survival:
++		print("[MP8] 逆向行进：玩法=生存（扶梯 %.2f 起步，每秒 +%.3f，封顶 %.2f）—— 扶梯不再看任何玩家的速度" % [
++			_mp8_belt_base, _mp8_belt_ramp, _mp8_belt_cap])
++	else:
++		print("[MP8] 逆向行进：玩法=原版（扶梯速度 = 全场最快那个人，钳 1.0）")
++
++
++func _mp8_build_wide_venue() -> void :
++
++	var args := Array(OS.get_cmdline_args())
++
++	# 纯原版对照组（和残骸平台同名，含义一致：这次改动整个不跑）
++	if args.has("mp8noexpand"):
++		print("[MP8] 逆向行进：mp8noexpand，保持原版 4 条车道")
++		return
++
++	var want: int = clampi(PlayerManager.player_presences.size(), 0, MP8_LANES_MAX)
++	if want <= 4:
++		print("[MP8] 逆向行进：%d 人，用原版 4 条车道，一个字不改" % want)
++		return
++
++	_mp8_step = MP8_PAIR_STEP_DEFAULT
++	_mp8_wide = MP8_WIDE_SCALE_DEFAULT
++	_mp8_cam_pull = MP8_CAM_PULL_DEFAULT
++	_mp8_cam_side = MP8_CAM_SIDE_DEFAULT
++	_mp8_swing = MP8_SWING_DEFAULT
++	_mp8_fov = MP8_FOV_DEFAULT
++	_mp8_plat = MP8_PLAT_SCALE_DEFAULT
++	for a in args:
++		var s := String(a)
++		if s.begins_with("mp8escpair="):
++			_mp8_step = float(s.substr(11))
++		elif s.begins_with("mp8escwide="):
++			_mp8_wide = float(s.substr(11))
++		elif s.begins_with("mp8esccam="):
++			_mp8_cam_pull = float(s.substr(10))
++		elif s.begins_with("mp8escside="):
++			_mp8_cam_side = float(s.substr(11))
++		elif s.begins_with("mp8escswing="):
++			_mp8_swing = float(s.substr(12))
++		elif s.begins_with("mp8escfov="):
++			_mp8_fov = float(s.substr(10))
++		elif s.begins_with("mp8escplat="):
++			_mp8_plat = float(s.substr(11))
++	_mp8_edit_on = args.has("mp8escedit")
++
++	# ⚠️ 顺序有讲究：**先拉背景，再平移车道件**。
++	# 反过来的话，车道件的副本会被随后的父节点缩放一起拉宽 —— 那就又变成 v2 了。
++	_mp8_widen_backdrop()
++	_mp8_clone_lane_art()
++	_mp8_clone_lanes()
++	_mp8_place_spawns()
++	_mp8_clone_lights()
++
++	# 手调布局：收件 → 有存盘文件就按文件摆（文件说了算，能加件也能藏件）
++	_mp8_edit_collect()
++	if not args.has("mp8escnofile"):
++		_mp8_apply_layout_file()
++
++	print("[MP8] 逆向行进：%d 人 → 单场 8 车道（步长 %.2f 米，背景 X 拉伸 %.2f 倍，铁皮 %.2f 倍，相机拉远 %.2f 倍）" % [
++		want, _mp8_step, _mp8_wide, _mp8_plat, _mp8_cam_pull
++	])
++	_mp8_count_pieces()
++
++	# 上面那行只证明"跑过了"，不证明"东西到哪儿了"。灯尤其要自证（v3 就栽在这）。
++	call_deferred("_mp8_verify_lights")
++
++
++# 数清楚每种件现在有几份 —— 用户说"扶手只有 12 条"，先让日志能对得上账。
++func _mp8_count_pieces() -> void :
++	var art: Node3D = get_node_or_null("escalator pit art11") as Node3D
++	if art == null:
++		return
++	var parts := PackedStringArray()
++	for src_name in MP8_EDIT_SOURCES:
++		var n: int = 0
++		for c in art.get_children():
++			var nm := String(c.name)
++			if nm == src_name or nm.begins_with(src_name + "_MP8"):
++				n += 1
++		parts.append("%s x%d" % [src_name, n])
++	print("[MP8] 逆向行进：现有件数 —— %s（8 条车道；想加减请用 mp8escedit 手调）" % ", ".join(parts))
++
++
++# ---------------- 1. 背景大件：只拉伸，不平移 ----------------
++# 判据：art11 底下**不在 MP8_LANE_ART 里的**都算背景（洞窟、平台、绞肉机、横梁…），
++# 一律 `position.x *= k; scale.x *= k` —— 这等价于"整体绕世界 x=0 拉伸 k 倍"，
++# 对"网格几何相对节点原点有偏移"的件也成立（`Cube_011` 就是这种）。
++func _mp8_widen_backdrop() -> void :
++
++	var k := _mp8_wide
++	if is_equal_approx(k, 1.0):
++		return
++
++	var art: Node3D = get_node_or_null("escalator pit art11") as Node3D
++	var widened := 0
++	if art != null:
++		for c in art.get_children():
++			if not (c is Node3D):
++				continue
++			var nm := String(c.name)
++			if MP8_LANE_ART.has(nm):
++				continue                       # 车道件：一个字不动
++			if nm == MP8_GANTRY:
++				_mp8_widen_gantry(c as MeshInstance3D)
++				widened += 1
++				continue
++			_mp8_widen_node(c as Node3D)
++			widened += 1
++
++	# 铁丝网整组（里面没有车道件，可以整组拉）
++	var fence: Node3D = get_node_or_null("escalator pit fence1") as Node3D
++	if fence != null:
++		_mp8_widen_node(fence)
++
++	# ⚠️ 判定区必须跟着拉：不拉的话外侧 4 个人**掉下去不死、爬到顶不算完成**。
++	# （这条挂机测试验不出来 —— 机器人不按键，谁都不动。）
++	var inter: Node3D = get_node_or_null("Interactive") as Node3D
++	if inter != null:
++		_mp8_widen_node(inter)
++
++	print("[MP8] 逆向行进：背景拉伸 %.2f 倍（art11 下 %d 件 + 铁丝网 + 判定区）" % [k, widened])
++
++
++func _mp8_widen_node(n: Node3D) -> void :
++
++	var k: float = _mp8_wide
++	if String(n.name) == MP8_PLAT_NODE and _mp8_plat > 0.0:
++		k = _mp8_plat
++		print("[MP8] 逆向行进：'%s' 单独用 %.2f 倍（mp8escplat）" % [n.name, k])
++
++	if is_equal_approx(k, 1.0):
++		return
++
++	# 带 Y 旋转的件不能这么拉（局部 x 不是世界 x），先报出来免得默默变形
++	var eu := n.transform.basis.get_euler()
++	if absf(eu.y) > 0.01:
++		push_warning("[MP8] 逆向行进：'%s' 带 %.1f° 的 Y 旋转，X 拉伸对它是斜的，请单独确认" % [
++			n.name, rad_to_deg(eu.y)])
++
++	n.position.x *= k
++	n.scale.x *= k
++
++
++# 头顶横梁：本体网格是背景（要拉），子节点里的 CRT 是车道件（要平移）。
++# 做法：**另起一份拉宽的横梁挂到 art11 下，把原横梁自己的网格摘掉**（`mesh = null`）——
++# 原节点只留作 CRT 的容器，既不再画、也不会把子节点跟着缩放。
++func _mp8_widen_gantry(bar: MeshInstance3D) -> void :
++
++	if bar == null or bar.mesh == null:
++		return
++
++	var wide := MeshInstance3D.new()
++	wide.name = String(bar.name) + "_MP8WIDE"
++	wide.mesh = bar.mesh
++	wide.transform = bar.transform
++	wide.position.x *= _mp8_wide
++	wide.scale.x *= _mp8_wide
++	wide.material_override = bar.material_override
++	wide.layers = bar.layers
++	wide.cast_shadow = bar.cast_shadow
++	for i in bar.get_surface_override_material_count():
++		wide.set_surface_override_material(i, bar.get_surface_override_material(i))
++	bar.get_parent().add_child(wide)
++
++	bar.mesh = null
++
++	# 横梁自己的子网格（`Cube_001` / `Cube_011` 那两根长杆）也是背景，跟着拉
++	for c in bar.get_children():
++		if not (c is Node3D):
++			continue
++		if String(c.name).begins_with("escalator pit crt1"):
++			continue                            # CRT：车道件，留给平移那步
++		_mp8_widen_node(c as Node3D)
++
++
++# ---------------- 2. 车道件：只平移，绝不缩放 ----------------
++func _mp8_clone_lane_art() -> void :
++
++	var art: Node3D = get_node_or_null("escalator pit art11") as Node3D
++	if art == null:
++		push_warning("[MP8] 逆向行进：找不到 art11，车道件没复制")
++		return
++
++	var targets: Array[MeshInstance3D] = []
++	for nm in MP8_LANE_ART:
++		var n = art.get_node_or_null(NodePath(nm))
++		if n is MeshInstance3D:
++			targets.append(n as MeshInstance3D)
++		elif n == null:
++			push_warning("[MP8] 逆向行进：车道件 '%s' 不在场景里" % nm)
++
++	# CRT：本体 + 它底下的全部网格子节点。
++	# ⚠️ `crt1_001` 底下还挂着 4 块 2×2 的屏幕面片，**分属四条车道**
++	#    （x = -9.544 / -3.162 / +3.253 / +9.662）—— 所以按**每个网格自己的 x** 判归属，
++	#    绝不能整个节点连子树一起复制（那样会有两块面片盖在原件上打架）。
++	var gantry: Node3D = art.get_node_or_null(NodePath(MP8_GANTRY)) as Node3D
++	if gantry != null:
++		for c in gantry.get_children():
++			if not String(c.name).begins_with("escalator pit crt1"):
++				continue
++			if c is MeshInstance3D:
++				targets.append(c as MeshInstance3D)
++			for cc in c.get_children():
++				if cc is MeshInstance3D:
++					targets.append(cc as MeshInstance3D)
++
++	var made := 0
++	for t in targets:
++		for sgn in _mp8_signs_for(_mp8_world_x(t)):
++			_mp8_clone_mesh(t, Vector3(sgn * _mp8_step, 0.0, 0.0))
++			made += 1
++
++	print("[MP8] 逆向行进：车道件 %d 个 → 复制出 %d 份（只平移 ±%.2f 米，一个都没缩放）" % [
++		targets.size(), made, _mp8_step])
++
++
++# x<0 的件往左复制一份，x>0 的往右复制一份，正中间的（中央分隔柱）两边各一份。
++func _mp8_signs_for(world_x: float) -> Array :
++	if world_x < -0.05:
++		return [-1.0]
++	if world_x > 0.05:
++		return [1.0]
++	return [-1.0, 1.0]
++
++
++# 新建一个干净的 MeshInstance3D（**不带子节点**），共用同一份 Mesh 资源。
++# 为什么不用 `duplicate()`：那会把子树一起复制，而 CRT 底下的面片分属不同车道。
++func _mp8_clone_mesh(src: MeshInstance3D, world_delta: Vector3) -> MeshInstance3D :
++
++	var m := MeshInstance3D.new()
++	m.name = String(src.name) + ("_MP8L" if world_delta.x < 0.0 else "_MP8R")
++	m.mesh = src.mesh
++	m.transform = src.transform
++	m.position += _mp8_local_delta(src.get_parent(), world_delta)
++	m.material_override = src.material_override
++	m.layers = src.layers
++	m.cast_shadow = src.cast_shadow
++	m.visible = src.visible
++	for i in src.get_surface_override_material_count():
++		m.set_surface_override_material(i, src.get_surface_override_material(i))
++	src.get_parent().add_child(m)
++	return m
++
++
++# ---------------- 3. 履带：4 条 → 8 条 ----------------
++# `stair_handler.gd` 是 `for pp in paths_parent.get_children()`，数量完全数据驱动，
++# 所以新履带**必须挂进同一个 `StairPaths`**，那个文件一行都不用改。
++func _mp8_clone_lanes() -> void :
++
++	var paths_parent: Node3D = get_node_or_null("StairPaths") as Node3D
++	if paths_parent == null:
++		push_warning("[MP8] 逆向行进：找不到 StairPaths，履带没扩")
++		return
++
++	var lanes: Array[Node3D] = []
++	for c in paths_parent.get_children():
++		if c is Node3D:
++			lanes.append(c as Node3D)
++
++	var xs := PackedFloat32Array()
++	for l in lanes:
++		var sgn: float = -1.0 if _mp8_world_x(l) < 0.0 else 1.0
++		var d: Node3D = l.duplicate()
++		d.name = String(l.name) + ("_MP8L" if sgn < 0.0 else "_MP8R")
++		paths_parent.add_child(d)
++		d.position = l.position + _mp8_local_delta(paths_parent, Vector3(sgn * _mp8_step, 0.0, 0.0))
++		xs.append(d.position.x)
++
++	var all := PackedFloat32Array()
++	for c in paths_parent.get_children():
++		if c is Node3D:
++			all.append((c as Node3D).position.x)
++	all.sort()
++	print("[MP8] 逆向行进：履带 %d → %d 条，x = %s" % [
++		lanes.size(), paths_parent.get_child_count(), str(all)])
++
++
++# ---------------- 4. 出生点：4 → 8，按 x 从左到右排 ----------------
++# 出生点是 `@export var player_spawn_positions: Array[Node3D]` —— **数组式**，不是容器式：
++# 往容器里塞 Marker 完全无效，`spawn_players()` 读的是这个数组（HANDOFF 的 P1-C）。
++func _mp8_place_spawns() -> void :
++
++	if player_spawn_positions.is_empty():
++		push_warning("[MP8] 逆向行进：player_spawn_positions 是空的，放弃补出生点")
++		return
++
++	var holder: Node = player_spawn_positions[0].get_parent()
++	var all: Array[Node3D] = []
++	for m in player_spawn_positions:
++		all.append(m)
++
++	for v in all.duplicate():
++		var sgn: float = -1.0 if _mp8_world_x(v) < 0.0 else 1.0
++		var d: Node3D = v.duplicate()
++		d.name = String(v.name) + ("_MP8L" if sgn < 0.0 else "_MP8R")
++		holder.add_child(d)
++		d.position = v.position + _mp8_local_delta(holder, Vector3(sgn * _mp8_step, 0.0, 0.0))
++		all.append(d)
++
++	# 按世界 x 从左到右排：发人时 counter 从 0 开始，于是玩家顺序 = 站位顺序
++	all.sort_custom(func(a: Node3D, b: Node3D): return _mp8_world_x(a) < _mp8_world_x(b))
++
++	player_spawn_positions.clear()
++	for m2 in all:
++		player_spawn_positions.append(m2)
++
++	var xs := PackedFloat32Array()
++	for m3 in all:
++		xs.append(_mp8_world_x(m3))
++	print("[MP8] 逆向行进：出生点 4 → %d 个，x = %s" % [all.size(), str(xs)])
++
++
++# ---------------- 5. 灯：跟着场地一起变宽 ----------------
++# ⚠️ 这一步是 v3 第一版"4 个人掉进黑虚空"的案发地，务必看 `_mp8_local_delta` 的注释。
++# 方向光**绝对不碰**（全局的，而且这场景里两盏都 visible=false）。
++func _mp8_clone_lights() -> void :
++
++	var lights: Node = get_node_or_null("light parent")
++	if lights == null:
++		push_warning("[MP8] 逆向行进：找不到 light parent，灯没扩 —— 外侧会是黑的")
++		return
++
++	var omnis: Array[Node3D] = []
++	for c in lights.get_children():
++		if c is OmniLight3D:
++			omnis.append(c as Node3D)
++
++	for o in omnis:
++		for sgn in [-1.0, 1.0]:
++			var od: Node3D = o.duplicate()
++			od.name = String(o.name) + ("_MP8L" if sgn < 0.0 else "_MP8R")
++			lights.add_child(od)
++			od.position = o.position + _mp8_local_delta(lights, Vector3(sgn * _mp8_step, 0.0, 0.0))
++			_mp8_light_check.append(od)
++
++	print("[MP8] 逆向行进：点光源 %d → %d 盏（左右各补一份，覆盖加宽后的场地）" % [
++		omnis.size(), omnis.size() * 3])
++
++
++# ---------------- 6. 相机：左右两台原版相机 + 加大摇摆 ----------------
++# 用户 2026-08-16 实测否掉了"一台相机拉远看全场"：**太远、人太小**。
++# 改法：**两台原版相机** —— 左边一台整体平移 -12.8 米框住左 4 条道，右边一台 +12.8 米框右 4 条道。
++# 数字是对上的：左半 4 条道从 -22.39 到 -3.19 = **19.2 米，正好等于原版 4 条道的跨度**，
++# 所以既不用拉远也不用改 fov，**构图与原版同级，人一点都不会变小**。
++# 再把 `move` 动画的左右摇摆幅度放大，让每台相机都能扫到对面那半场 —— 8 个人互相看得见。
++#
++# ⚠️ `move` 动画每帧写 `CameraTarget` 的 position 与 rotation，这两样都必须**改动画键值**，
++#    直接写节点属性会被当帧盖掉（改 IK 目标那次就是这么白改的）。
++#    `Camera3D:fov` 那条轨 0 个键（probe23）→ fov 可以直接写节点。
++func _mp8_setup_camera() -> void :
++
++	if _mp8_step <= 0.0:
++		return
++
++	_mp8_apply_swing()
++
++	if _mp8_fov > 0.0 and camera_3d != null:
++		camera_3d.fov = _mp8_fov
++		print("[MP8] 逆向行进：相机 fov -> %.1f" % _mp8_fov)
++
++	# 对照用：一台相机看全场那版（默认不走这条）
++	if not is_equal_approx(_mp8_cam_pull, 1.0) and camera_3d != null:
++		var d: float = camera_3d.global_position.length()
++		var pull: float = (_mp8_cam_pull - 1.0) * d
++		camera_3d.position.z += pull
++		print("[MP8] 逆向行进：相机沿视线后退 %.1f 米（倍率 %.2f）" % [pull, _mp8_cam_pull])
++
++
++func _mp8_cam_anim(anim_name: StringName) -> Animation :
++	var ct: Node3D = get_node_or_null("CameraTarget") as Node3D
++	if ct == null:
++		return null
++	var ap: AnimationPlayer = ct.get_node_or_null("anim_camera movement") as AnimationPlayer
++	if ap == null:
++		return null
++	return ap.get_animation(anim_name)
++
++
++# 摇摆：把 `.:rotation` 每个键的 **y（左右摇）** 相对它们的均值放大。
++# ⚠️ Animation 是资源，会被**跨局缓存**住 —— 反复放大会一局比一局甩得更狠。
++#    所以第一次先把原始键值存进这条轨的 meta，之后永远从 meta 重算（可重复调用不累积）。
++func _mp8_apply_swing() -> void :
++
++	if is_equal_approx(_mp8_swing, 1.0):
++		return
++
++	var mv: Animation = _mp8_cam_anim(&"move")
++	if mv == null:
++		return
++
++	for t in mv.get_track_count():
++		if String(mv.track_get_path(t)) != ".:rotation":
++			continue
++
++		var meta_key := "mp8_orig_rot_%d" % t
++		var orig: Array = []
++		if mv.has_meta(meta_key):
++			orig = mv.get_meta(meta_key)
++		else:
++			for k in mv.track_get_key_count(t):
++				orig.append(mv.track_get_key_value(t, k))
++			mv.set_meta(meta_key, orig)
++		if orig.size() < mv.track_get_key_count(t):
++			continue
++
++		var mean: float = 0.0
++		for v in orig:
++			mean += (v as Vector3).y
++		mean /= float(maxi(orig.size(), 1))
++
++		var lo: float = 999.0
++		var hi: float = -999.0
++		for k in mv.track_get_key_count(t):
++			var v: Vector3 = orig[k]
++			var y: float = mean + (v.y - mean) * _mp8_swing
++			mv.track_set_key_value(t, k, Vector3(v.x, y, v.z))
++			lo = minf(lo, y)
++			hi = maxf(hi, y)
++
++		print("[MP8] 逆向行进：相机摇摆 x%.2f（中心 %.1f°，现在扫 %.1f° ~ %.1f°）" % [
++			_mp8_swing, rad_to_deg(mean), rad_to_deg(lo), rad_to_deg(hi)])
++
++
++# 两台相机：把当事人那台机器的相机架整体平移到他所在的半场。
++# 相机是**每台机器一份的本地表现**，所以只发给当事人（`rpc_id`），广播会把所有人的相机都挪走。
++@rpc("authority", "call_local", "reliable")
++func mp8_set_camera_side_rpc(offset_x: float) -> void :
++
++	var ct: Node3D = get_node_or_null("CameraTarget") as Node3D
++	if ct == null:
++		return
++
++	var ap: AnimationPlayer = ct.get_node_or_null("anim_camera movement") as AnimationPlayer
++	var base: Vector3 = ct.position
++
++	if ap != null:
++		# 基准取自 **RESET 动画**（我们从不改它），保证本函数可重复调用而**不会累加偏移** ——
++		# Animation 会被资源缓存跨局留住，拿"当前值"当基准就会一局比一局跑得更远。
++		base = _mp8_anim_base_position(ap, base)
++		var mv: Animation = ap.get_animation(&"move")
++		if mv != null:
++			for t in mv.get_track_count():
++				if String(mv.track_get_path(t)) != ".:position":
++					continue
++				for k in mv.track_get_key_count(t):
++					mv.track_set_key_value(t, k, Vector3(base.x + offset_x, base.y, base.z))
++
++	ct.position = Vector3(base.x + offset_x, base.y, base.z)
++
++	print("[MP8] 逆向行进：本机相机平移 x %+.1f（框%s半场那 4 条道）" % [
++		offset_x, "左" if offset_x < 0.0 else "右"])
++
++
++func _mp8_anim_base_position(ap: AnimationPlayer, fallback: Vector3) -> Vector3 :
++	var reset: Animation = ap.get_animation(&"RESET")
++	if reset == null:
++		return fallback
++	for t in reset.get_track_count():
++		if String(reset.track_get_path(t)) == ".:position" and reset.track_get_key_count(t) > 0:
++			var v = reset.track_get_key_value(t, 0)
++			if v is Vector3:
++				return v
++	return fallback
++
++
++# ---------------- 7. 场地手调（mp8escedit）：铁皮和扶手交给用户自己摆 ----------------
++#
++# 用户 2026-08-16 定：**"黄铁皮不拉伸，我来自己摆铁皮和手。"**
++# 规矩照抄枪械工厂的 `mp8gunedit`（同一个项目里两套手调不该有两种规矩）：
++#   进游戏按键选中 → 挪 → 按 0 存盘 → 下次开局**优先读存盘文件**。
++#   存盘文件是人能直接用记事本改的纯文本，不开游戏也能改。
++#
++# ⚠️ 8 个实例共用同一个 `user://` 目录（坑第 15 条）—— 这里是好事：存一份，
++#    下次 8 个实例读到的是同一份，天然不会各机布局不一致。
++const MP8_EDIT_FILE: String = "user://mp8_esc_layout.txt"
++const MP8_EDIT_STEPS: Array[float] = [1.0, 0.5, 0.1]
++const MP8_EDIT_YAW_STEP: float = 15.0
++const MP8_EDIT_SCALE_STEP: float = 0.1
++
++## 可手调的件。**原件和它的每一份副本都是一行**，所以想加扶手就在文件里多写一行。
++const MP8_EDIT_SOURCES: Array[String] = [
++	"base platform",     # 那块锈铁板（黄铁皮），贴图 paint rusted1 painted bloody1
++	"Plane_003",         # 左半那套扶梯壳体，贴图 escalator.png
++	"BézierCurve",       # 右半那两根深灰金属扶手（albedo 0.146 / 粗糙 0.36）
++	"BézierCurve_001",
++]
++
++## **用户 2026-08-16 22:48 手调定稿的摆位**，直接烘进代码 —— 于是不依赖
++## `%APPDATA%` 里那份 `mp8_esc_layout.txt` 也成立（发布版的玩家不会有那个文件）。
++## 一项 = [源件名, 位置, 转角度数, x缩放, 显示]。存盘文件若存在则**文件优先**。
++## 备份留在 `notes\mp8_esc_layout.txt`。想改：进游戏 `-EscEdit` 摆完按 0，
++## 再把新的 `mp8_esc_layout.txt` 贴回这张表。
++const MP8_LAYOUT_BAKED: Array = [
++	["base platform",   Vector3(-19.024, -0.812,   3.477),   0.0, 1.0, true],
++	["base platform",   Vector3( 18.976, -0.812,   3.477),   0.0, 1.0, true],
++	["base platform",   Vector3( -0.024, -0.812,   3.477),   0.0, 1.0, true],
++	["Plane_003",       Vector3( -9.559,  6.435, -11.366),   0.0, 1.0, true],
++	["Plane_003",       Vector3(-22.359,  6.435, -11.366),   0.0, 1.0, true],
++	["Plane_003",       Vector3(  3.141,  6.435, -11.366),   0.0, 1.0, true],
++	["BézierCurve",     Vector3(  9.313, 14.572, -16.690), -95.0, 1.0, true],
++	["BézierCurve",     Vector3( 13.113, 14.572, -16.690), -95.0, 1.0, true],
++	["BézierCurve_001", Vector3(  6.313, 15.125, -16.690), -95.0, 1.0, true],
++	["BézierCurve_001", Vector3( 22.113, 15.125, -16.690), -95.0, 1.0, true],
++]
++
++# [MP8] ================ 玩法改造：扶梯定速下行 + 随时间加速 ================
++#
++# 用户 2026-08-16 定：**"扶梯按一定速度把玩家往搅拌机里带，存活越久扶梯掉得越快，
++# 玩家需要按键越快才能存活。"** —— 小游戏的性格从"追逐赛"改成**耐久生存**。
++#
++# ⚠️ 这条会**顶掉原版的核心规则**：原版 `escalator_speed = 全场最快那个人的 speed`（钳 1.0），
++# 也就是"领先者把整条扶梯拉快、拖累所有人（含自己）"的橡皮筋设计。
++# 新玩法里扶梯**不看任何人**，只看本局已经打了多久：
++#
++#     扶梯速度 = min(起始速度 + 每秒增量 × 本局已进行秒数, 上限)
++#
++# 玩家净位移仍是 `(自己的 speed − 扶梯速度) × 0.5 × delta`，所以：
++#   - 开局扶梯就在往下带（起始速度 > 0），不按键必然掉下去；
++#   - 时间一长扶梯超过玩家速度上限（2.0），**谁都撑不住** → 局必然收敛，不会无限打下去。
++#
++# 原版规则保留成对照组：`mp8escmode=vanilla`。
++const MP8_BELT_BASE_DEFAULT: float = 0.35   ## 开局扶梯速度
++const MP8_BELT_RAMP_DEFAULT: float = 0.03   ## 每秒增加多少
++const MP8_BELT_CAP_DEFAULT: float = 2.0     ## 上限（= 玩家 speed 的上限，到顶就是谁都跟不上）
++
++# [MP8] ===== 名次制算分：**存活顺序**（用户 2026-08-16 定）=====
++#
++# 原版是累加型：到顶第一名 +2、其余 +1；每有人掉下去，还活着的每人 +1；最后剩一人再 +1。
++# 8 人下它是坏的：**苟活收益最高 +8，冲第一只有 +2**，而且一到顶就退出 active 列表、
++# 之后别人再掉一分都拿不到 —— 「吊在半空等别人掉光」是压倒性最优解（人越多越离谱）。
++#
++# 新玩法是耐久生存，**存活时长天然就是名次**，所以直接拿小游戏自己的顺序数组当名次源
++# （`_mp8_dead_order` / `active_players` / `finished_players`），不在汇总处对整数计数排名
++# —— 这是项目的分数铁律，和猎鸭那套（T13）同一个路子。
++#
++# 排名从差到好：**先掉下去的最差 → 后掉下去的 → 活到最后的 → 逃到顶的（第一个到顶最好）**
++# 分数 = 步长 × 名次下标，第一个死的 0 分。8 人局正好铺满 {0,2,4,…,14}，不重不漏。
++#
++# 步长沿用猎鸭的 2：不是本局需要半分，而是**为了和名次型小游戏的量级对齐**
++# （名次型 8 人局大致 0~12~14）。真要调量级请用 `game.gd` 的 MP8_MINIGAME_SCORE_SCALE，
++# 别在这里改步长。
++const MP8_ESC_RANK_STEP: int = 2
++
++var _mp8_dead_order: Array[int] = []    # 掉进搅拌机的先后顺序（网络 id），本局的名次源
++
++var _mp8_survival: bool = true          # false = 回原版"最快的人带动扶梯"
++var _mp8_belt_base: float = MP8_BELT_BASE_DEFAULT
++var _mp8_belt_ramp: float = MP8_BELT_RAMP_DEFAULT
++var _mp8_belt_cap: float = MP8_BELT_CAP_DEFAULT
++var _mp8_belt_elapsed: float = 0.0      # 本局 Play 开始后的秒数
++var _mp8_belt_running: bool = false     # 倒计时结束才开始加速
++var _mp8_belt_log_t: float = 0.0
++var _mp8_info_on: bool = false          # mp8escinfo：屏幕上显示扶梯速度，调参用
++var _mp8_info_label: Label = null
++
++var _mp8_edit_on: bool = false
++var _mp8_edit_sel: int = 0
++var _mp8_edit_step_i: int = 1
++var _mp8_edit_items: Array = []          # [{ "node": Node3D, "src": String }]，8 台机器顺序一致
++var _mp8_edit_panel: Label = null
++var _mp8_edit_canvas: CanvasLayer = null
++var _mp8_edit_src: String = "自动布局"
++
++
++# 把可手调的件收进注册表：先原件，再它的副本（`_MP8L` / `_MP8R`）。
++# 顺序在每台机器上都一样（同一份场景 + 同一段代码），所以下标可以直接当 RPC 参数用。
++func _mp8_edit_collect() -> void :
++
++	_mp8_edit_items.clear()
++	var art: Node3D = get_node_or_null("escalator pit art11") as Node3D
++	if art == null:
++		return
++
++	for src_name in MP8_EDIT_SOURCES:
++		for c in art.get_children():
++			if not (c is Node3D):
++				continue
++			var nm := String(c.name)
++			if nm == src_name or nm == src_name + "_MP8L" or nm == src_name + "_MP8R" \
++					or nm.begins_with(src_name + "_MP8X"):
++				_mp8_edit_items.append({"node": c, "src": src_name})
++
++
++# 读存盘文件并按它摆。文件在 = 文件说了算（多的行建副本，少的行把多余的藏掉）。
++func _mp8_apply_layout_file() -> void :
++
++	var rows := _mp8_parse_layout_file()
++	if rows.is_empty():
++		# 没有存盘文件 → 用烘进代码的定稿摆位（发布版走的就是这条）
++		rows = []
++		for r in MP8_LAYOUT_BAKED:
++			rows.append({
++				"src": String(r[0]), "pos": r[1], "yaw": float(r[2]),
++				"sx": float(r[3]), "vis": bool(r[4]),
++			})
++		_mp8_edit_src = "内置定稿表 MP8_LAYOUT_BAKED"
++	else:
++		_mp8_edit_src = "存盘文件 %s" % MP8_EDIT_FILE
++	if rows.is_empty():
++		return
++
++	var art: Node3D = get_node_or_null("escalator pit art11") as Node3D
++	if art == null:
++		return
++
++	# 按源件分组，逐组对齐：第 n 行 → 该组第 n 个实例，不够就复制一份
++	for src_name in MP8_EDIT_SOURCES:
++		var mine: Array = []
++		for it in _mp8_edit_items:
++			if String(it["src"]) == src_name:
++				mine.append(it["node"])
++
++		var want: Array = []
++		for r in rows:
++			if String(r["src"]) == src_name:
++				want.append(r)
++		if want.is_empty():
++			continue
++
++		var proto: Node3D = mine[0] if not mine.is_empty() else null
++		if proto == null:
++			push_warning("[MP8] 逆向行进：布局文件里的 '%s' 场景里没有，跳过" % src_name)
++			continue
++
++		var extra: int = 0
++		while mine.size() < want.size():
++			var m := proto as MeshInstance3D
++			if m == null:
++				break
++			extra += 1
++			var dup := _mp8_clone_mesh(m, Vector3.ZERO)
++			dup.name = "%s_MP8X%d" % [src_name, extra]
++			mine.append(dup)
++			_mp8_edit_items.append({"node": dup, "src": src_name})
++
++		for i in mine.size():
++			var n: Node3D = mine[i]
++			if i >= want.size():
++				n.visible = false                 # 文件里没写的多余副本：藏起来
++				continue
++			var r: Dictionary = want[i]
++			n.position = r["pos"]
++			n.rotation = Vector3(n.rotation.x, deg_to_rad(float(r["yaw"])), n.rotation.z)
++			n.scale.x = float(r["sx"])
++			n.visible = bool(r["vis"])
++
++	print("[MP8] 逆向行进：按手调布局摆好了（%d 件，来源：%s）" % [rows.size(), _mp8_edit_src])
++
++
++# 文件格式：`源件名, x, y, z, 转角度数, x缩放, 显示(1/0)`，`#` 开头是注释。
++# 一行 = 场景里的一份实例；想多加一条扶手，复制一行改 x 即可。
++func _mp8_parse_layout_file() -> Array :
++
++	if not FileAccess.file_exists(MP8_EDIT_FILE):
++		return []
++
++	var f := FileAccess.open(MP8_EDIT_FILE, FileAccess.READ)
++	if f == null:
++		push_warning("[MP8] 逆向行进：打不开 %s（%d）" % [MP8_EDIT_FILE, FileAccess.get_open_error()])
++		return []
++
++	var rows: Array = []
++	var line_no: int = 0
++	while not f.eof_reached():
++		var line: String = f.get_line().strip_edges()
++		line_no += 1
++		if line.is_empty() or line.begins_with("#"):
++			continue
++		var cols: PackedStringArray = line.split(",", false)
++		if cols.size() < 7:
++			push_warning("[MP8] 逆向行进：布局文件第 %d 行不是 7 列，跳过：%s" % [line_no, line])
++			continue
++		var src_name: String = cols[0].strip_edges()
++		if not MP8_EDIT_SOURCES.has(src_name):
++			push_warning("[MP8] 逆向行进：布局文件第 %d 行的件名 '%s' 不认识，跳过" % [line_no, src_name])
++			continue
++		rows.append({
++			"src": src_name,
++			"pos": Vector3(float(cols[1]), float(cols[2]), float(cols[3])),
++			"yaw": float(cols[4]),
++			"sx": float(cols[5]),
++			"vis": int(cols[6]) != 0,
++		})
++	f.close()
++	return rows
++
++
++func _mp8_save_layout_file() -> bool :
++
++	var f := FileAccess.open(MP8_EDIT_FILE, FileAccess.WRITE)
++	if f == null:
++		push_warning("[MP8] 逆向行进：写不了 %s（%d）" % [MP8_EDIT_FILE, FileAccess.get_open_error()])
++		return false
++
++	f.store_line("# 逆向行进（mp8game=2）8 人场地手调 —— 铁皮与扶手的摆位")
++	f.store_line("# 每行 = 一份实例：源件名, x, y, z, 转角度数, x缩放, 显示(1/0)")
++	f.store_line("# 想多加一条扶手：把某行复制一份、改 x 即可（游戏会自动多建一份）。")
++	f.store_line("# 想去掉一条：把最后一列改成 0，或者直接删掉那一行。")
++	f.store_line("# 删掉整个文件 = 回到代码里的自动布局。")
++	f.store_line("# 存于 %s" % Time.get_datetime_string_from_system())
++	f.store_line("")
++
++	for it in _mp8_edit_items:
++		var n: Node3D = it["node"]
++		if not is_instance_valid(n):
++			continue
++		f.store_line("%s, %.3f, %.3f, %.3f, %.0f, %.3f, %d" % [
++			String(it["src"]), n.position.x, n.position.y, n.position.z,
++			rad_to_deg(n.rotation.y), n.scale.x, (1 if n.visible else 0)])
++	f.close()
++
++	print("[MP8] 逆向行进：布局已存盘 → %s（%d 件）" % [
++		ProjectSettings.globalize_path(MP8_EDIT_FILE), _mp8_edit_items.size()])
++	return true
++
++
++# 摆位广播：8 个窗口一起动，免得"只有我这台看着对"。
++@rpc("any_peer", "call_local", "reliable")
++func mp8_esc_place_rpc(idx: int, pos: Vector3, yaw_deg: float, sx: float, vis: bool) -> void :
++
++	if idx < 0 or idx >= _mp8_edit_items.size():
++		return
++	var n: Node3D = _mp8_edit_items[idx]["node"]
++	if not is_instance_valid(n):
++		return
++	n.position = pos
++	n.rotation = Vector3(n.rotation.x, deg_to_rad(yaw_deg), n.rotation.z)
++	n.scale.x = sx
++	n.visible = vis
++	if _mp8_edit_on:
++		_mp8_edit_refresh()
++
++
++func _mp8_edit_begin() -> void :
++
++	_mp8_edit_collect()
++	if _mp8_edit_items.is_empty():
++		push_warning("[MP8] 逆向行进：一个可调的件都没找到，手调模式不启动")
++		_mp8_edit_on = false
++		return
++
++	if _mp8_edit_canvas == null:
++		_mp8_edit_canvas = CanvasLayer.new()
++		_mp8_edit_canvas.layer = 100
++		add_child(_mp8_edit_canvas)
++
++	var lbl := Label.new()
++	lbl.name = "MP8EscEditPanel"
++	lbl.set_anchors_preset(Control.PRESET_BOTTOM_LEFT)
++	lbl.offset_left = 16.0
++	lbl.offset_top = -200.0
++	lbl.offset_right = 1100.0
++	lbl.offset_bottom = -8.0
++	# ⚠️ 必须显式指定游戏自己的字体：默认主题字体字距是坏的（枪械工厂/猎鸭都栽过）
++	var font = load("res://fonts/Terminal F4.ttf")
++	if font != null:
++		lbl.add_theme_font_override("font", font)
++	lbl.add_theme_color_override("font_color", Color(0.6, 0.95, 1.0))
++	_mp8_edit_canvas.add_child(lbl)
++	_mp8_edit_panel = lbl
++
++	# 每个件头顶挂号码牌，否则十几个件里根本认不出在调哪个
++	for i in _mp8_edit_items.size():
++		var n: Node3D = _mp8_edit_items[i]["node"]
++		if not is_instance_valid(n):
++			continue
++		var tag := Label3D.new()
++		tag.name = "MP8EditTag"
++		tag.text = "%d" % (i + 1)
++		tag.billboard = BaseMaterial3D.BILLBOARD_ENABLED
++		tag.font_size = 200
++		tag.outline_size = 40
++		tag.outline_modulate = Color.BLACK
++		tag.no_depth_test = true
++		if font != null:
++			tag.font = font
++		n.add_child(tag)
++		tag.position = Vector3(0.0, 6.0, 0.0)
++
++	_mp8_edit_check_keys()
++	_mp8_edit_refresh()
++	print("[MP8] 逆向行进：场地手调已开 —— %d 个件可调，布局来源：%s" % [
++		_mp8_edit_items.size(), _mp8_edit_src])
++
++
++# 按键撞车自检（照枪械工厂的规矩：别赌按键没被占，开局把 InputMap 查一遍）
++func _mp8_edit_check_keys() -> void :
++
++	var mine: Dictionary = {
++		KEY_6: "上一件", KEY_7: "下一件", KEY_4: "复制", KEY_3: "藏/显",
++		KEY_I: "推远", KEY_K: "拉近", KEY_J: "左移", KEY_L: "右移",
++		KEY_U: "升高", KEY_O: "降低", KEY_N: "左转", KEY_M: "右转",
++		KEY_Y: "加宽", KEY_H: "收窄",
++		KEY_5: "步长", KEY_0: "存盘", KEY_9: "复位", KEY_8: "打报告",
++	}
++	var clash := PackedStringArray()
++	for action in InputMap.get_actions():
++		for ev in InputMap.action_get_events(action):
++			var k := ev as InputEventKey
++			if k == null:
++				continue
++			for code in [k.keycode, k.physical_keycode]:
++				if code != 0 and mine.has(code):
++					clash.append("%s(%s)↔%s" % [OS.get_keycode_string(code), mine[code], String(action)])
++	if clash.is_empty():
++		print("[MP8] 逆向行进：手调按键与游戏 InputMap 无冲突（查了 %d 个动作）" % InputMap.get_actions().size())
++	else:
++		print("[MP8] 逆向行进：⚠️ 手调按键撞车 —— %s" % ", ".join(clash))
++
++
++func _mp8_edit_refresh() -> void :
++
++	if _mp8_edit_panel == null or _mp8_edit_items.is_empty():
++		return
++	_mp8_edit_sel = clampi(_mp8_edit_sel, 0, _mp8_edit_items.size() - 1)
++	var it: Dictionary = _mp8_edit_items[_mp8_edit_sel]
++	var n: Node3D = it["node"]
++	if not is_instance_valid(n):
++		return
++
++	_mp8_edit_panel.text = "\n".join([
++		"【场地手调】%d/%d  %s%s   步长 %.1f 米" % [
++			_mp8_edit_sel + 1, _mp8_edit_items.size(), String(n.name),
++			"" if n.visible else "（已藏）", MP8_EDIT_STEPS[_mp8_edit_step_i]],
++		"位置 (%.2f, %.2f, %.2f)   转角 %.0f°   x缩放 %.2f" % [
++			n.position.x, n.position.y, n.position.z, rad_to_deg(n.rotation.y), n.scale.x],
++		"6/7 选件   I/K 前后  J/L 左右  U/O 升降   N/M 转   Y/H 宽窄",
++		"4 复制一份   3 藏/显   5 换步长   0 存盘   9 复位   8 打报告",
++	])
++
++
++func _mp8_edit_report() -> void :
++	print("[MP8] 逆向行进：当前 %d 个件 ——" % _mp8_edit_items.size())
++	for i in _mp8_edit_items.size():
++		var n: Node3D = _mp8_edit_items[i]["node"]
++		if not is_instance_valid(n):
++			continue
++		print("   %2d  %-24s pos=(%8.2f,%7.2f,%8.2f) yaw=%4.0f° sx=%.2f %s" % [
++			i + 1, n.name, n.position.x, n.position.y, n.position.z,
++			rad_to_deg(n.rotation.y), n.scale.x, "" if n.visible else "（已藏）"])
++
++
++func _unhandled_key_input(event: InputEvent) -> void :
++
++	if not _mp8_edit_on or _mp8_edit_items.is_empty():
++		return
++	var key := event as InputEventKey
++	if key == null or not key.pressed or key.echo:
++		return
++
++	var step: float = MP8_EDIT_STEPS[_mp8_edit_step_i]
++	var n: Node3D = _mp8_edit_items[_mp8_edit_sel]["node"]
++	if not is_instance_valid(n):
++		return
++
++	var pos: Vector3 = n.position
++	var yaw: float = rad_to_deg(n.rotation.y)
++	var sx: float = n.scale.x
++	var vis: bool = n.visible
++	var changed: bool = false
++
++	match key.keycode:
++		KEY_6, KEY_7:
++			var d: int = -1 if key.keycode == KEY_6 else 1
++			_mp8_edit_sel = posmod(_mp8_edit_sel + d, _mp8_edit_items.size())
++			_mp8_edit_refresh()
++
++		KEY_J, KEY_L:
++			pos.x += (- step if key.keycode == KEY_J else step)
++			changed = true
++		KEY_I, KEY_K:
++			pos.z += (- step if key.keycode == KEY_I else step)
++			changed = true
++		KEY_U, KEY_O:
++			pos.y += (step if key.keycode == KEY_U else - step)
++			changed = true
++		KEY_N, KEY_M:
++			yaw = fposmod(yaw + (- MP8_EDIT_YAW_STEP if key.keycode == KEY_N else MP8_EDIT_YAW_STEP), 360.0)
++			changed = true
++		KEY_Y, KEY_H:
++			sx = maxf(0.05, sx + (MP8_EDIT_SCALE_STEP if key.keycode == KEY_Y else - MP8_EDIT_SCALE_STEP))
++			changed = true
++		KEY_3:
++			vis = not vis
++			changed = true
++
++		KEY_4:
++			# 复制一份：新件落在原件右边一个步长处，方便立刻看见
++			mp8_esc_dup_rpc.rpc(_mp8_edit_sel)
++
++		KEY_5:
++			_mp8_edit_step_i = (_mp8_edit_step_i + 1) % MP8_EDIT_STEPS.size()
++			_mp8_edit_refresh()
++
++		KEY_0:
++			var ok: bool = _mp8_save_layout_file()
++			_mp8_edit_refresh()
++			if _mp8_edit_panel != null:
++				_mp8_edit_panel.text = ("【已存盘】下次开局自动用这套摆位\n" if ok
++					else "【存盘失败】看日志\n") + _mp8_edit_panel.text
++
++		KEY_9:
++			print("[MP8] 逆向行进：想回自动布局请删掉 %s 再重开一局" %
++				ProjectSettings.globalize_path(MP8_EDIT_FILE))
++
++		KEY_8:
++			_mp8_edit_report()
++
++		_:
++			return
++
++	if changed:
++		mp8_esc_place_rpc.rpc(_mp8_edit_sel, pos, yaw, sx, vis)
++
++	get_viewport().set_input_as_handled()
++
++
++# 复制一份当前件（8 台机器一起建，否则下标就对不上了）
++@rpc("any_peer", "call_local", "reliable")
++func mp8_esc_dup_rpc(idx: int) -> void :
++
++	if idx < 0 or idx >= _mp8_edit_items.size():
++		return
++	var src: MeshInstance3D = _mp8_edit_items[idx]["node"] as MeshInstance3D
++	if src == null:
++		return
++
++	var dup := _mp8_clone_mesh(src, Vector3.ZERO)
++	dup.name = "%s_MP8X%d" % [String(_mp8_edit_items[idx]["src"]), _mp8_edit_items.size()]
++	dup.position.x += MP8_EDIT_STEPS[_mp8_edit_step_i]
++	_mp8_edit_items.append({"node": dup, "src": String(_mp8_edit_items[idx]["src"])})
++
++	if _mp8_edit_on:
++		var tag := Label3D.new()
++		tag.text = "%d" % _mp8_edit_items.size()
++		tag.billboard = BaseMaterial3D.BILLBOARD_ENABLED
++		tag.font_size = 200
++		tag.outline_size = 40
++		tag.outline_modulate = Color.BLACK
++		tag.no_depth_test = true
++		var font = load("res://fonts/Terminal F4.ttf")
++		if font != null:
++			tag.font = font
++		dup.add_child(tag)
++		tag.position = Vector3(0.0, 6.0, 0.0)
++		_mp8_edit_sel = _mp8_edit_items.size() - 1
++		_mp8_edit_refresh()
++
++	print("[MP8] 逆向行进：复制了 %s → 现在共 %d 个件" % [src.name, _mp8_edit_items.size()])
++
++
++# ---------------- 8. 生存玩法：扶梯速度 ----------------
++# 扶梯速度 = min(起始 + 每秒增量 × Play 开始后的秒数, 上限)。
++# **倒计时结束（进 Play）才开始计时**，赛前站桩那段不该把难度先耗掉。
++func _mp8_belt_speed(delta: float) -> float :
++
++	if not _mp8_belt_running:
++		return 0.0
++
++	_mp8_belt_elapsed += delta
++	var belt: float = minf(_mp8_belt_base + _mp8_belt_ramp * _mp8_belt_elapsed, _mp8_belt_cap)
++
++	# 每秒打一行：调参时要能看出"第几秒开始有人跟不上"
++	_mp8_belt_log_t += delta
++	if _mp8_belt_log_t >= 1.0:
++		_mp8_belt_log_t = 0.0
++		var fastest: float = 0.0
++		for p in player_characters.values():
++			if p.speed > fastest:
++				fastest = p.speed
++		print("[MP8] 逆向行进：%5.1f 秒  扶梯 %.2f  最快玩家 %.2f  还活着 %d 人%s" % [
++			_mp8_belt_elapsed, belt, fastest, active_players.size(),
++			"   ← 扶梯已封顶，谁都跟不上了" if belt >= _mp8_belt_cap - 0.001 else ""])
++
++	_mp8_belt_info(belt)
++	return belt
++
++
++# mp8escinfo：屏幕左上角显示扶梯速度 / 已进行时间 / 最快玩家，纯调参用（默认关）
++func _mp8_belt_info(belt: float) -> void :
++
++	if not _mp8_info_on:
++		return
++
++	if _mp8_info_label == null:
++		if _mp8_edit_canvas == null:
++			_mp8_edit_canvas = CanvasLayer.new()
++			_mp8_edit_canvas.layer = 100
++			add_child(_mp8_edit_canvas)
++		var lbl := Label.new()
++		lbl.name = "MP8EscInfo"
++		lbl.set_anchors_preset(Control.PRESET_TOP_LEFT)
++		lbl.offset_left = 16.0
++		lbl.offset_top = 16.0
++		lbl.offset_right = 700.0
++		lbl.offset_bottom = 100.0
++		var font = load("res://fonts/Terminal F4.ttf")
++		if font != null:
++			lbl.add_theme_font_override("font", font)
++		lbl.add_theme_color_override("font_color", Color(1.0, 0.85, 0.3))
++		_mp8_edit_canvas.add_child(lbl)
++		_mp8_info_label = lbl
++
++	var fastest: float = 0.0
++	for p in player_characters.values():
++		if p.speed > fastest:
++			fastest = p.speed
++	_mp8_info_label.text = "扶梯 %.2f   %.1f 秒   最快玩家 %.2f   活 %d" % [
++		belt, _mp8_belt_elapsed, fastest, active_players.size()]
++
++
++# ---------------- 公用：坐标系换算 ----------------
++# [MP8] ⚠️⚠️ 把"世界里往 x 走 dist 米"换算成**父节点局部坐标里的位移**。
++#
++# 这是 v3 第一版"4 个人掉进黑虚空"的真凶（2026-08-16 实测定位）：
++# `light parent` 在场景里带 **-135.7° 的 Y 旋转**（probe31 从原装 PCK 量的），
++# 而 `position` 是父节点局部坐标。写成 `od.position = o.position + Vector3(120,0,0)`
++# 等于沿它**转过的** x 轴走 —— 4 盏点光源被甩到世界 (-86, 0, +84) 那边，
++# 第二份场地一盏灯都没有。而本场景 `ambient_light_source` = 背景色 (0,0,0)、
++# 两盏 DirectionalLight3D 的 `visible = false` —— **没灯就是纯黑虚空**，
++# 几何体 / 履带 / 出生点 / 相机全对也没用（probe29 + probe30 + probe31 三张表钉死的）。
++#
++# 判据：写任何 `dup.position = src.position + 偏移` 之前，先问一句
++# **"这个父节点的 basis 是单位阵吗"**。本场景里不是单位阵的有三个：
++# `light parent`（转 -135.7°）、`sequence_label_scene_parent`（缩 0.818）、
++# `CameraTarget`（转 -43.7°/26.8°，但它的 position 在根空间里，不受影响）。
++#
++# ⚠️ 不能用 `global_transform` 算：本函数在根的 `_enter_tree()` 里跑，
++# 那时子节点还没进树，全局变换不可靠 —— 所以逐级累乘**局部** basis。
++# ⚠️ 形参是 `Node` 不是 `Node3D`：`Minigame` 并非 Node3D 的子类，
++# 写成 Node3D 会让 `_mp8_local_delta(self)` 在**加载期**就 Parse Error ——
++# 而 gdre 的"编译通过"查不出这种类型错，游戏里的表现是**全屏纯黑**（脚本整个没加载）。
++func _mp8_local_delta(node: Node, world_delta: Vector3) -> Vector3 :
++
++	if node == null or node == self:
++		return world_delta
++
++	var b := Basis.IDENTITY
++	var cur: Node = node
++	while cur != null and cur != self:
++		if cur is Node3D:
++			b = (cur as Node3D).transform.basis * b
++		cur = cur.get_parent()
++
++	return b.inverse() * world_delta
++
++
++# 节点的世界 x —— 同样不能用 `global_position`（`_enter_tree` 阶段还没进树），
++# 所以从自己逐级累乘局部变换算出来。
++func _mp8_world_x(node: Node) -> float :
++
++	var chain: Array[Node3D] = []
++	var cur: Node = node
++	while cur != null and cur != self:
++		if cur is Node3D:
++			chain.push_front(cur as Node3D)
++		cur = cur.get_parent()
++
++	var t := Transform3D.IDENTITY
++	for n in chain:
++		t = t * n.transform
++	return t.origin.x
++
++
++# [MP8] 灯的自证（进树后跑）：把每盏复制灯相对原灯的**世界位移**打出来。
++# 期望正好是 (±步长, 0, 0)；差 0.5 米以上就是又踩了坐标系的坑，日志里直接标 ❌。
++func _mp8_verify_lights() -> void :
++
++	for od in _mp8_light_check:
++		if not is_instance_valid(od) or not od.is_inside_tree():
++			continue
++		var src_name := String(od.name).trim_suffix("_MP8L").trim_suffix("_MP8R")
++		var src: Node3D = od.get_parent().get_node_or_null(NodePath(src_name)) as Node3D
++		if src == null:
++			continue
++		var d: Vector3 = od.global_position - src.global_position
++		var ok: bool = absf(absf(d.x) - _mp8_step) < 0.5 and absf(d.y) < 0.5 and absf(d.z) < 0.5
++		print("[MP8] 逆向行进：复制灯 %-18s 世界=(%8.2f,%7.2f,%8.2f)  相对原灯位移=(%7.2f,%6.2f,%7.2f)  期望 ±%.2f  %s" % [
++			od.name, od.global_position.x, od.global_position.y, od.global_position.z,
++			d.x, d.y, d.z, _mp8_step, "OK" if ok else "❌ 灯没跟过去！"
++		])
++
++# [MP8] 试过但行不通，记下来免得下次重试：**改 IK 目标收窄玩家双臂 —— 完全无效。**
++# 玩家身上有现成的 `ik target_left/right hand`，按理说改位置就能改姿势；实测把倍率压到
++# `mp8escarm=0.05`（两手并到胸前）**画面一个像素都没变**（对照图 esc8_arm005）——
++# 姿势是 `character_animation_tree` 每帧写进骨骼的，SkeletonIK3D 的结果被动画盖掉，够不着。
++# （这条是 v2"车道挤到 2.737 米、指尖只差 0.16 米"时想出来的补救。v4 车道间距回到原版
++#   6.4 米，本来就不挤，**这个问题在 v4 不存在**，留着只为记住"IK 改不动姿势"这条结论。）
++
++# [MP8] 自截图（照抄残骸平台那套）：游戏自己存 PNG，不需要任何屏幕录制权限。
++# ⚠️ 必须走 RPC 广播 —— `countdown_state.expired` 只在服务器上连过（见 _ready），
++# 直接调只有房主会存图。
++@rpc("authority", "call_local", "reliable")
++func mp8_shot_rpc() -> void :
++	_mp8_shot(1.0)
++	_mp8_shot(5.0)
++	_mp8_shot(12.0)
++
++
++func _mp8_shot(delay: float) -> void :
++
++	if not Array(OS.get_cmdline_args()).has("mp8shot"):
++		return
++
++	await get_tree().create_timer(delay, false).timeout
++	if not is_inside_tree():
++		return
++	await RenderingServer.frame_post_draw
++
++	var me: int = multiplayer.get_unique_id() if multiplayer.has_multiplayer_peer() else 0
++	var who: String = "p%d" % me
++	if PlayerManager.player_presences.has(me):
++		who = String(PlayerManager.player_presences[me].network_name)
++
++	var img: Image = get_viewport().get_texture().get_image()
++	if img != null:
++		img.save_png("user://mp8_esc_t%d_%s.png" % [int(delay), who])
++
++
+ func _ready() -> void :
+ 	super._ready()
+ 
+@@ -52,10 +1288,20 @@ func _ready() -> void :
+ 		kill_area.area_entered.connect(_on_kill_area_entered)
+ 		finish_area.area_entered.connect(_on_finish_area_entered)
+ 
++		# [MP8] v4 只有一份场地，判定区还是原来那两个（已按 `_mp8_wide` 拉宽），
++		# 所以这里不需要再接任何副本 —— 别再往回加。
++
+ 		countdown_state.countdown_started.connect(_on_countdown_started)
+ 		countdown_state.tick.connect(_on_countdown_tick)
+ 		countdown_state.expired.connect(_on_countdown_expired)
+ 
++	# [MP8] 相机：摇摆幅度 / fov（左右两台的平移在 spawn_players 里逐人发）
++	_mp8_setup_camera()
++
++	# [MP8] 场地手调（只有传了 mp8escedit 才开）
++	if _mp8_edit_on:
++		_mp8_edit_begin()
++
+ 	if GameManager.local_game:
+ 		await get_tree().create_timer(1.0).timeout
+ 		minigame_ready.emit(1)
+@@ -63,6 +1309,11 @@ func _ready() -> void :
+ func initialize(_round_number: int, _total_rounds: int, _scores: Dictionary = {}):
+ 	super.initialize(_round_number, _total_rounds, _scores)
+ 
++	# [MP8] 名次源每局清空，否则上一局的死亡顺序会串进这一局
++	_mp8_dead_order.clear()
++	_mp8_belt_running = false
++	_mp8_belt_elapsed = 0.0
++
+ 	spawn_players()
+ 
+ 	state_machine.transition_to_rpc.rpc(&"Round", {"round": _round_number, "total": _total_rounds})
+@@ -78,18 +1329,24 @@ func _process(delta: float) -> void :
+ 	if not multiplayer.is_server():
+ 		return
+ 
+-	var highest_speed: float = 0.0
+-	for p in player_characters.values():
+-		if p.speed > highest_speed:
+-			highest_speed = p.speed
+-	highest_speed = min(highest_speed, 1.0)
++	# [MP8] 生存玩法：扶梯**不看任何人**，只按本局已进行的时间加速。
++	# 原版那条"取全场最快"的规则保留在 else 分支（mp8escmode=vanilla）。
++	var belt: float = 0.0
++
++	if _mp8_survival:
++		belt = _mp8_belt_speed(delta)
++	else:
++		for p in player_characters.values():
++			if p.speed > belt:
++				belt = p.speed
++		belt = min(belt, 1.0)
+ 
+ 	stair_handler.speed = move_toward(
+-		stair_handler.speed, highest_speed * 0.1, 8.0 * delta
++		stair_handler.speed, belt * 0.1, 8.0 * delta
+ 	)
+ 
+ 	for p in player_characters.values():
+-		p.set_escalator_speed_rpc.rpc(highest_speed)
++		p.set_escalator_speed_rpc.rpc(belt)
+ 
+ func _physics_process(_delta: float) -> void :
+ 
+@@ -133,6 +1390,14 @@ func spawn_players():
+ 
+ 		player_scores[player_presence.network_id] = 0
+ 
++		# [MP8] 两台原版相机：这个玩家在左半场还是右半场，就把他那台机器的相机整体挪过去。
++		# 归属按**出生点的实际 x**判，不用下标算术（残骸平台翻转配对那个坑：编号不可信，位置才可信）。
++		if _mp8_cam_side > 0.0:
++			var side: float = _mp8_cam_side
++			if player_spawn_positions[counter].position.x < 0.0:
++				side = -_mp8_cam_side
++			mp8_set_camera_side_rpc.rpc_id(player_presence.network_id, side)
++
+ 		counter += 1
+ 
+ func check_game_end():
+@@ -144,9 +1409,7 @@ func check_game_end():
+ 		ap.show_win_indicator_rpc.rpc()
+ 
+ 
+-	for ap in active_players:
+-		player_scores[ap.player_presence.network_id] += 1
+-		break
++	_mp8_score_by_survival()
+ 
+ 	player_scores_finalized.emit(player_scores)
+ 
+@@ -156,6 +1419,48 @@ func check_game_end():
+ 	state_machine.transition_to_rpc.rpc(&"Finish")
+ 	set_effects_visibility_rpc.rpc(false)
+ 
++# [MP8] 存活顺序 → 名次分。从差到好铺一张表，分数 = 步长 × 下标。
++func _mp8_score_by_survival() -> void :
++
++	var order: Array[int] = []
++
++	# 1) 掉进搅拌机的，按掉下去的先后（第一个死的最差）
++	for nid in _mp8_dead_order:
++		order.append(nid)
++
++	# 2) 局末还站在扶梯上的（通常就是最后一个幸存者）
++	for ap in active_players:
++		if is_instance_valid(ap) and ap.player_presence != null:
++			var a_id: int = ap.player_presence.network_id
++			if not order.has(a_id):
++				order.append(a_id)
++
++	# 3) 爬到顶逃出去的，**倒着放**：最后到顶的靠前、第一个到顶的排最后 = 最高分
++	for i in range(finished_players.size() - 1, -1, -1):
++		var fp = finished_players[i]
++		if is_instance_valid(fp) and fp.player_presence != null:
++			var f_id: int = fp.player_presence.network_id
++			if not order.has(f_id):
++				order.append(f_id)
++
++	for i in order.size():
++		player_scores[order[i]] = MP8_ESC_RANK_STEP * i
++
++	# 没进榜的（中途掉线）保底 0，别留下上一局的残值
++	for key in player_scores.keys():
++		if not order.has(key):
++			player_scores[key] = 0
++
++	# 对着日志就能核算名次分对不对（猎鸭那套的规矩）
++	var lines := PackedStringArray()
++	for i in range(order.size() - 1, -1, -1):
++		var nm := str(order[i])
++		if PlayerManager.player_presences.has(order[i]):
++			nm = str(PlayerManager.player_presences[order[i]].network_name)
++		lines.append("第%d名 %s = %d 分" % [order.size() - i, nm, MP8_ESC_RANK_STEP * i])
++	print("[MP8] 逆向行进：存活名次分（步长 %d）—— %s" % [MP8_ESC_RANK_STEP, "; ".join(lines)])
++
++
+ func fade_in_ambience():
+ 
+ 	for speaker_controller in ambience_speaker_controllers:
+@@ -195,17 +1500,33 @@ func _on_countdown_expired():
+ 		player.set_active_rpc.rpc(true)
+ 	state_machine.transition_to_rpc.rpc(&"Play")
+ 
++	# [MP8] 生存玩法：从这一刻开始给扶梯计时加速（赛前站桩那段不算）
++	_mp8_belt_elapsed = 0.0
++	_mp8_belt_log_t = 0.0
++	_mp8_belt_running = true
++	if _mp8_survival:
++		print("[MP8] 逆向行进：开打 —— 扶梯 %.2f 起步，每秒 +%.3f，%.0f 秒后封顶 %.2f" % [
++			_mp8_belt_base, _mp8_belt_ramp, (_mp8_belt_cap - _mp8_belt_base) / maxf(_mp8_belt_ramp, 0.001),
++			_mp8_belt_cap])
++
++	# [MP8] 开局连拍：1 秒看 8 个人的初始站位是不是一人一条履带，
++	# 5/12 秒看爬起来之后有没有互相穿模、有没有人掉出画面。
++	# ⚠️ 挂机实例不会按键 → escalator_speed = max(所有人的 speed) = 0 → 谁都不动，
++	# 局也永远不会结束。所以自动验收**只能验开局构图**，"爬到顶/掉下去"要真人打。
++	mp8_shot_rpc.rpc()
++
+ func _on_finish_area_entered(body):
+ 
+ 	if body.owner is EscalatorPitPlayer:
+ 
+ 		active_players.erase(body.owner)
+-		if finished_players.is_empty():
+-			player_scored.emit(body.owner.player_presence.network_id, 2)
+-		else:
+-			player_scored.emit(body.owner.player_presence.network_id, 1)
+ 
++		# [MP8] 原版在这里当场发 +2 / +1，已删 —— 改成本局结束统一按存活名次算，
++		# 逃到顶的排在名次表最上面（第一个到顶的最高）。
+ 		finished_players.append(body.owner)
++		if body.owner.player_presence != null:
++			print("[MP8] 逆向行进：第 %d 个爬到顶逃出去 —— %s（%.1f 秒）" % [
++				finished_players.size(), str(body.owner.player_presence.network_name), _mp8_belt_elapsed])
+ 
+ 		body.owner.finish_rpc.rpc()
+ 
+@@ -223,7 +1544,14 @@ func _on_kill_area_entered(body):
+ 		active_players.erase(body.owner)
+ 		body.owner.kill_rpc.rpc()
+ 
+-		for ap in active_players:
+-			player_scores[ap.player_presence.network_id] += 1
++		# [MP8] 原版这里是"还活着的每人 +1"（苟活收益 8 人下高达 +8），已删。
++		# 现在只记**掉下去的先后**，本局结束时统一按存活名次给分。
++		if body.owner.player_presence != null:
++			var nid: int = body.owner.player_presence.network_id
++			if not _mp8_dead_order.has(nid):
++				_mp8_dead_order.append(nid)
++				print("[MP8] 逆向行进：第 %d 个掉进搅拌机 —— %s（%.1f 秒，扶梯 %.2f）" % [
++					_mp8_dead_order.size(), str(body.owner.player_presence.network_name),
++					_mp8_belt_elapsed, minf(_mp8_belt_base + _mp8_belt_ramp * _mp8_belt_elapsed, _mp8_belt_cap)])
+ 
+ 		check_game_end()

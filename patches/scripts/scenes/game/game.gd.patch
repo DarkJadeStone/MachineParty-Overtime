@@ -1,0 +1,271 @@
+diff --git a/scripts/scenes/game/game.gd b/scripts/scenes/game/game.gd
+--- a/scripts/scenes/game/game.gd
++++ b/scripts/scenes/game/game.gd
+@@ -292,6 +292,31 @@ func generate_session_playlist():
+ 
+ 	session_minigame_list = minigames_shuffled
+ 
++	# [MP8] 自动化测试开关：命令行 mp8game=<编号> 时，把整张歌单全填成同一个小游戏。
++	# 之所以是"填满"而不是"只留一个"，是为了完全不碰抽签器的逻辑——
++	# 它爱抽哪个下标就抽哪个，抽到的都是指定的这个，行为可复现。
++	# 编号 = Globals.MinigameIdentifier 的顺序：0=ChiselGauntlet 1=ExplodingCollarRace
++	# 2=EscalatorPit 3=ManufactureGun 4=SmokeBreak 5=DiscoDodge 6=ShapeCutter
++	# 7=KnifeAtTheOffice 8=ScavangerChairs 9=TrainRace 10=DuckHunt 11=GreenPea
++	# 12=DvdRoomba 13=JunkPlatform 14=SpineBreaker 15=MemorizePath 16=ForkliftCertified
++	# 17=BurnRecycle 18=CutsceneTest 19=CutsceneGame02
++	var mp8_forced: int = -1
++	for a in OS.get_cmdline_args():
++		var s: String = String(a)
++		if s.begins_with("mp8game="):
++			mp8_forced = int(s.substr(8))
++
++	if mp8_forced >= 0 and Globals.MinigameIdentifier.values().has(mp8_forced):
++
++		for i in session_minigame_list.size():
++			session_minigame_list[i] = mp8_forced
++
++		session_minigame_rounds[mp8_forced] = max(session_minigame_rounds.get(mp8_forced, 1), 1)
++
++		print("[MP8] 强制小游戏 = %s（歌单 %d 项全填同一个）" % [
++			Globals.MinigameIdentifier.keys()[mp8_forced], session_minigame_list.size()
++		])
++
+ 
+ func check_player_game_state():
+ 
+@@ -456,8 +481,20 @@ func load_minigame(minigame_identifier: Globals.MinigameIdentifier, _is_round: b
+ 		minigame.cleanup_rpc.rpc()
+ 		await get_tree().create_timer(1.0).timeout
+ 
++	# [MP8] 崩溃面包屑。硬崩（0xc0000005）会丢掉缓冲区里没刷出去的 stdout，
++	# 所以 print() 的日志不可信——必须每写一条就关文件，强制落盘。
++	# 落点：user://mp8_trace.txt，即
++	# %APPDATA%\Godot\app_userdata\Machine Party\mp8_trace.txt
++	_mp8_trace("load_minigame 开始 id=%d 路径=%s" % [
++		minigame_identifier, str(Globals.MinigamePaths.get(minigame_identifier, "<无此键>"))
++	])
++
+ 	var minigame_scene: PackedScene = load(Globals.MinigamePaths[minigame_identifier])
++	_mp8_trace("场景 load 完成 null=%s" % str(minigame_scene == null))
++
+ 	var minigame_instance = minigame_scene.instantiate()
++	_mp8_trace("instantiate 完成")
++
+ 	minigame = minigame_instance
+ 
+ 	minigame.host_loaded.connect(_on_host_minigame_loaded)
+@@ -479,7 +516,149 @@ func load_minigame(minigame_identifier: Globals.MinigameIdentifier, _is_round: b
+ 
+ 	GameManager.minigame_loaded.emit(minigame_identifier)
+ 	GameManager.current_minigame_identifier = minigame_identifier
++
++	_mp8_trace("准备 add_child")
+ 	minigame_parent.add_child(minigame_instance, true)
++	_mp8_trace("add_child 完成 —— 小游戏已进树")
++
++	# [MP8] 宣传截图：不 await，让它自己在后台等时点。
++	_mp8_promo_shot(minigame_identifier)
++
++
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] 宣传截图（mp8promo）—— 通用局内自截图，与具体小游戏无关
++# ═══════════════════════════════════════════════════════════════════════════
++#
++# 起因：15 个小游戏里只有 5 个自带 `_mp8_shot()`（残骸/凿刻/猎鸭/逆向/人工筛选），
++# 另外 10 个一张画面都截不出来。逐个去加等于改 10 个脚本、10 份回归风险，
++# 而**抓视口这件事跟小游戏是什么毫无关系** —— 所以挂在这里，一处覆盖全部 15 个。
++#
++# 与 `_mp8_shot()` 的分工：那些是**验收**用的（定点、定时、配合各自的调试开关）；
++# 这个是**出宣传图**用的，只关心画面干不干净。两者互不干扰，可以并存。
++#
++# ⚠️ 为什么挂在 load_minigame() 末尾而不是某个 Play 状态：
++# `game.gd` 看不见各小游戏内部的状态机（那是 15 套各不相同的东西）。
++# 从"小游戏进树"这一刻起算秒数是唯一对 15 个都成立的参照系。
++# 代价是时点不精确（各小游戏的开场长度不同），所以默认一次截三个时点，挑着用。
++#
++# 开关（都只在带 mp8promo 时有意义）：
++#   mp8promo          总开关，不传则整个函数第一行就 return
++#   mp8promoat=10,16  进小游戏后第几秒截，逗号分隔，可给任意多个（默认 10,16,22）
++#   mp8promoui        **保留**调试 UI（默认是截图瞬间藏掉的）
++#
++# 落点：user://mp8_promo_<小游戏id>_t<秒>_<peer>.png
++#   即 %APPDATA%\Godot\app_userdata\Machine Party\
++func _mp8_promo_shot(minigame_identifier: int) -> void :
++
++	if not Array(OS.get_cmdline_args()).has("mp8promo"):
++		return
++
++	var times: Array = []
++	var spec: String = _mp8_arg("mp8promoat=")
++	if spec == "":
++		times = [10.0, 16.0, 22.0]
++	else:
++		for part in spec.split(",", false):
++			var v: float = float(part)
++			if v > 0.0:
++				times.append(v)
++	if times.is_empty():
++		return
++	times.sort()
++
++	var peer: int = multiplayer.get_unique_id() if multiplayer.has_multiplayer_peer() else 0
++	var waited: float = 0.0
++
++	for t in times:
++		# 逐段等待：时点是相对"进树"的绝对秒数，不是彼此的间隔
++		var gap: float = float(t) - waited
++		if gap > 0.0:
++			await get_tree().create_timer(gap, false).timeout
++			waited = float(t)
++
++		# 小游戏中途被换掉（局数走完 / 掉线重来）就别再截了，
++		# 否则会把下一个小游戏的画面按上一个的 id 存盘。
++		if not is_inside_tree():
++			return
++		if Globals.current_minigame_identifier != minigame_identifier:
++			return
++
++		# 截图瞬间藏掉调试 UI，截完立刻还原。
++		# 这样不管命令行开了多少调试开关，出来的图都是干净的。
++		# ⚠️ 只藏 help_label（调试帮助文字），**不动头顶名牌** ——
++		# 名牌和 help_label 同在 Globals.GROUP_UI 里，但名牌是原版的东西，
++		# 而且"8 个名字同时挂在头上"正是这张图要说明的事，藏了反而没说服力。
++		var hidden: Array = []
++		if not Array(OS.get_cmdline_args()).has("mp8promoui"):
++			if debug_player_handler != null and debug_player_handler.help_label != null:
++				if debug_player_handler.help_label.visible:
++					hidden.append(debug_player_handler.help_label)
++					debug_player_handler.help_label.visible = false
++			_mp8_hide_debug_overlays(get_tree().root, hidden)
++
++		await RenderingServer.frame_post_draw
++
++		var img: Image = get_viewport().get_texture().get_image()
++		if img != null:
++			var path: String = "user://mp8_promo_%d_t%d_%d.png" % [minigame_identifier, int(t), peer]
++			img.save_png(path)
++			print("[MP8] mp8promo：已存 %s" % path)
++
++		for node in hidden:
++			if is_instance_valid(node):
++				node.visible = true
++
++
++# [MP8] 递归藏掉本 mod 自己加的调试浮层，收进 out 供截图后还原。
++#
++# ⚠️ 判据是**三条同时成立**，缺一条都会误伤：
++#   ① 是 CanvasLayer 或 Control —— 挡住 MP8Press / MP8Belt / MP8Spawn 那些
++#      同样以 MP8 开头、但**是玩法实体**的 Node3D，藏了它们就把场地拆了；
++#   ② 名字以 MP8 开头 —— 只认本 mod 加的，原版 UI 一律不碰；
++#   ③ 名字里带 Panel / Debug / Info —— 只认**调试浮层**。
++#      这条把 MP8BurnScoreBoard（8 人结算榜）和 MP8RoleRich（角色揭示）留了下来，
++#      它们是玩家该看到的东西，恰恰是宣传图想要的内容。
++func _mp8_hide_debug_overlays(node: Node, out: Array) -> void :
++
++	var n: String = node.name
++	if n.begins_with("MP8") and (node is CanvasLayer or node is Control):
++		if n.contains("Panel") or n.contains("Debug") or n.contains("Info"):
++			if node.visible:
++				out.append(node)
++				node.visible = false
++			return
++
++	for child in node.get_children():
++		_mp8_hide_debug_overlays(child, out)
++
++
++# [MP8] 取 mp8xxx=<值> 形式的命令行参数，取不到返回空串
++func _mp8_arg(prefix: String) -> String:
++	for a in OS.get_cmdline_args():
++		var s: String = str(a)
++		if s.begins_with(prefix):
++			return s.substr(prefix.length())
++	return ""
++
++
++# [MP8] 崩溃面包屑：每条都开-写-关，保证落盘。只在传 mp8trace 时启用。
++var _mp8_trace_on: int = -1
++
++func _mp8_trace(msg: String) -> void :
++
++	if _mp8_trace_on == -1:
++		_mp8_trace_on = 1 if Array(OS.get_cmdline_args()).has("mp8trace") else 0
++
++	if _mp8_trace_on == 0:
++		return
++
++	var path := "user://mp8_trace.txt"
++	var f := FileAccess.open(path, FileAccess.READ_WRITE) if FileAccess.file_exists(path) else FileAccess.open(path, FileAccess.WRITE)
++	if f == null:
++		return
++	f.seek_end()
++	f.store_line("[%d] %s" % [multiplayer.get_unique_id() if multiplayer else 0, msg])
++	f.close()
+ 
+ func update_scores(more_rounds: bool):
+ 
+@@ -707,15 +886,62 @@ func _on_host_overlay_minigame_selected(minigame_identifier: Globals.MinigameIde
+ 
+ 	load_minigame(minigame_identifier, false, 1)
+ 
++# [MP8] 各小游戏的分值系数（默认 1.0，只列需要压/抬的那些）。
++#
++# 猎鸭 0.5 的来由：它是"每人轮流当一次猎人"，8 人双猎 = **4 个小回合**，分数累加；
++# 改成名次制 + 击伤给分之后单场能到 0~42，而名次型小游戏（立足之本那类）只有 0~16，
++# 猎鸭会一家独大。
++# 系数放在**汇总处**的好处：不动各小游戏自己那套名次规则，
++# 以后要调平衡只改这一张表，不用回头再动玩法代码。
++# （用户 2026-08-15 定：猎鸭 50%）
++const MP8_MINIGAME_SCORE_SCALE: Dictionary = {
++	Globals.MinigameIdentifier.DuckHunt: 0.5,
++	# 雷区改名次制之后量级涨了（用户 2026-08-16 定案，推导见 exploding_collar_race.gd）：
++	#   原版累加制 8 人 = 单轮上限 4 分 × 3 轮 = 0~12
++	#   名次制     8 人 = 单轮上限 8 分（名次 0~7 + 满血 1）× 3 轮 = **0~24**
++	# 而 A 名次族（立足之本）8 人打 2 轮是 0~16。雷区打 3 轮，理应比它重一点，
++	# 但重一倍就过头 —— ×0.75 → **0~18**，比 A 族高约 12%，和"多打一轮"对得上。
++	Globals.MinigameIdentifier.ExplodingCollarRace: 0.75,
++}
++
++# 同一个小游戏在不同人数下场次不一样，分量也会差很多，所以再加一层"按人数覆盖"。
++#
++# 猎鸭 6 人 = 0.8 的来由：猎鸭的小回合数 = 人数 ÷ 每回合猎人数，
++# 6 人双猎只有 **3 个小回合**（8 人是 4 个），而且每人只当 2 次鸭子，
++# 算下来期望 5 分、区间 0~10，比同人数的名次型小游戏（约 0~12）还轻，
++# 和它在 8 人局的定位正好相反。提到 0.8 把这一档拉回来。
++# （用户 2026-08-15 定）
++const MP8_MINIGAME_SCORE_SCALE_BY_COUNT: Dictionary = {
++	Globals.MinigameIdentifier.DuckHunt: {6: 0.8},
++}
++
++
++func _mp8_score_scale() -> float:
++
++	var identifier = Globals.current_minigame_identifier
++	var by_count: Dictionary = MP8_MINIGAME_SCORE_SCALE_BY_COUNT.get(identifier, {})
++	var count: int = PlayerManager.player_presences.size()
++	if by_count.has(count):
++		return by_count[count]
++
++	return MP8_MINIGAME_SCORE_SCALE.get(identifier, 1.0)
++
++
+ func _on_minigame_player_scored(_network_id: int, _score: int):
+ 
+-	round_score_by_network_id[_network_id] += (_score * score_multiplier)
++	# [MP8] 先乘系数再取整，精度损失只发生在最后一步
++	round_score_by_network_id[_network_id] += int(
++		_score * score_multiplier * _mp8_score_scale()
++	)
+ 
+ func _on_minigame_player_score_finalized(player_scores):
+ 
++	var scale: float = _mp8_score_scale()  # [MP8]
+ 	for network_id in player_scores.keys():
+ 		if round_score_by_network_id.has(network_id):
+-			round_score_by_network_id[network_id] += player_scores[network_id] * score_multiplier
++			round_score_by_network_id[network_id] += int(
++				player_scores[network_id] * score_multiplier * scale
++			)
+ 
+ func _on_score_screen_finished():
+ 

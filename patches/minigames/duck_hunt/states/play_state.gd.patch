@@ -1,0 +1,13 @@
+diff --git a/minigames/duck_hunt/states/play_state.gd b/minigames/duck_hunt/states/play_state.gd
+--- a/minigames/duck_hunt/states/play_state.gd
++++ b/minigames/duck_hunt/states/play_state.gd
+@@ -21,6 +21,9 @@ func enter(_msg: Dictionary = {}) -> void :
+ 		for player in owner.players:
+ 			player.set_active_rpc.rpc(true)
+ 
++	owner.mp8_shot("go", 0.3)    # [MP8] 刚喊开始那一下，用来看倒计时口号/附注
++	owner.mp8_shot("play", 3.0)  # [MP8] 开打 3 秒后，用来看双猎人站位
++
+ func exit(_msg: Dictionary = {}) -> void :
+ 	pass
+ 

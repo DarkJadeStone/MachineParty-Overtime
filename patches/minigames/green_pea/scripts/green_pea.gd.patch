@@ -1,0 +1,393 @@
+diff --git a/minigames/green_pea/scripts/green_pea.gd b/minigames/green_pea/scripts/green_pea.gd
+--- a/minigames/green_pea/scripts/green_pea.gd
++++ b/minigames/green_pea/scripts/green_pea.gd
+@@ -35,9 +35,53 @@ var ach_timer: float = 0.0
+ var ach_duration: float = 20.0
+ var ach_active: bool = false
+ 
++
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] 8 人席位（2026-08-17）
++# ═══════════════════════════════════════════════════════════════════════════
++#
++# **摆法定案 B**（probe48/49 量出来的，不是拍脑袋）：**原版 4 席一个字节不动**，
++# 每边各插 2 个新座位，z = **+0.28**（插在原版两席中间）与 **-2.15**（桌子 -z 端的空档）。
++#
++# ⚠️ **"把桌子延长再加座位"这条路两个方向都堵死**（原本的方案 ①，实测否掉）：
++#   * **+z 方向**：相机在 (0, 4.26, 4.31) **朝 -z 看**，桌面已经到 z=2.86，
++#     离镜头只剩 1.45 米 —— 再往这边加人就糊在镜头上。
++#     （候选 C 实测：z=2.20 那对屏幕 ±0.93 贴边、椅子还出桌面 2 厘米。）
++#   * **-z 方向**：教练椅占 z[-4.83, -3.33]，桌面到 -2.86，中间只有 0.47 米。
++#
++# ⚠️ **为什么不用"每边 4 席均分"**（候选 A，间距 1.43 刚好塞得下 4 张椅子）：
++#   那样**原版席位会被挪走**，而教练的开枪动画是**逐座位手做的**
++#   （`coach_shoot_position_0..3`，全表只有这 4 个）—— 席位一挪，
++#   原本瞄得准的那 4 个也跟着全歪。保原版 = 8 席里有 4 席瞄准完美。
++#
++# 屏幕投影验算（坑第 25 条，全部在框内，最远 ±0.70，和原版最远那一席一样）：
++#     z=-2.15 → ±0.36    z=-0.73 → ±0.45    z=+0.28 → ±0.54    z=+1.29 → ±0.70
++#
++# 代价：z=+0.28 那把椅子和左右邻座各**重叠 0.34 米**
++# （用户 2026-08-17 明确授权"必要时候允许重叠"）。
++const MP8_NEW_SEAT_Z: Array[float] = [0.28, -2.15]
++
++# network_manager 用 Object.get() 读这个标志，读到 true 就不碰我们的出生点容器。
++# ⚠️ **必须有**：本容器名 `PlayerSpawnPositions` 正在通用补位的白名单里，
++#    而通用算法取的是"相邻两点连线的中点"—— 会把新座位塞到**桌子正中间**去。
++var mp8_owns_spawns: bool = true
++
++var _mp8_seat_z: Array[float] = []      # 下标 = 座位号，值 = 该席位的世界 z
++
++# [MP8] 被教练打死的先后。原版只把人从 active_players 里抹掉、不记顺序，
++# 而名次制需要给没吃完的人排个先后 —— 死得晚的比死得早的强（躲得久）。
++# 这是本次唯一新增的顺序数组；完成顺序用原版就有的 finished_players，
++# 到没到一半用原版就有的 halfway_done_players（用户定的规矩 2：用已有的顺序数组）。
++var _mp8_dead_order: Array[int] = []
++
++
+ func _ready() -> void :
+ 	super._ready()
+ 
++	# [MP8] 必须在任何人读出生点之前建好；而且**每个端都要跑**——
++	# 椅子和血迹是各机本地的视觉件，不走网络同步。
++	_mp8_setup_seats()
++
+ 	camera.current = true
+ 
+ 	if multiplayer.is_server():
+@@ -113,6 +157,289 @@ func spawn_players():
+ 	coach_handler.set_players(player_characters)
+ 
+ 
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] 以下全是新增
++# ═══════════════════════════════════════════════════════════════════════════
++
++func _mp8_setup_seats() -> void :
++
++	if player_spawn_positions == null:
++		push_warning("[MP8] 吃豆子：没有出生点容器，8 席不做")
++		return
++
++	var base: int = player_spawn_positions.get_child_count()
++	if base != 4:
++		print("[MP8] 吃豆子：出生点有 %d 个（预期 4），版本可能变了，8 席不做" % base)
++		return
++
++	# 原版 4 席的 z **现读**，不抄坐标（抄坐标是这个项目翻过车的事）
++	_mp8_seat_z.clear()
++	for i in base:
++		_mp8_seat_z.append(player_spawn_positions.get_child(i).position.z)
++
++	# 左右各取一个原版 Marker 当模板：x / y / 朝向全部沿用它的，只改 z
++	var left_src: Node3D = null
++	var right_src: Node3D = null
++	for i in base:
++		var m: Node3D = player_spawn_positions.get_child(i)
++		if m.position.x < 0.0:
++			if left_src == null:
++				left_src = m
++		elif right_src == null:
++			right_src = m
++
++	if left_src == null or right_src == null:
++		print("[MP8] 吃豆子：认不出左右两侧的出生点，8 席不做")
++		return
++
++	# ① 出生点：每个新 z 各加左右两个，顺序 = 左、右（和原版的左右交替一致）
++	for z in MP8_NEW_SEAT_Z:
++		for src in [left_src, right_src]:
++			var dup: Node3D = src.duplicate()
++			dup.name = "MP8Seat%d" % _mp8_seat_z.size()
++			player_spawn_positions.add_child(dup)
++			dup.transform = src.transform
++			dup.position = Vector3(src.position.x, src.position.y, z)
++			_mp8_seat_z.append(z)
++
++	_mp8_add_chairs(left_src, right_src)
++	_mp8_extend_decals(base)
++	_mp8_map_animations(base)
++	_mp8_clear_table_cans()
++
++	print("[MP8] 吃豆子：席位 %d → %d，z = %s" % [base, _mp8_seat_z.size(), str(_mp8_seat_z)])
++
++
++# 椅子实体：左右各拿一张原版椅子复制。
++# ⚠️ 父节点 `walls` 的 basis 实测是**单位阵**（probe48 逐级验过），所以可以直接改 position；
++#    换了版本万一不是单位阵，得按坑第 27 条用 basis.inverse() 换算，别直接平移。
++func _mp8_add_chairs(left_src: Node3D, right_src: Node3D) -> void :
++
++	var walls := get_node_or_null("pea dinner scene4/walls")
++	if walls == null:
++		print("[MP8] 吃豆子：找不到 walls，新座位没有椅子")
++		return
++
++	var chair_l := walls.get_node_or_null("chair player0")   # 左，z≈1.29
++	var chair_r := walls.get_node_or_null("chair player3")   # 右，z≈1.29
++	if chair_l == null or chair_r == null:
++		print("[MP8] 吃豆子：找不到模板椅子，新座位没有椅子")
++		return
++
++	# 椅子的 z 和出生点的 z 差一点（实测 0.07 米）——**现算这个差**，不写死
++	var off_l: float = chair_l.position.z - left_src.position.z
++	var off_r: float = chair_r.position.z - right_src.position.z
++
++	var n: int = 0
++	for z in MP8_NEW_SEAT_Z:
++		for pair in [[chair_l, off_l], [chair_r, off_r]]:
++			var src: Node3D = pair[0]
++			var d: Node3D = src.duplicate()
++			d.name = "MP8Chair%d" % n
++			walls.add_child(d)
++			d.transform = src.transform
++			d.position = Vector3(src.position.x, src.position.y, z + float(pair[1]))
++			n += 1
++
++	print("[MP8] 吃豆子：新增椅子 %d 张" % n)
++
++
++# 血迹：`decals_by_seat_index` 是按座位下标索引的定长 4 项数组（坑第 13 条那个模式），
++# 5~8 号会越界读。复制**同侧最近**那一组，整组沿世界 z 平移过去。
++# ⚠️ 组自己带 yaw（seat1/seat3 是 -180°），但 position 在父空间、父节点是单位阵，
++#    所以直接加 z 就是世界平移；组内子件跟着整组走，不用管它们的局部朝向。
++func _mp8_extend_decals(base: int) -> void :
++
++	var coach = coach_handler.coach if coach_handler != null else null
++	if coach == null or coach.decals_by_seat_index == null:
++		return
++
++	var arr: Array = coach.decals_by_seat_index
++	if arr.size() != base:
++		print("[MP8] 吃豆子：血迹数组 %d 项（预期 %d），跳过扩位" % [arr.size(), base])
++		return
++
++	for i in range(base, _mp8_seat_z.size()):
++
++		var v: int = _mp8_nearest_vanilla(i, base)
++		var src = arr[v]
++		if src == null or not is_instance_valid(src):
++			arr.append(null)
++			continue
++
++		var d: Node3D = src.duplicate()
++		src.get_parent().add_child(d)
++		d.name = "MP8Decals%d" % i
++		d.transform = src.transform
++		d.position = src.position + Vector3(0.0, 0.0, _mp8_seat_z[i] - _mp8_seat_z[v])
++		d.visible = false
++		arr.append(d)
++
++	print("[MP8] 吃豆子：血迹组 %d → %d" % [base, arr.size()])
++
++
++# 教练动画就近映射：新座位借**同侧、z 最近**那个原版席位的动画。
++# 全表只有 coach_shoot_position_0..3，加座位加不出新动画，只能借。
++func _mp8_map_animations(base: int) -> void :
++
++	var coach = coach_handler.coach if coach_handler != null else null
++	if coach == null:
++		return
++
++	var table: Array = []
++	var desc := PackedStringArray()
++
++	for i in _mp8_seat_z.size():
++		if i < base:
++			table.append(i)                       # 原版席位用自己的，瞄准完美
++			continue
++		var v: int = _mp8_nearest_vanilla(i, base)
++		table.append(v)
++		desc.append("席%d→动画%d(偏%.2f米)" % [i, v, absf(_mp8_seat_z[i] - _mp8_seat_z[v])])
++
++	coach.mp8_anim_by_seat = table
++	print("[MP8] 吃豆子：动画映射 %s" % " ".join(desc))
++
++
++# [MP8] 名次制算分（用户 2026-08-17 定：**名次制 + 第一个吃完额外一分**）
++#
++# 原版是 B 累加族，单轮上限 3 分（到一半 +1、吃完 +1、第一个吃完再 +1），
++# **完全不随人数变**：8 人局里七个人都拿 2 分，排名根本分不开。
++# 现在改成名次分，分差随人数放大，和名次族对齐。
++#
++# **排序（从差到好），全部用已有的顺序数组，不新造机制**：
++#   ① 没到一半就被打死的 —— 按死亡先后（先死的最差）
++#   ② 到了一半但没吃完就被打死的 —— 按死亡先后
++#   ③ 吃完的 —— 按完成顺序**倒序**（最后吃完的排在这一档最前，第一个吃完的最好）
++# 得分 = 在这个序列里的下标，**全档步长 1**；然后第一个吃完的**再 +1**。
++#
++# ⚠️ 这个 +1 会在榜首造成一个 2 分的断层（其余档位都是 1）——
++# 和碎骨者那次特意压平的断层是同一个形状，但**这里是用户明确要的**：
++# 那边的断层是原版遗留的副作用，这里是刻意奖励"第一个清盘"。
++#
++# ⚠️ 掉线的人（既没吃完也没被打死）不在任何顺序数组里，会保持 0 分 ——
++# 和"第一个死的"并列。人都断线了，不值得为他单开一档。
++func _mp8_apply_rank_scores() -> void :
++
++	var order: Array = []
++
++	# ① / ② 没吃完的：先按"到没到一半"分两档，档内按死亡先后
++	for want_half in [false, true]:
++		for nid in _mp8_dead_order:
++			if finished_players.has(nid):
++				continue                      # 吃完之后又被打死的，算完成
++			if halfway_done_players.has(nid) == want_half:
++				order.append(nid)
++
++	# ③ 吃完的：完成顺序倒过来，第一个吃完的排最后 = 分最高
++	var fin: Array = finished_players.duplicate()
++	fin.reverse()
++	order.append_array(fin)
++
++	for i in order.size():
++		player_scores[order[i]] = i
++
++	if not finished_players.is_empty():
++		player_scores[finished_players[0]] += 1
++
++	_mp8_log_scores(order.size())
++
++
++# 结算时把名次/名字/得分打进日志（不改任何分数，纯为事后对账）。
++# 格式与残骸平台、碎骨者一致，几个名次制小游戏对照着看方便。
++func _mp8_log_scores(ranked: int) -> void :
++
++	if not multiplayer.is_server():
++		return
++
++	var keys: Array = player_scores.keys()
++	keys.sort_custom(func(a, b): return player_scores[a] > player_scores[b])
++
++	var parts: PackedStringArray = []
++	for i in keys.size():
++		var nid = keys[i]
++		var nm: String = "id%d" % nid
++		if PlayerManager.player_presences.has(nid):
++			nm = String(PlayerManager.player_presences[nid].network_name)
++		var how := "掉线?"
++		if finished_players.has(nid):
++			how = "第%d个吃完" % (finished_players.find(nid) + 1)
++		elif _mp8_dead_order.has(nid):
++			how = ("到一半被打死" if halfway_done_players.has(nid) else "没到一半被打死")
++		parts.append("第%d名 %s %d分(%s)" % [i + 1, nm, player_scores[nid], how])
++
++	print("[MP8] 吃豆子结算（%d 人在场 / %d 人吃完 / %d 人被打死 / 排进名次 %d）：%s" % [
++		player_scores.size(), finished_players.size(), _mp8_dead_order.size(),
++		ranked, " / ".join(parts)
++	])
++
++
++# 清掉**桌面上**的罐头残骸（用户 2026-08-17 实测：挡住新座位的盘子）。
++#
++# ⚠️ **按范围判，不按名字写死**：`pea can*` 一共十几个，其中只有 4 个在桌上，
++# 其余几个在远处高台上（y 3.5~5.4、z≈-7），那些是布景，清了反而少东西。
++# 判据是"AABB 中心落在桌面 xz 范围内、且高于桌面"—— 桌面范围也现读，不抄坐标。
++#
++# 只关 `visible` 不删节点：可逆、不动场景结构。
++# （罐头如果另挂了碰撞体，这里不碰它 —— 玩家是坐着的，够不到桌子中央，
++#  实测挡的是**视线**不是身体。真发现还能撞上再说。）
++func _mp8_clear_table_cans() -> int :
++
++	var scene := get_node_or_null("pea dinner scene4")
++	if scene == null:
++		return 0
++
++	var table := scene.find_child("table", true, false)
++	if table == null or not (table is MeshInstance3D) or (table as MeshInstance3D).mesh == null:
++		print("[MP8] 吃豆子：找不到桌面网格，罐头不清")
++		return 0
++
++	var tb: AABB = (table as MeshInstance3D).global_transform * (table as MeshInstance3D).mesh.get_aabb()
++	var n: int = 0
++
++	for m in scene.find_children("pea can*", "MeshInstance3D", true, false):
++
++		if (m as MeshInstance3D).mesh == null:
++			continue
++
++		var c: Vector3 = ((m as MeshInstance3D).global_transform * (m as MeshInstance3D).mesh.get_aabb()).get_center()
++
++		# 高于桌面才算"桌上的"（远处高台那批 y 在 3.5 以上，但 xz 也不在桌面范围内，双重排除）
++		if c.y < tb.end.y - 0.10:
++			continue
++		if c.x < tb.position.x - 0.30 or c.x > tb.end.x + 0.30:
++			continue
++		if c.z < tb.position.z - 0.30 or c.z > tb.end.z + 0.30:
++			continue
++
++		m.visible = false
++		n += 1
++
++	print("[MP8] 吃豆子：清掉桌面罐头 %d 个（桌面 x[%.2f,%.2f] z[%.2f,%.2f] 顶面 y=%.2f）" % [
++		n, tb.position.x, tb.end.x, tb.position.z, tb.end.z, tb.end.y
++	])
++	return n
++
++
++# 同侧（x 同号）、z 最近的那个原版席位
++func _mp8_nearest_vanilla(seat: int, base: int) -> int :
++
++	var mine: Node3D = player_spawn_positions.get_child(seat)
++	var best: int = 0
++	var best_d: float = INF
++
++	for v in base:
++		var vm: Node3D = player_spawn_positions.get_child(v)
++		if signf(vm.position.x) != signf(mine.position.x):
++			continue
++		var d: float = absf(vm.position.z - mine.position.z)
++		if d < best_d:
++			best_d = d
++			best = v
++
++	return best
++
++
+ func initialize_debug_specifics():
+ 	super.initialize_debug_specifics()
+ 
+@@ -127,6 +454,7 @@ func check_game_end():
+ 
+ 	finished = true
+ 
++	_mp8_apply_rank_scores()          # [MP8] 名次制，见该函数
+ 	player_scores_finalized.emit(player_scores)
+ 
+ 	await get_tree().create_timer(3.0).timeout
+@@ -170,14 +498,12 @@ func _on_player_finished(_network_id: int):
+ 		if ach_active:
+ 			player_characters[_network_id].trigger_achievement_rpc.rpc()
+ 
++	# [MP8] 原版这里的两处 `player_scores += 1`（吃完 +1、第一个吃完再 +1）已删 ——
++	# 改成名次制之后分数在 _mp8_apply_rank_scores() 里按顺序数组统一算，
++	# 留着会和名次分叠加。"第一个吃完额外 +1"没丢，挪到那边了（用户 2026-08-17 要保留）。
+ 	if active_players.has(_network_id):
+-
+-		player_scores[_network_id] += 1
+ 		active_players.erase(_network_id)
+ 
+-	if finished_players.is_empty():
+-		player_scores[_network_id] += 1
+-
+ 	if not finished_players.has(_network_id):
+ 		finished_players.append(_network_id)
+ 
+@@ -187,14 +513,18 @@ func _on_player_died(_network_id: int):
+ 
+ 	if active_players.has(_network_id):
+ 		active_players.erase(_network_id)
++		# [MP8] 记死亡先后，名次制要用它给没吃完的人排序
++		if not _mp8_dead_order.has(_network_id):
++			_mp8_dead_order.append(_network_id)
+ 
+ 	check_game_end()
+ 
+ func _on_player_halfway(_network_id: int):
+ 
++	# [MP8] 原版这里 +1；名次制下改成**排序里的一档**（到过一半的死者排在没到一半的前面），
++	# 而不是单独加分 —— 单独加分会把"全档步长 1"的阶梯打乱。
+ 	if not halfway_done_players.has(_network_id):
+ 		halfway_done_players.append(_network_id)
+-		player_scores[_network_id] += 1
+ 
+ func _on_countdown_tick(time_left: int):
+ 	super._on_countdown_tick(time_left)

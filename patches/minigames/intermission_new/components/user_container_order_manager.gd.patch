@@ -1,0 +1,73 @@
+diff --git a/minigames/intermission_new/components/user_container_order_manager.gd b/minigames/intermission_new/components/user_container_order_manager.gd
+--- a/minigames/intermission_new/components/user_container_order_manager.gd
++++ b/minigames/intermission_new/components/user_container_order_manager.gd
+@@ -3,21 +3,57 @@ class_name Intermission_UserContainerOrder_Manager extends Node
+ @export var intermission_score: Intermission_ScoreScreen
+ @export var user_container_order_worker_instance: PackedScene
+ 
++# [MP8] 原版这里藏着一个 bug，一列的时候看不出来，分成两列立刻显形：
++#
++#   pos1 = Vector3(container2.transform.origin.x,                       ← 对方**当前**的实际坐标
++#                  rank_y_positions[container2.user_rank_value - 1],    ← 名次表推出来的
++#                  container2.transform.origin.z)
++#
++# y 是从名次表推的，x 却是读对方的实时位置。而
++# `check_to_switch_places_with_upstairs_container()` 每帧每条都在判，
++# 完全可能在**上一个 tween 还在飞**的时候再触发一次换位——
++# 这时读到的 x 是个中间值，算出来的目标位置就是错的。
++#
++# 一列时所有条的 x 恒定，读到中间值也还是那个值，所以永远不出错；
++# 分成两列之后 x 变成有意义的量，实测：左列少了两条、名次 3 跑到右列去了。
++#
++# 改法：x 和 y 一样**全部从名次表推**，不读对方的实时坐标。
++# 表由 Intermission_ScoreScreen 维护（`rank_y_positions` 原版就有，
++# `mp8_rank_x_positions` 是 8 人分列时新加的）。一列时 x 表里全是同一个值，
++# 行为与原版完全一致。
+ func switch_places(container1: Intermission_UserContainer, container2: Intermission_UserContainer):
+-	var pos_to_move_container1_to = Vector3(
+-		container2.transform.origin.x, 
+-		intermission_score.rank_y_positions[container2.user_rank_value - 1], 
+-		container2.transform.origin.z
+-	)
+-	var pos_to_move_container2_to = Vector3(
+-		container1.transform.origin.x, 
+-		intermission_score.rank_y_positions[container1.user_rank_value - 1], 
+-		container1.transform.origin.z
+-	)
++
++	var rank_container1 = container1.user_rank_value
++	var rank_container2 = container2.user_rank_value
++
++	# 两条互换名次，各自搬到"新名次对应的槽位"
++	var pos_to_move_container1_to = _mp8_slot_position(container1, rank_container2)
++	var pos_to_move_container2_to = _mp8_slot_position(container2, rank_container1)
++
+ 	var worker: Intermission_UserContainerOrder_Worker = user_container_order_worker_instance.instantiate()
+ 	add_child(worker)
+ 	worker.move_containers(container1, pos_to_move_container1_to, container2, pos_to_move_container2_to)
+-	var rank_container1 = container1.user_rank_value
+-	var rank_container2 = container2.user_rank_value
+ 	container1.set_user_rank_label(rank_container2)
+ 	container2.set_user_rank_label(rank_container1)
++
++
++# [MP8] 名次（1 起）对应的槽位坐标。表里查不到就退回这条当前的坐标（等于不动）。
++# x 表用 Object.get() 取：万一哪天计分板脚本没打补丁，也只退化成原版行为，不会报错。
++func _mp8_slot_position(container: Intermission_UserContainer, rank: int) -> Vector3:
++
++	var pos: Vector3 = container.transform.origin
++	var index: int = rank - 1
++	if index < 0 or intermission_score == null:
++		return pos
++
++	var ys: Array = intermission_score.rank_y_positions
++	if index < ys.size():
++		pos.y = ys[index]
++
++	var xs_value = intermission_score.get("mp8_rank_x_positions")
++	if xs_value is Array:
++		var xs: Array = xs_value
++		if index < xs.size():
++			pos.x = xs[index]
++
++	return pos

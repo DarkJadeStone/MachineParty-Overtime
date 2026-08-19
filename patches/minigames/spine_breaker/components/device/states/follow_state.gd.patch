@@ -1,0 +1,208 @@
+diff --git a/minigames/spine_breaker/components/device/states/follow_state.gd b/minigames/spine_breaker/components/device/states/follow_state.gd
+--- a/minigames/spine_breaker/components/device/states/follow_state.gd
++++ b/minigames/spine_breaker/components/device/states/follow_state.gd
+@@ -3,6 +3,26 @@ extends State
+ var target: SpineBreakerPlayer
+ var elapsed: float = 0.0
+ 
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] 卡住 → 侧向绕行（2026-08-17，用户实测"被抱住的人可以卡另一个机体的位置"）
++# ═══════════════════════════════════════════════════════════════════════════
++#
++# **为什么两台机器才会出这个问题**：一个人背上 A 之后 `has_spine_breaker = true`，
++# B 的 `_mp8_can_take()` 就把他否掉了 —— B **既抓不了他、又推不开他**，
++# 于是他可以拿身体把 B 顶在原地。原版只有一台，撞上就是被抓，卡不成僵局。
++#
++# **为什么不能靠"重新寻路"**：NavigationAgent3D 走的是导航网格，
++# 网格里根本没有玩家和另一台机器这些动态刚体 —— 重算多少次都是同一条路，
++# 撞的还是同一个人。所以真正管用的是**贴着障碍侧移一段**，绕过去再接回原路。
++const MP8_STUCK_RATIO: float = 0.35   # 实际位移 < 意图位移的这个比例 = 正被挡着
++const MP8_STUCK_SECS: float = 0.5     # 连续挡这么久才判定卡住（避免蹭一下就绕）
++const MP8_DODGE_SECS: float = 0.8     # 一次绕行走多久
++
++var _mp8_stuck: float = 0.0
++var _mp8_dodge_left: float = 0.0
++var _mp8_dodge_dir: Vector3 = Vector3.ZERO
++var _mp8_dodge_count: int = 0
++
+ func init() -> void :
+ 
+ 	owner.navigation_update_timer.timeout.connect(_on_navigation_timer_timeout)
+@@ -21,6 +41,11 @@ func enter(_msg: Dictionary = {}) -> void :
+ 	state_time = 0.0
+ 	elapsed = 0.0
+ 
++	# [MP8] 绕行状态按"每次追击"清零 —— 不清的话上一段追击攒下的绕行会带进新目标
++	_mp8_stuck = 0.0
++	_mp8_dodge_left = 0.0
++	_mp8_dodge_count = 0
++
+ 	var new_target = _msg.get("target", null)
+ 	var is_new_target: bool = _msg.get("new_target", false)
+ 
+@@ -48,13 +73,120 @@ func update_physics(_delta: float) -> void :
+ 	var current_agent_position: Vector3 = owner.global_position
+ 	var next_path_position: Vector3 = owner.navigation_agent.get_next_path_position()
+ 
+-	owner.velocity = current_agent_position.direction_to(next_path_position) * (owner.speed + elapsed_speed)
++	var dir: Vector3 = current_agent_position.direction_to(next_path_position)
++
++	# [MP8] 绕行期间把方向换成侧移方向（掺了原方向，所以是"斜着蹭过去"不是原地打转）
++	if _mp8_dodge_left > 0.0:
++		_mp8_dodge_left -= _delta
++		dir = _mp8_dodge_dir
++
++	owner.velocity = dir * (owner.speed + elapsed_speed)
+ 	owner.velocity.y = vertical_velocity
+ 
++	var before: Vector3 = owner.global_position
+ 	owner.move_and_slide()
++	_mp8_check_stuck(_delta, before, dir)
+ 
+ 	update_proximity_check()
+ 
++
++# [MP8] 这一帧想走多远 vs 实际走了多远，差太多就是被挡着了。
++# 用位移比而不是"速度是否为零"：move_and_slide 撞墙时速度还在，只是走不动。
++func _mp8_check_stuck(_delta: float, before: Vector3, dir: Vector3) -> void :
++
++	if _mp8_dodge_left > 0.0:      # 正在绕行，先让它走完
++		return
++
++	var want: float = Vector2(owner.velocity.x, owner.velocity.z).length() * _delta
++	var got: float = Vector2(
++		owner.global_position.x - before.x, owner.global_position.z - before.z
++	).length()
++
++	if want <= 0.001 or got >= want * MP8_STUCK_RATIO:
++		_mp8_stuck = 0.0
++		return
++
++	_mp8_stuck += _delta
++	if _mp8_stuck < MP8_STUCK_SECS:
++		return
++
++	_mp8_stuck = 0.0
++	_mp8_dodge_dir = _mp8_pick_dodge(dir)
++	_mp8_dodge_left = MP8_DODGE_SECS
++	_mp8_dodge_count += 1
++
++	# 每次追击只报第一次，够看出"这台在绕路"又不刷屏
++	if _mp8_dodge_count == 1 and multiplayer.is_server():
++		print("[MP8] 碎骨者：%d 号机被挡住了，改走侧向绕行（目标 %s）" % [
++			owner.mp8_index, (String(target.name) if target != null else "?")
++		])
++
++
++# 挑绕行方向：拿挡路那面的法线求切向，两个切向里选**不往回走**的那个。
++# 取不到法线（比如卡在两个体中间）就退回"当前朝向的垂线"。
++func _mp8_pick_dodge(dir: Vector3) -> Vector3 :
++
++	var n: Vector3 = Vector3.ZERO
++	for i in owner.get_slide_collision_count():
++		var cn: Vector3 = owner.get_slide_collision(i).get_normal()
++		if absf(cn.y) < 0.7:        # 忽略地面，只要竖直面
++			n = cn
++			break
++
++	var side: Vector3 = (n.cross(Vector3.UP) if n != Vector3.ZERO else dir.cross(Vector3.UP))
++	side.y = 0.0
++	if side.length() < 0.01:
++		return dir
++	side = side.normalized()
++
++	if side.dot(dir) < 0.0:         # 选和原方向同侧的那条切向
++		side = - side
++
++	# 掺一点原方向：绕行时仍然朝目标偏，绕过去就自然接回原路
++	return (side * 0.8 + dir * 0.4).normalized()
++
++
++# [MP8] 这个人能不能被我扑上去？
++#
++# 原版**没有任何判断**：距离 <1.45 就 Attached，body_entered 也是无条件。
++# 一台机器的时候无所谓，两台就会出事 ——
++#   * 两台可以同时扑同一个人：两条 10 秒引信并行跑，第一条烧完人就死了，
++#     第二台还 attached 在尸体上，之后它的 activation_timer 到点会对着死人再来一次 BreakSpine；
++#   * 已经死的人 collision layer 被关了（break_spine_rpc 里 set_collision_layer_value(1,false)），
++#     照理进不了 Area3D，但 players_in_proximity 是自己维护的数组，
++#     退出信号漏一次就会残留一个死人引用。
++# 所以这里逐条挡掉。
++func _mp8_can_take(p) -> bool :
++
++	if p == null or not is_instance_valid(p):
++		return false
++	if not (p is SpineBreakerPlayer):
++		return false
++	if not p.active:
++		return false
++	if p.has_spine_breaker:
++		return false
++	return true
++
++
++# 能不能把他**设成我的目标**（比 _mp8_can_take 多一条：别抢另一台已经盯上的人）。
++#
++# 为什么要分成两条判据：`choose_new_target` 分配目标时已经避开了另一台，
++# 但机器在跑过去的路上，下面 update_proximity_check() 会把 target 改成
++# "附近最近的那个" —— 那段原版逻辑完全不看另一台在追谁，于是两台又汇到同一个人身上
++# （用户实测："仇恨同时锁到一个人身上"）。
++#
++# ⚠️ 但**接触判定（distance < 1.45）不受这条约束**：都撞上了还不粘，
++#    玩家只会觉得机器坏了。抢不抢是"选目标"的事，粘不粘是"撞上了"的事。
++func _mp8_can_target(p) -> bool :
++
++	var gi = owner.game_instance
++	if gi != null and gi.has_method("mp8_is_claimed_by_other"):
++		if gi.mp8_is_claimed_by_other(p, owner):
++			return false
++	return true
++
++
+ func update_proximity_check():
+ 
+ 	var target_distance: float = INF
+@@ -62,14 +194,27 @@ func update_proximity_check():
+ 	var closest = null
+ 	var closest_distance = target_distance
+ 	for p in owner.players_in_proximity:
++
++		if not _mp8_can_take(p):        # [MP8]
++			continue
++
+ 		var distance = owner.global_position.distance_to(p.global_position)
+-		if distance < closest_distance:
+ 
+-			if distance < 1.45:
+-				state_machine.transition_to(&"Attached", {
+-					"target": p
+-				})
+-				return
++		# [MP8] 接触判定提到前面来，**不受"别抢别人的目标"约束**（见 _mp8_can_target 的注释）。
++		# ⚠️ 挪出 `if distance < closest_distance` 之后与原版逐例等价，不是行为改动：
++		#    原来它嵌在里面，但 closest_distance 只减不增 —— 能挡住某个 <1.45 的人的
++		#    前提是更早有个比他还近的，而那个人自己就 <1.45，早就 return 掉了。
++		#    所以"第一个进 1.45 的人触发"这条在两种写法下都成立。
++		if distance < 1.45:
++			state_machine.transition_to(&"Attached", {
++				"target": p
++			})
++			return
++
++		if not _mp8_can_target(p):      # [MP8] 换目标才看归属
++			continue
++
++		if distance < closest_distance:
+ 
+ 			closest_distance = distance
+ 			closest = p
+@@ -107,6 +252,9 @@ func _on_player_attach_entered(body):
+ 	if body is not SpineBreakerPlayer:
+ 		return
+ 
++	if not _mp8_can_take(body):        # [MP8] 别扑已经背着机器的人 / 死人
++		return
++
+ 	state_machine.transition_to(&"Attached", {
+ 		"target": body
+ 	})

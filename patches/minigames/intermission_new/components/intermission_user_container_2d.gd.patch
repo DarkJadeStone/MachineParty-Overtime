@@ -1,0 +1,79 @@
+diff --git a/minigames/intermission_new/components/intermission_user_container_2d.gd b/minigames/intermission_new/components/intermission_user_container_2d.gd
+--- a/minigames/intermission_new/components/intermission_user_container_2d.gd
++++ b/minigames/intermission_new/components/intermission_user_container_2d.gd
+@@ -25,6 +25,63 @@ var state: ContainerState = Intermission_UserContainer_2D.ContainerState.None
+ 
+ func _ready() -> void :
+ 	hide_invite_button()
++	_mp8_apply_bold()
++
++
++# [MP8] 名字上限与字重。
++#
++# 原版把名字砍到 8 个字符再补 "-"（9 个字符以上就砍），Steam 名字基本要被砍掉大半。
++# 加粗用 FontVariation.variation_embolden：不需要另配一套粗体字库文件，
++# 对任何字体都能合成加粗；Terminal F4 这种细笔画字体缩小之后尤其需要。
++#
++# ⚠️ 加粗会让字变宽，和"名字更长"抢的是同一份横向空间，一起调必须看图确认。
++#
++# 这段在 3D 那个 intermission_user_container.gd 里有一份**一模一样的**。
++# 不抽公共文件是因为：新加 .gd 就要新注册 class_name，而 class_name 表在
++# project.binary 里，得连项目设置一起打补丁，风险远大于抄这二十行。
++const MP8_NAME_MAX: int = 7   # 用户定案 2026-08-15（原版 9，试过 20）
++const MP8_BOLD: float = 0.12  # 0.3 实测太肥，数字的内孔糊死（见 HANDOFF T16）
++
++
++static func _mp8_arg_int(prefix: String, fallback: int) -> int:
++	for a in OS.get_cmdline_args():
++		var t: String = String(a)
++		if t.begins_with(prefix):
++			return int(t.substr(prefix.length()))
++	return fallback
++
++
++static func _mp8_arg_float(prefix: String, fallback: float) -> float:
++	for a in OS.get_cmdline_args():
++		var t: String = String(a)
++		if t.begins_with(prefix):
++			return float(t.substr(prefix.length()))
++	return fallback
++
++
++static func _mp8_format_name(_name: String) -> String:
++	var limit: int = maxi(_mp8_arg_int("mp8name=", MP8_NAME_MAX), 2)
++	if _name.length() > limit:
++		return _name.left(limit - 1) + "-"
++	return _name
++
++
++func _mp8_apply_bold() -> void :
++
++	var amount: float = _mp8_arg_float("mp8bold=", MP8_BOLD)
++	if is_equal_approx(amount, 0.0):
++		return
++
++	for label: Label in [label_rank, label_score, label_name]:
++		if not is_instance_valid(label):
++			continue
++		var base: Font = label.get_theme_font("font")
++		if base == null:
++			continue
++		var fv := FontVariation.new()
++		fv.base_font = base
++		fv.variation_embolden = amount
++		label.add_theme_font_override("font", fv)
+ 
+ func _physics_process(_delta: float) -> void :
+ 	set_ready_visuals()
+@@ -40,10 +97,7 @@ func set_user_data(_score: int, _name: String):
+ 	state = ContainerState.Normal
+ 
+ 	user_score_value = _score
+-	var formatted_name = _name
+-	if _name.length() > 9:
+-		formatted_name = _name.left(8)
+-		formatted_name += "-"
++	var formatted_name = _mp8_format_name(_name)  # [MP8] 原版砍到 8 字符
+ 
+ 	label_score.text = "%04d" % _score
+ 	label_name.text = formatted_name

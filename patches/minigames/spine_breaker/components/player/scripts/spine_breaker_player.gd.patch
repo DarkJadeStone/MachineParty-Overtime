@@ -1,0 +1,293 @@
+diff --git a/minigames/spine_breaker/components/player/scripts/spine_breaker_player.gd b/minigames/spine_breaker/components/player/scripts/spine_breaker_player.gd
+--- a/minigames/spine_breaker/components/player/scripts/spine_breaker_player.gd
++++ b/minigames/spine_breaker/components/player/scripts/spine_breaker_player.gd
+@@ -42,6 +42,26 @@ var has_spine_breaker: bool = false
+ var movement_input: Vector3
+ var spine_breaker_device: SpineBreakerDevice
+ 
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] 两台机器上场后必须记住「现在背着我的是哪一台」（2026-08-17）
++# ═══════════════════════════════════════════════════════════════════════════
++#
++# 原版 `spine_breaker_device` 是 setup_rpc() 时写死的**那一台**（场景里的 Device）。
++# 一台机器时它永远是对的；两台一上场，三处会错位：
++#   ① throw_spine_breaker_rpc()：背着 2 号机的人按扔 → 扔的是 1 号机
++#      → 自己背的甩不掉，反而把另一台遥控走了；
++#   ② break_spine_rpc()：死亡结算调错那台的 set_spine_broken_rpc；
++#   ③ _process 的闪烁同步：读错那台的 light_animation_player.speed_scale
++#      → 引信节奏显示的是另一台的，玩家判断不了自己还有多久炸。
++#
++# 由机器在 attach 时通过 mp8_bind_rpc 自报家门（call_local，所以每个客户端都设得上；
++# 光靠服务器的 attached_to 反查不行，状态机只在服务器转，客户端那份是空的）。
++var mp8_current_device: SpineBreakerDevice = null
++
++# [MP8] 染过色的面：[[MeshInstance3D, 面号, 染之前那个面上的覆盖材质], ...]
++# 记"之前是什么"而不是"清成 null"，见 mp8_set_visual_tint 里的理由。
++var _mp8_tinted: Array = []
++
+ var kicking: bool = false
+ var kick_progress: float = 0.0
+ var kick_timeout: float = 0.0
+@@ -55,6 +75,95 @@ var footstep_counter = 0
+ signal spine_broken()
+ signal emit_died(network_id)
+ 
++
++# [MP8] 把背上那台机器的视觉染成 c（Color.WHITE = 恢复原色）。
++#
++# 为什么非要有这个：**你背上看到的那台不是装置本体**。装置 attach 的那一刻就
++# `visible = false` 并被挪到地下 100 米（attach_entered_rpc），背上这个是玩家场景
++# 自己的 `spine_breaker_visual`，是另一套网格 —— 所以给装置本体染的红色，
++# 一被抱住就"没了"（用户 2026-08-17 实测）。这里给背上这套单独染一次。
++#
++# 同样走 set_surface_override_material（节点级、每个玩家各一份），
++# 不碰材质资源本身 —— 理由见小游戏脚本里 _mp8_tint_device 那段。
++# ⚠️⚠️ 这个函数前后错了**两版**，把教训写死在这儿：
++#
++#   第一版：走 `spine_breaker_visual.find_children(...)` —— 一个面都没染到。
++#     `find_children()` **只找后代、不含自身**，而 `spine_breaker_visual` 自己就是
++#     MeshInstance3D；且它的面 0 材质是 null，又被"必须是 StandardMaterial3D"挡掉。
++#
++#   第二版：修好上面两条，日志如实打出 `染色 1 面` —— **画面还是没变**。
++#     因为染对了节点、染错了对象：`spine_breaker_visual`（SpineBreakerAttached）
++#     根本不是画面上显示的那台。玩家背上真正看得见的机器，是
++#     `set_spinebreaker_visuals()` 用 `skeleton_attached.set_bone_pose_scale(34, ...)`
++#     从 0 撑到 1 的那根骨头 —— 属于**另一套骨骼**
++#     （`Visuals/main character spinebreaker attached`）的 character mesh 的**面 3**。
++#
++# ⭐⭐ 两次的共同教训：**"我改到了"和"玩家看到了"是两回事。**
++#    日志说染了 1 个面是真的，只是那个面没人看。验收必须落到画面上。
++#
++# 现在的认法（probe46 查的，不猜下标）：**按贴图名匹配**。
++# 机器那个面和装置本体用的是同名贴图，只是各自模型目录下的一份拷贝：
++#     装置本体   spinebreaker single2**_spinebreaker base1.png**
++#     玩家 面3   character spinebreaker attached1**_spinebreaker base1.png**
++#     角色皮肤   ..._main character painted6 / hands boots / eye open   ← 匹配不上
++# 所以拿"最后一个下划线之后的部分"当钥匙，扫整个 Visuals 子树。
++# 好处是**背着走和处决动画共用这张网格**，一条规则两处都覆盖。
++#
++# tex_key 为空 = 不做匹配（退化成"染所有带贴图的面"），只在装置那边取不到贴图时才会发生。
++func mp8_set_visual_tint(c: Color, tex_key: String = "") -> int :
++
++	# 先把上一次染的还原 —— 上一台可能是红的，这一台是白的，得刷得回来。
++	# 记的是**原来的覆盖材质**而不是一律清 null：角色定制（customization assigner）
++	# 也可能在这些面上挂过覆盖材质，一律清掉会把玩家配色抹了。
++	for row in _mp8_tinted:
++		var old_mi = row[0]
++		if is_instance_valid(old_mi):
++			old_mi.set_surface_override_material(row[1], row[2])
++	_mp8_tinted.clear()
++
++	if c == Color.WHITE or visuals == null:
++		return 0
++
++	var n: int = 0
++
++	for node in visuals.find_children("", "MeshInstance3D", true, false):
++
++		var mi: MeshInstance3D = node
++		if mi.mesh == null:
++			continue
++
++		for s in mi.mesh.get_surface_count():
++
++			var src = mi.get_active_material(s)
++			if not (src is StandardMaterial3D):
++				continue
++
++			var sd: StandardMaterial3D = src
++			if sd.albedo_texture == null:
++				continue
++
++			if tex_key != "":
++				var f: String = str(sd.albedo_texture.resource_path).get_file()
++				if not f.ends_with(tex_key):
++					continue
++
++			var m: StandardMaterial3D = sd.duplicate()
++			m.albedo_color = c
++			_mp8_tinted.append([mi, s, mi.get_surface_override_material(s)])
++			mi.set_surface_override_material(s, m)
++			n += 1
++
++	return n
++
++
++# [MP8] 当前背着我的那台；没绑上就退回原版那台（一台机器时两者是同一个）
++func _mp8_dev() -> SpineBreakerDevice :
++
++	if mp8_current_device != null and is_instance_valid(mp8_current_device):
++		return mp8_current_device
++	return spine_breaker_device
++
++
+ func _ready() -> void :
+ 
+ 	spine_breaker_visual.visible = false
+@@ -63,10 +172,11 @@ func _ready() -> void :
+ 
+ func _process(_delta: float) -> void :
+ 
+-	if spine_breaker_device:
++	var dev: SpineBreakerDevice = _mp8_dev()      # [MP8]
++	if dev:
+ 
+ 		blink_animation_player.speed_scale = (
+-			spine_breaker_device.light_animation_player.speed_scale
++			dev.light_animation_player.speed_scale
+ 		)
+ 
+ 	if not active:
+@@ -87,8 +197,8 @@ func _process(_delta: float) -> void :
+ 			return
+ 
+ 		movement_input = Vector3(
+-			DynamicInput.get_axis(player_presence.device_id, "left", "right"), 
+-			0.0, 
++			DynamicInput.get_axis(player_presence.device_id, "left", "right"),
++			0.0,
+ 			DynamicInput.get_axis(player_presence.device_id, "up", "down")
+ 		).rotated(Vector3.UP, deg_to_rad(scene_rotation))
+ 
+@@ -167,10 +277,10 @@ func update_movement(delta: float):
+ 	if movement_input.length() > Globals.Epsilon:
+ 
+ 		visuals.rotation.y = rotate_toward(
+-			visuals.rotation.y, 
++			visuals.rotation.y,
+ 			atan2(
+ 				- movement_input.x, - movement_input.z
+-			), 
++			),
+ 			delta * rotation_speed
+ 		)
+ 
+@@ -179,8 +289,8 @@ func update_movement(delta: float):
+ func update_animations(delta: float):
+ 
+ 	var delayed_blend = move_toward(
+-		animation_tree.get("parameters/run_blend/blend_amount"), 
+-		velocity.length() / move_speed, 
++		animation_tree.get("parameters/run_blend/blend_amount"),
++		velocity.length() / move_speed,
+ 		delta * move_blend_multiplier
+ 	)
+ 
+@@ -203,7 +313,6 @@ func beep():
+ 
+ 
+ 
+-
+ var tween_attachment: Tween
+ var tween_throw: Tween
+ @rpc("any_peer", "call_local", "reliable")
+@@ -212,6 +321,12 @@ func set_spine_breaker_rpc(_has_spine_breaker: bool, _thrown: bool = false, _fro
+ 	spine_breaker_visual.visible = _has_spine_breaker
+ 	has_spine_breaker = _has_spine_breaker
+ 
++	# [MP8] 机器离身（被扔走 / 复位）就把绑定解掉，免得下一次按扔还去遥控上一台；
++	# 背上那套视觉的染色也一并还原，否则下次被**白色那台**抱住还是红的
++	if not _has_spine_breaker:
++		mp8_current_device = null
++		mp8_set_visual_tint(Color.WHITE)
++
+ 	if _thrown:
+ 		set_spinebreaker_visuals()
+ 		animation_tree_attached.set("parameters/blend_normal_attached/blend_amount", 0)
+@@ -313,22 +428,45 @@ func break_spine_rpc():
+ 		if player_presence.customization.size() > 0:
+ 
+ 			PropManager.spawn_rpc.rpc(
+-				&"hat_gib", 
+-				global_position + (Vector3.UP * 3.0), 
+-				visuals.basis.z, 
+-				Vector3.ONE, 
++				&"hat_gib",
++				global_position + (Vector3.UP * 3.0),
++				visuals.basis.z,
++				Vector3.ONE,
+ 				[player_presence.customization[0]]
+ 			)
+ 
+ 			DecalManager.spawn_rpc.rpc(
+-				&"blood_splat_01", 
+-				global_position, 
+-				Vector3(0.0, lerp(-180.0, 180.0, randf()), 0.0), 
++				&"blood_splat_01",
++				global_position,
++				Vector3(0.0, lerp(-180.0, 180.0, randf()), 0.0),
+ 				Vector3.ONE
+ 			)
+ 
+ 	await get_tree().create_timer(0.5, false).timeout
+ 
++	# [MP8] ⚠️⚠️ **必须在 spine_broken.emit() 之前取这台机器**，取晚了拿到的一定是错的那台。
++	#
++	# emit 会**同步**走进 break_spine_state._on_spine_broken()，那里发的
++	# set_spine_breaker_rpc(false) 是 call_local 的 —— 当场就把 mp8_current_device 清成 null。
++	# 于是 emit 之后再问"谁背着我"，_mp8_dev() 只能退回原版写死的 spine_breaker_device，
++	# 也就是**永远是 1 号机**。
++	#
++	# 后果正是用户 2026-08-17 实测看到的那一幕：**2 号机杀的人，把 1 号机也拽到这具尸体上**
++	# —— set_spine_broken_rpc 干的事是「global_position = 传进去的坐标 + 重新打开碰撞层」，
++	# 于是两台机器叠在同一个点，被物理挤开，一台飞出去。
++	# 用户的判断（"下来的位置是被杀伤的人的实体坐标"）就是这条：传的正是尸体的 global_position。
++	#
++	# ⭐ 判据：**拿"当前绑定"去做事之前，先查这中间有没有谁把绑定清掉了。**
++	# 上一轮修的是"写死第一台"这个表面，但取值时机在清空**之后** —— 等于没修，
++	# 而且因为写法看着是对的（`_mp8_dev()` 就在那儿），复查时极容易被跳过去。
++	var dev: SpineBreakerDevice = _mp8_dev()
++
++	# 绊线：任何一台机器 attach 时都会 mp8_bind_rpc 自报家门（含 1 号机），
++	# 所以死的时候没绑定 = 绑定链断了，退回来的那台**很可能不是杀我的那台** ——
++	# 这条一旦打出来，上面那个"两台叠一起"的老毛病就会原样复现。
++	if multiplayer.is_server() and mp8_current_device == null:
++		print("[MP8] 碎骨者：⚠️ %s 死了却没有绑定机器 —— 退回 setup 时那台，复位可能挪错机器" % String(name))
++
+ 	spine_broken.emit()
+ 
+ 	player_name_label.visible = false
+@@ -339,7 +477,15 @@ func break_spine_rpc():
+ 	if multiplayer.is_server():
+ 
+ 		emit_died.emit(player_presence.network_id)
+-		spine_breaker_device.set_spine_broken_rpc.rpc(global_position)
++
++		# [MP8] 退休那台**不复位**：set_spine_broken_rpc 会把它重新显形、重开碰撞、
++		# 挪到尸体坐标 —— 那正好把"钉在他身上不下来"整个撤销掉。
++		# （_on_spine_broken 已经为退休那台跳过了全套复位，这里是同一件事的另一条入口，
++		#  漏掉这条的话退休机器会当场从尸体里冒出来变绿灯。）
++		if dev != null and not dev.mp8_retired:
++			dev.set_spine_broken_rpc.rpc(global_position)
++		elif dev != null:
++			print("[MP8] 碎骨者：%d 号机已退休，跳过尸体复位" % dev.mp8_index)
+ 
+ @rpc("any_peer", "call_local", "reliable")
+ func throw_spine_breaker_rpc():
+@@ -355,12 +501,20 @@ func throw_spine_breaker_rpc():
+ 
+ 	if multiplayer.is_server():
+ 
+-		spine_breaker_device.try_throw_rpc.rpc(
+-			throw_position.global_position, 
+-			- visuals.global_basis.z, 
+-			throw_strength, 
+-			get_path()
+-		)
++		# [MP8] 同上：扔的必须是背在自己身上的那台
++		var dev: SpineBreakerDevice = _mp8_dev()
++		# 诊断：绑定没生效时这里会打出"回退"，一眼看出是不是扔错了机器
++		print("[MP8] 碎骨者：%s 按扔 → %d 号机%s" % [
++			String(name), (dev.mp8_index if dev != null else -1),
++			("" if mp8_current_device != null else "（⚠️ 没绑定，回退到 setup 时那台）")
++		])
++		if dev != null:
++			dev.try_throw_rpc.rpc(
++				throw_position.global_position,
++				- visuals.global_basis.z,
++				throw_strength,
++				get_path()
++			)
+ 
+ @rpc("any_peer", "call_local", "reliable")
+ func set_active_rpc(_active: bool):

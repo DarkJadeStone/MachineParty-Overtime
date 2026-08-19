@@ -1,0 +1,642 @@
+diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scripts/duck_hunt.gd
+--- a/minigames/duck_hunt/scripts/duck_hunt.gd
++++ b/minigames/duck_hunt/scripts/duck_hunt.gd
+@@ -45,8 +45,131 @@ var players: Array
+ var players_acknowledged: Array[int]
+ var duck_player_count: int = 0
+ var duck_players: Dictionary[int, DuckHuntDuckPlayer]
++
++# [MP8] 原版只有一个猎人。6 人及以上改成两个，所以主存储换成数组；
++# `hunter_player` 保留为"第一个猎人"——本地分屏的取景器只支持一个视口。
++var hunter_players: Array[DuckHuntHunterPlayer] = []
+ var hunter_player: DuckHuntHunterPlayer
+ 
++# [MP8] ===== 8 人改造参数（用户 2026-08-14 定稿，见 HANDOFF T6）=====
++#
++# 人数 → 鸭:猎    ≤4 → 3:1 ｜ 5 → 4:1 ｜ 6 → 4:2 ｜ 7 → 5:2 ｜ 8 → 6:2
++# 弹夹/射速的五档表在 hunter_player.gd（原版就有那两张 @export 表，只是索引改成了总人数）。
++const MP8_TWO_HUNTERS_FROM: int = 6
++
++# 双猎人站位。实测几何：猎人位 (0, 16.629, -21)，鸭子排在 z=104，相距约 125 米。
++#
++# 改判过一次（2026-08-15）：
++#   初版按"分守两侧、形成交叉火力"给了 ±15，实跑后**用户判定火力覆盖意味太强**——
++#   两个狙击位隔着 30 米，鸭子无论往哪边跑都在某一个人的正面，压迫感过头。
++#   现在改成**中间并列**：两人从原位各往两边挪一个身位，肩并肩守中路。
++#   这样两人视野基本重合，火力集中而不是包夹，鸭子仍有侧翼可绕。
++#   2026-08-15 再调：1 个身位太挤，改成 2（两人之间隔约 4 米）。
++const MP8_HUNTER_SIDE_OFFSET: float = 2.0
++
++# 鸭子出生点：只在原版 3 个点的跨度里均分，**不往外扩**（往外扩会出地图，用户实测）。
++# ⚠️ 也不能套通用补位算法（取相邻两点的中点）：对 3 个点会算出**重合**的出生点——
++#    j=1 时 (-5,+5) 的中点 = 0，与原版 Marker3D 完全重合，实测两对鸭子叠在一起。
++var _mp8_duck_span_set: bool = false
++var _mp8_duck_span_min: float = 0.0
++var _mp8_duck_span_max: float = 0.0
++
++
++# [MP8] 自截图：文件名带角色（hunter/duck），事后一眼能挑出猎人那张。
++# 和另外两块屏一样，靠游戏自己存 PNG，不需要任何屏幕录制权限（见 HANDOFF 第八节）。
++func mp8_shot(tag: String, delay: float = 0.0) -> void :
++
++	if not Array(OS.get_cmdline_args()).has("mp8shot"):
++		return
++
++	if delay > 0.0:
++		await get_tree().create_timer(delay, false).timeout
++	if not is_inside_tree():
++		return
++	await RenderingServer.frame_post_draw
++
++	var role: String = "hunter" if is_hunter else "duck"
++	var peer: int = multiplayer.get_unique_id() if multiplayer.has_multiplayer_peer() else 0
++	var img: Image = get_viewport().get_texture().get_image()
++	if img != null:
++		img.save_png("user://mp8_duck_%s_%s_%d.png" % [tag, role, peer])
++		print("[MP8] mp8shot：已存 user://mp8_duck_%s_%s_%d.png" % [tag, role, peer])
++
++
++# [MP8] 本局该有几个猎人。至少留一只鸭，否则没人可打。
++func _mp8_hunter_count(total_players: int) -> int:
++	# [MP8] mp8lone：测试开关，强制单猎人。
++	# "独狼回合"本来只出现在 7 人局的**最后一个**小回合，而挂机机器人打不完前三个
++	# （鸭子不死不逃），那一轮的强化参数和专属口号根本验不到。
++	# 有了这个开关，8 人局直接就是 1 猎 7 鸭，独狼那套全走一遍。
++	if Array(OS.get_cmdline_args()).has("mp8lone"):
++		return 1
++	var wanted: int = 2 if total_players >= MP8_TWO_HUNTERS_FROM else 1
++	return clampi(wanted, 1, maxi(total_players - 1, 1))
++
++
++# [MP8] 猎人站位：一个猎人守中间（原版位置），两个猎人分守两侧。
++func _mp8_hunter_position(index: int, total_hunters: int) -> Vector3:
++	var base: Vector3 = hunter_player_spawn_position.global_position
++	if total_hunters <= 1:
++		return base
++	# index 0 → 左，index 1 → 右
++	var side: float = -1.0 if index == 0 else 1.0
++	return base + Vector3(side * MP8_HUNTER_SIDE_OFFSET, 0.0, 0.0)
++
++
++# [MP8] 鸭子出生点从 3 个补到够用为止。
++#
++# 第一版是"按原版间距 5 向两侧延伸"（x = 0, ±5, ±10, -15），
++# **用户实测：有人会跳出地图** —— 往外扩就扩到场地边界外面去了。
++# 现在改成**只在原版那 3 个点的跨度里均分**（x ∈ [-5, +5]）：
++# 那个跨度是原版唯一背书过"一定在场地内"的范围，往外一步都不迈。
++# 代价只是鸭子起跑时挨得近一些（6 只时间距 2），换来的是绝不出界。
++func _mp8_ensure_duck_spawns(needed: int) -> void :
++
++	var container: Node3D = duck_player_spawn_positions
++	var kids: Array = container.get_children()
++	if kids.is_empty() or needed <= 0:
++		return
++
++	# 原版跨度只在第一次采集，之后自己补的点不能再参与计算（否则会一轮轮往外爬）
++	if not _mp8_duck_span_set:
++		var xs: Array[float] = []
++		for k in kids:
++			if k is Node3D:
++				xs.append((k as Node3D).position.x)
++		xs.sort()
++		_mp8_duck_span_min = xs[0]
++		_mp8_duck_span_max = xs[xs.size() - 1]
++		_mp8_duck_span_set = true
++
++	if kids.size() >= needed:
++		return
++
++	var template: Node3D = kids[0]
++	while container.get_child_count() < needed:
++		var dup: Node3D = template.duplicate()
++		dup.name = "MP8DuckSpawn%d" % container.get_child_count()
++		container.add_child(dup)
++
++	# 全部重新均分到原版跨度里（含原有那 3 个，间距会变密但都在界内）
++	var all: Array = container.get_children()
++	var n: int = all.size()
++	for i in n:
++		var node: Node3D = all[i]
++		var t: float = 0.5 if n <= 1 else float(i) / float(n - 1)
++		var pos: Vector3 = node.position
++		pos.x = lerpf(_mp8_duck_span_min, _mp8_duck_span_max, t)
++		node.position = pos
++
++	var final_xs: Array = []
++	for k in all:
++		final_xs.append(snappedf((k as Node3D).position.x, 0.01))
++	print("[MP8] 鸭子出生点 %d -> %d，跨度 [%.1f, %.1f]，x = %s" % [
++		kids.size(), n, _mp8_duck_span_min, _mp8_duck_span_max, str(final_xs)
++	])
++
++
+ var spectate_duck_players: Array[DuckHuntDuckPlayer]
+ var spectator_index: int = 0
+ var spectate_player: DuckHuntDuckPlayer
+@@ -63,6 +186,140 @@ var player_scores: Dictionary[int, int]
+ var player_count: int
+ var hunter_name: String = ""
+ 
++# [MP8] 角色揭示界面要用：本局所有猎人的名字 + 总人数（决定显示哪条强弱提示）
++var mp8_hunter_names: Array = []
++var mp8_total_players: int = 0
++
++
++# [MP8] 角色揭示界面（用户 2026-08-15 定的版式）：
++#
++#   被选中者        ← 红
++#   玩家名字1
++#   玩家名字2
++#   增强已启动 / 削弱已启动   ← 增强红、削弱蓝；基准档不显示这行
++#
++# 为什么硬编码文案而不是加本地化 key：游戏的 .translation 是编译过的
++# OptimizedTranslation 资源，**加不了新 key**（用户拍板的四条之一）。
++#
++# 为什么要塞一个 RichTextLabel 进去：原版 `ui_role_label` 是普通 Label，
++# **一个 Label 只能有一种字色**，做不到"这行红、那行蓝"。
++# RichTextLabel 挂成它的子节点，就能白蹭原有的淡入 tween 和 shake 动画
++# （两者都作用在父节点上，子节点自动跟着）。
++const MP8_ROLE_COLOR_NAME: String = "#9bcf87"  # 原版那个绿，保持画面调性
++const MP8_ROLE_COLOR_BUFF: String = "#ff2d2d"  # 增强 = 红
++const MP8_ROLE_COLOR_NERF: String = "#3fa9ff"  # 削弱 = 蓝
++const MP8_ROLE_COLOR_NONE: String = "#4dff6a"  # 无效果 = 绿（比名字那个绿更亮，好和名字区分开）
++
++# "被选中者"放大两号：原版 Label 字号 32，这里用 BBCode 单独放大这一行
++const MP8_ROLE_TITLE_FONT_SIZE: int = 44
++
++
++func mp8_apply_role_reveal_label() -> void :
++
++	if ui_role_label == null:
++		return
++
++	var rtl: RichTextLabel = ui_role_label.get_node_or_null("MP8RoleRich")
++	if rtl == null:
++		rtl = RichTextLabel.new()
++		rtl.name = "MP8RoleRich"
++		rtl.bbcode_enabled = true
++		rtl.scroll_active = false
++		rtl.mouse_filter = Control.MOUSE_FILTER_IGNORE
++		rtl.set_anchors_preset(Control.PRESET_FULL_RECT)
++		var f: Font = ui_role_label.get_theme_font("font")
++		if f != null:
++			rtl.add_theme_font_override("normal_font", f)
++		var fs: int = ui_role_label.get_theme_font_size("font_size")
++		if fs > 0:
++			rtl.add_theme_font_size_override("normal_font_size", fs)
++		ui_role_label.add_child(rtl)
++
++	# ⚠️ 原 Label 的 modulate 是绿色 (0.61,0.81,0.53)，而 modulate **会往下传给子节点**，
++	# 不改的话红色会被乘成暗橄榄色。这里把它改成白色，颜色全交给 BBCode；
++	# alpha 仍旧由原来的淡入 tween 控制（那个 tween 只动 modulate:a，不碰 RGB）。
++	ui_role_label.modulate = Color(1.0, 1.0, 1.0, ui_role_label.modulate.a)
++	ui_role_label.text = ""
++
++	rtl.text = mp8_role_reveal_bbcode()
++
++	# RichTextLabel 没有垂直居中，等一帧拿到内容高度再把它压到中间
++	await get_tree().process_frame
++	if is_instance_valid(rtl):
++		rtl.offset_top = maxf(
++			(rtl.get_parent_area_size().y - rtl.get_content_height()) * 0.5, 0.0
++		)
++
++
++func mp8_role_reveal_bbcode() -> String:
++
++	var zh: bool = TranslationServer.get_locale().to_upper().begins_with("ZH")
++
++	var lines: Array[String] = []
++	# "被选中者"放大两号（原版 Label 是 32）
++	lines.append("[font_size=%d][color=%s]%s[/color][/font_size]" % [
++		MP8_ROLE_TITLE_FONT_SIZE, MP8_ROLE_COLOR_BUFF, "被选中者" if zh else "THE CHOSEN"
++	])
++
++	for n in mp8_hunter_names:
++		lines.append("[color=%s]%s[/color]" % [MP8_ROLE_COLOR_NAME, String(n).to_upper()])
++
++	# 三种状态各有各的提示：增强红、削弱蓝、**无效果绿**（≤4 和 8 人是基准档）
++	match mp8_total_players:
++		5:
++			lines.append("[color=%s]%s[/color]" % [
++				MP8_ROLE_COLOR_BUFF, "增强已启动" if zh else "BUFF ENGAGED"
++			])
++		6, 7:
++			lines.append("[color=%s]%s[/color]" % [
++				MP8_ROLE_COLOR_NERF, "削弱已启动" if zh else "NERF ENGAGED"
++			])
++		_:
++			lines.append("[color=%s]%s[/color]" % [
++				MP8_ROLE_COLOR_NONE, "无效果" if zh else "NO EFFECT"
++			])
++
++	return "[center]" + "\n".join(lines) + "[/center]"
++
++
++# [MP8] 纯文本版（保留：本地分屏等拿不到富文本的地方还用得上）
++func mp8_role_reveal_text() -> String:
++
++	# ⚠️ 本作的 locale 是**大写**代码（globals.gd 的 debug_locales：EN / ZHS / ZHT / JA …），
++	# 游戏自己也是拿 `match TranslationServer.get_locale(): "ZHS":` 这么比的。
++	# 第一版写成 begins_with("zh")，中文界面下判定成 false，显示了英文。
++	var loc: String = TranslationServer.get_locale().to_upper()
++	var zh: bool = loc.begins_with("ZH")
++
++	# 猎人名字：一个就用原版那句本地化，两个就自己拼
++	var names: Array = mp8_hunter_names
++	var head: String = ""
++	if names.size() <= 1:
++		head = tr("LOC_CONTROL_HUNTER_NAME") % hunter_name.to_upper()
++	else:
++		var joined: String = ""
++		for i in names.size():
++			if i > 0:
++				joined += " ＋ " if zh else " + "
++			joined += String(names[i]).to_upper()
++		head = ("双猎人：%s" % joined) if zh else ("HUNTERS: %s" % joined)
++
++	# 强弱提示：只有偏离基准的档位才提示
++	var tip: String = ""
++	match mp8_total_players:
++		5:
++			tip = "猎人强化　弹夹 12・射速 0.70" if zh else "HUNTER BUFFED  MAG 12 / CYCLE 0.70"
++		6:
++			tip = "猎人削弱　弹夹 7・射速 1.00" if zh else "HUNTER NERFED  MAG 7 / CYCLE 1.00"
++		7:
++			tip = "猎人削弱　弹夹 8・射速 0.80" if zh else "HUNTER NERFED  MAG 8 / CYCLE 0.80"
++		8:
++			tip = "基准配置　弹夹 10・射速 0.80" if zh else "BASELINE  MAG 10 / CYCLE 0.80"
++
++	if tip == "":
++		return head
++	return head + "\n" + tip
++
+ var last_spectate_camera_transform: Transform3D
+ 
+ var local_duck_players: Dictionary[int, DuckHuntDuckPlayer]
+@@ -216,17 +473,47 @@ func spawn_players():
+ 		local_game_players_order[player_presence] = null
+ 
+ 
++	# [MP8] 本局的猎人们（6 人及以上是 2 个）。原版这里只 pop 一个。
++	# 顺带一个好处：`check_game_end()` 是"possible_hunters 空了才结束"，
++	# 也就是每人轮流当一次猎人 = 一局的小回合数 = 人数。
++	# 8 人时一次 pop 两个 → 4 个小回合，和原版 4 人 1 猎的节奏一致，不会拖长一倍。
+ 	possible_hunters.shuffle()
+-	var hunter_network_id = possible_hunters.pop_front()
+ 
+-	set_hunter_name_rpc.rpc(PlayerManager.player_presences[hunter_network_id].network_name)
++	# [MP8] mp8hunterme：测试用，把猎人固定成 **P1 和 P2**（窗口 1 和窗口 2）。
++	# 不然猎人是随机抽的：人工试手感要满屏找哪个窗口是猎人，
++	# 试音效更麻烦——第一人称音效只在他自己那台机器上响，
++	# 得先知道第二个猎人是哪个实例，才能用 -Audio 把声音给到他。
++	# 固定下来之后：窗口 1 = 左猎人，窗口 2 = 右猎人，`-Audio 2` 就能听右边那个。
++	if Array(OS.get_cmdline_args()).has("mp8hunterme"):
++		for wanted_name in ["P2", "P1"]:   # 倒着塞，最后 P1 在最前面
++			for nid in possible_hunters:
++				var pres = PlayerManager.player_presences.get(nid)
++				if pres != null and pres.network_name == wanted_name:
++					possible_hunters.erase(nid)
++					possible_hunters.push_front(nid)
++					break
++
++	var total_players: int = PlayerManager.player_presences.size()
++	var hunter_count: int = _mp8_hunter_count(total_players)
++
++	var hunter_network_ids: Array[int] = []
++	while hunter_network_ids.size() < hunter_count and not possible_hunters.is_empty():
++		hunter_network_ids.append(possible_hunters.pop_front())
++
++	var hunter_names: Array[String] = []
++	for hid in hunter_network_ids:
++		hunter_names.append(PlayerManager.player_presences[hid].network_name)
++	set_hunter_names_rpc.rpc(hunter_names, total_players)
+ 
+ 	var player_presence: PlayerPresence
+ 
+ 	if GameManager.local_game:
+ 		set_local_lights()
+ 	else:
+-		set_ducks_ambient_light_rpc.rpc(hunter_network_id)
++		set_ducks_ambient_light_rpc.rpc(hunter_network_ids)
++
++	# [MP8] 鸭子位原版只有 3 个，先补够再取
++	_mp8_ensure_duck_spawns(total_players - hunter_network_ids.size())
+ 
+ 	var spawn_positions = duck_player_spawn_positions.get_children()
+ 	spawn_positions.shuffle()
+@@ -235,7 +522,7 @@ func spawn_players():
+ 	var counter: int = 0
+ 	for network_id in PlayerManager.player_presences.keys():
+ 
+-		if network_id == hunter_network_id:
++		if hunter_network_ids.has(network_id):
+ 			continue
+ 
+ 		player_presence = PlayerManager.player_presences[network_id]
+@@ -261,18 +548,11 @@ func spawn_players():
+ 		counter += 1
+ 
+ 	duck_player_count = duck_players.size()
+-	set_hunter_rpc.rpc(hunter_network_id)
+-
++	# [MP8] 名次分要用"本小回合开局有几只鸭"。duck_player_count 会被 remove_player_rpc
++	# 改动（有人掉线时），所以单独留一份开局快照，免得算出来的名次分随掉线飘。
++	_mp8_round_duck_count = duck_players.size()
++	set_hunters_rpc.rpc(hunter_network_ids)
+ 
+-	player_presence = PlayerManager.player_presences[hunter_network_id]
+-	var hunter_player_character = hunter_player_scene.instantiate()
+-	hunter_player_spawn_parent.add_child(hunter_player_character, true)
+-
+-	hunter_player_character.set_player_presence.rpc(player_presence.network_id)
+-	hunter_player_character.setup_rpc.rpc(
+-		hunter_player_spawn_position.global_position, 
+-		duck_player_count
+-	)
+ 
+ 	var hunter_initialization_delay = 8.0
+ 	if current_round > 0:
+@@ -281,16 +561,43 @@ func spawn_players():
+ 	if GameManager.local_game:
+ 		hunter_initialization_delay -= 2.0
+ 
+-	hunter_player_character.initialize_hunter_rpc.rpc(hunter_initialization_delay)
++	# [MP8] 逐个生成猎人（原版这里只有一个，没有循环）
++	hunter_players.clear()
++	for hunter_index in hunter_network_ids.size():
++		var hunter_network_id: int = hunter_network_ids[hunter_index]
++		player_presence = PlayerManager.player_presences[hunter_network_id]
++
++		var hunter_player_character = hunter_player_scene.instantiate()
++		hunter_player_spawn_parent.add_child(hunter_player_character, true)
++
++		hunter_player_character.set_player_presence.rpc(player_presence.network_id)
++		hunter_player_character.setup_rpc.rpc(
++			_mp8_hunter_position(hunter_index, hunter_network_ids.size()),
++			duck_player_count,
++			total_players,
++			hunter_index,
++			hunter_network_ids.size()
++		)
++
++		hunter_player_character.initialize_hunter_rpc.rpc(hunter_initialization_delay)
+ 
+-	local_game_players_order[player_presence.network_id] = hunter_player_character
+-	hunter_player = hunter_player_character
+-	players.append(hunter_player_character)
++		local_game_players_order[player_presence.network_id] = hunter_player_character
++		hunter_players.append(hunter_player_character)
++		players.append(hunter_player_character)
++
++	hunter_player = hunter_players[0] if not hunter_players.is_empty() else null
++
++	print("[MP8] 猎鸭开局：%d 人 → %d 鸭 %d 猎，猎人位 %s" % [
++		total_players, duck_player_count, hunter_players.size(),
++		str(hunter_names)
++	])
+ 
+ 	for network_id in duck_players.keys():
+ 		duck_player_added_rpc.rpc(network_id)
+ 
+-	local_handler.setup(local_multiplayer_camera_viewport, hunter_player.local_viewport)
++	# [MP8] 本地分屏取景器只支持一个视口，用第一个猎人的；加个空判防止没猎人时崩
++	if hunter_player:
++		local_handler.setup(local_multiplayer_camera_viewport, hunter_player.local_viewport)
+ 
+ func force_game_end():
+ 
+@@ -317,9 +624,15 @@ func check_game_end():
+ 	if resetting:
+ 		return
+ 
+-	if not duck_players.is_empty() and hunter_player:
++	if not duck_players.is_empty() and not hunter_players.is_empty():  # [MP8] 原为单个 hunter_player
+ 		return
+ 
++	# [MP8] 小回合结算，方便对着日志核算名次分对不对
++	print("[MP8] 小回合结束：%d 鸭 %d 猎，跑掉 %d 只、被打死 %d 只，累计分 %s" % [
++		_mp8_round_duck_count, hunter_players.size(),
++		players_finished.size(), players_shot.size(), str(player_scores)
++	])
++
+ 	if not possible_hunters.is_empty():
+ 		resetting = true
+ 		await get_tree().create_timer(3.0).timeout
+@@ -337,12 +650,23 @@ func check_game_end():
+ func set_hunter_name_rpc(_hunter_name: String):
+ 	hunter_name = _hunter_name
+ 
++# [MP8] 双猎人版：名字变成一串，另外把本局人数一起发下去，
++# 角色揭示界面要用它显示"这一档猎人被加强/削弱了"。
++@rpc("authority", "call_local", "reliable")
++func set_hunter_names_rpc(_hunter_names: Array, _total_players: int):
++	mp8_hunter_names = _hunter_names
++	mp8_total_players = _total_players
++	hunter_name = String(_hunter_names[0]) if not _hunter_names.is_empty() else ""
++
+ @rpc("authority", "call_local", "reliable")
+-func set_ducks_ambient_light_rpc(_hunter_id):
+-	if multiplayer.get_unique_id() == _hunter_id:
+-		light_parent_ducks_only.visible = false
++func set_ducks_ambient_light_rpc(_hunter_ids):
++	# [MP8] 原来收单个 id，现在收一串：两个猎人都要看不见"只有鸭子能看见"的补光
++	var is_local_hunter: bool = false
++	if _hunter_ids is Array:
++		is_local_hunter = (_hunter_ids as Array).has(multiplayer.get_unique_id())
+ 	else:
+-		light_parent_ducks_only.visible = true
++		is_local_hunter = (multiplayer.get_unique_id() == _hunter_ids)
++	light_parent_ducks_only.visible = not is_local_hunter
+ 
+ @rpc("authority", "call_local", "reliable")
+ func duck_player_added_rpc(_network_id):
+@@ -368,6 +692,56 @@ func set_hunter_rpc(_network_id):
+ 
+ 	acknowledge_role_rpc.rpc(multiplayer.get_unique_id())
+ 
++# [MP8] 双猎人版：收一串 id，判断自己在不在里面
++@rpc("any_peer", "call_local", "reliable")
++func set_hunters_rpc(_network_ids: Array):
++
++	is_hunter = _network_ids.has(multiplayer.get_unique_id())
++	if is_hunter:
++		Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
++
++	_mp8_setup_countdown()  # 角色定了才知道该给自己显示哪句
++	acknowledge_role_rpc.rpc(multiplayer.get_unique_id())
++
++
++# [MP8] 倒计时的文字/配色（用户 2026-08-15 定的版式）。
++#
++# 全部小回合：数到 "1" 时数字变红；"GO!" 换成分角色的口号并抖动。
++#   鸭子 → 狂奔吧！      猎人 → 狩猎吧！
++# 独狼回合（本该两猎却只有一个，即 7 人局最后一轮）额外：
++#   倒计时下方多一行**大一号的红字**"猎人已大幅增强"，
++#   口号升级成  鸭子 → 夺命狂奔吧！   猎人 → 尽情狩猎吧！
++#
++# 这些都是**本机渲染**的（服务器只广播 "3"/"2"/"1"/"GO!"），
++# 所以同一时刻鸭子和猎人各看各的，不用额外 RPC。
++# 客户端判断独狼靠 set_hunter_names_rpc 发下来的名字数组，不依赖只有服务器才有的 hunter_players。
++func _mp8_setup_countdown() -> void :
++
++	if minigame_overlay == null:
++		return
++
++	var zh: bool = TranslationServer.get_locale().to_upper().begins_with("ZH")
++	var lone: bool = mp8_hunter_names.size() == 1 and mp8_total_players >= MP8_TWO_HUNTERS_FROM
++
++	minigame_overlay.mp8_shake_on_go = true
++
++	if is_hunter:
++		minigame_overlay.mp8_go_text = (
++			("尽情狩猎吧！" if zh else "HUNT THEM ALL!") if lone
++			else ("狩猎吧！" if zh else "HUNT!")
++		)
++	else:
++		minigame_overlay.mp8_go_text = (
++			("夺命狂奔吧！" if zh else "RUN FOR YOUR LIFE!") if lone
++			else ("狂奔吧！" if zh else "RUN!")
++		)
++
++	# **只有独狼回合**才把倒计时的 "1" 整个换成红色提示语；
++	# 其余回合保持原版正常的白色 "1"（用户 2026-08-15 修正）。
++	minigame_overlay.mp8_one_text = ""
++	if lone:
++		minigame_overlay.mp8_one_text = "猎人已大幅增强" if zh else "HUNTER GREATLY BUFFED"
++
+ @rpc("any_peer", "call_local", "reliable")
+ func acknowledge_role_rpc(_network_id: int):
+ 	if not multiplayer.is_server():
+@@ -376,10 +750,14 @@ func acknowledge_role_rpc(_network_id: int):
+ 	players_acknowledged.append(_network_id)
+ 
+ 	if players_acknowledged.size() == PlayerManager.player_presences.keys().size():
+-		if first_round:
++		# [MP8] mp8rolereveal：测试开关。角色揭示界面原本只在第二个小回合起才出现
++		# （第一个小回合走的是 "ROUND x/y" 那屏），而 8 个 AFK 实例根本打不完一个小回合，
++		# 于是那屏永远等不到。这个开关让第一个小回合就走角色揭示，好截图看文案。
++		if first_round and not Array(OS.get_cmdline_args()).has("mp8rolereveal"):
+ 			first_round = false
+ 			state_machine.transition_to_rpc.rpc(&"Round", {"round": round_number, "total": total_rounds})
+ 		else:
++			first_round = false
+ 			state_machine.transition_to_rpc.rpc(&"RoleReveal")
+ 
+ @rpc("any_peer", "call_local", "reliable")
+@@ -429,7 +807,9 @@ func remove_player_rpc(_network_id: int):
+ 			remove_spectate_player_rpc.rpc(_network_id)
+ 			duck_players.erase(_network_id)
+ 		if player_instance is DuckHuntHunterPlayer:
+-			hunter_player = null
++			# [MP8] 只摘掉走掉的那个猎人，另一个还在场上
++			hunter_players.erase(player_instance)
++			hunter_player = hunter_players[0] if not hunter_players.is_empty() else null
+ 			duck_player_count -= 1
+ 
+ 		player_instance.queue_free()
+@@ -498,13 +878,20 @@ func _on_player_finished(_network_id: int):
+ 			local_duck_players.erase(_network_id)
+ 
+ 	if duck_players.has(_network_id):
++
++		# [MP8] 猎人按"打掉多少血"拿分：这只鸭跑掉了，但可能是带着伤跑掉的
++		_mp8_award_hunters(_mp8_damage_taken(duck_players[_network_id]))
++
+ 		duck_players.erase(_network_id)
+ 		remove_spectate_player_rpc.rpc(_network_id)
+-		if players_finished.is_empty():
+-			players_finished.append(_network_id)
+-			player_scores[_network_id] += 1
+ 
+-		player_scores[_network_id] += 1
++		# [MP8] 名次分：第 j 个抵达出口的拿 2×(D-1-j)，越早到越高。
++		# 原版是"第一个到 +2、其余 +1"，第 3 名和第 6 名完全同分，名次信息全丢了。
++		var j: int = players_finished.size()
++		players_finished.append(_network_id)
++		player_scores[_network_id] += MP8_DUCK_RANK_STEP * maxi(
++			_mp8_round_duck_count - 1 - j, 0
++		)
+ 
+ 	check_game_end()
+ 
+@@ -517,15 +904,76 @@ func _on_player_died(_network_id: int):
+ 	if duck_players.has(_network_id):
+ 		duck_players.erase(_network_id)
+ 		remove_spectate_player_rpc.rpc(_network_id)
+-		player_scores[hunter_player.player_presence.network_id] += 1
++		# [MP8] 死掉的鸭子一定被打满了血量（爆头 2 伤、身体两枪 1+1，都是 2），
++		# 所以直接按满血给，不用管它是怎么死的。过量伤害也不会多算。
++		_mp8_award_hunters(MP8_DUCK_MAX_HEALTH)
+ 
++	# [MP8] 名次分：第 i 个被打死的拿 2i —— 第一个死的 0 分，撑得越久越高。
++	# （原版被打死是 0 分，死得早死得晚一个样。）
++	var i: int = players_shot.size()
+ 	players_shot.append(_network_id)
++	if player_scores.has(_network_id):
++		player_scores[_network_id] += MP8_DUCK_RANK_STEP * i
+ 
+-	if players_shot.size() == (player_count - 1):
+-		player_scores[hunter_player.player_presence.network_id] += 1
++	# 原版"把鸭子全打光再 +1"的奖励去掉了：现在全歼自然拿到 2D（满额），
++	# 已经高于任何一只鸭子的 2(D-1)，不需要额外补。
+ 
+ 	check_game_end()
+ 
++
++# [MP8] ===== 名次制算分（T13，2026-08-15 用户定稿）=====
++#
++# 原版是累加型：鸭子跑到出口 +1（第一个再 +1），被打死 0 分；猎人每杀一只 +1。
++# 毛病是**单局最多拉开 2 分，而且跑第 3 名和第 6 名完全同分**——
++# 名次信息被压掉了，撼动不了总排名（见第六点五节"反超难"）。
++#
++# 现在改成用小游戏**自己已有的顺序数组**当名次源（players_shot / players_finished），
++# 和淘汰型小游戏一个路子：
++#
++#   鸭子·被打死  第 i 个死的      → 2i          （第一个死 = 0 分）
++#   鸭子·跑掉    第 j 个到出口的  → 2(D-1-j)    （第一个到 = 最高分）
++#   猎人（共享） 打掉多少血就拿多少 = 2×击杀 + 1×带伤逃脱
++#
++# 两组分数正好拼成 {0,2,4,…,2(D-1)} 一整套，不重不漏（死的占低位、跑掉的占高位）。
++#
++# **为什么步长是 2 而不是 1**：留出"击伤 = 半只鸭"的整数表达。
++# 鸭子 2 点血，身体一枪 1 伤、爆头 2 伤，所以用"血量"当分度单位最自然：
++# 爆头击杀 = 2 分，身体两枪击杀 = 1+1 = 2 分（**和爆头等价，不奖励低效打法**），
++# 打伤但让它跑了 = 1 分。
++const MP8_DUCK_RANK_STEP: int = 2
++const MP8_DUCK_MAX_HEALTH: int = 2
++
++# 本小回合开局时有几只鸭（算"第 j 个到达"的分数要用；duck_player_count 会被
++# remove_player_rpc 改动，所以单独存一份开局快照）
++var _mp8_round_duck_count: int = 0
++
++
++# [MP8] 这只鸭子身上已经被打掉多少血。用于"带伤逃脱"给猎人半额。
++# 夹到 [0, max_health]：死掉的鸭子 health 会是 0 或负数（爆头打残血 = 过量伤害），
++# 不夹的话过量伤害会多算分。
++func _mp8_damage_taken(duck) -> int:
++	if duck == null or not is_instance_valid(duck):
++		return 0
++	var max_hp: int = duck.max_health if "max_health" in duck else MP8_DUCK_MAX_HEALTH
++	var hp: int = duck.health if "health" in duck else max_hp
++	return clampi(max_hp - hp, 0, max_hp)
++
++
++# [MP8] 双猎人**合作**：共享总分，纯粹鸭 vs 猎，猎人之间不竞争（用户拍板的四条之一）。
++# 所以每次得分是**每个猎人都加同样的分**，而不是只给开枪的那个。
++# 副作用：一个猎人也走这条路径，行为与原版完全一致。
++func _mp8_award_hunters(amount: int) -> void :
++	for h in hunter_players:
++		if not is_instance_valid(h):
++			continue
++		if h.player_presence == null:
++			continue
++		var hid: int = h.player_presence.network_id
++		if player_scores.has(hid):
++			player_scores[hid] += amount
++		else:
++			player_scores[hid] = amount
++
+ func _on_countdown_expired():
+ 	super._on_countdown_expired()
+ 

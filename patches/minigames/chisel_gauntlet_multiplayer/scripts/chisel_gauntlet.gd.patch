@@ -1,0 +1,576 @@
+diff --git a/minigames/chisel_gauntlet_multiplayer/scripts/chisel_gauntlet.gd b/minigames/chisel_gauntlet_multiplayer/scripts/chisel_gauntlet.gd
+--- a/minigames/chisel_gauntlet_multiplayer/scripts/chisel_gauntlet.gd
++++ b/minigames/chisel_gauntlet_multiplayer/scripts/chisel_gauntlet.gd
+@@ -13,8 +13,16 @@ enum JumbotronScreen{
+ }
+ 
+ @export_category("Shared Parameters")
++# [MP8] 硬阻塞 ①：原版只有 4 项，spawn_players() 按 [counter] 索引 → 第 5 人越界。
++# **前 4 项逐字节保持原样**（0/180/90/-90），后 4 项是它们之间的 45° 方位，
++# 于是 4 人及以下的座位与原版完全一致。
++# 座位不需要新几何体：玩家场景的 ./Visuals 局部偏移 (0, -0.037, -8.0) 决定了
++# 所有人都站在半径 8 米的圆周上，只靠 yaw 区分方位；45° 间隔 = 弧间距 6.28 米。
++# ⚠️ 这是 @export，真实值以场景为准（坑第 3 条）—— 已用 probe17 dump 过
++# chisel_gauntlet.tscn，根节点**没有**覆盖本属性，所以脚本默认值就是运行时真值。
++# 即便如此，_mp8_setup_seats() 仍会把运行时真值打进日志，不靠"我记得没覆盖"。
+ @export var player_rotations: Array[float] = [
+-	0.0, 180.0, 90.0, -90
++	0.0, 180.0, 90.0, -90, 45.0, 225.0, 135.0, -45.0
+ ]
+ 
+ @export_category("Game Parameters")
+@@ -80,6 +88,17 @@ var round_instructions: Array[int] = []
+ var submitted_solutions: Dictionary[int, Array]
+ 
+ 
++# [MP8] 硬阻塞 ②：这张表决定散弹枪转过去检查**哪些座位**（round_eliminate.gd:25
++# `for i in owner.shotgun_check_order`）。原版只列了 0~3，座位 4~7 不在表里
++# → **5~8 号玩家答错也永远不会被淘汰**，是功能坏，不是难看。
++#
++# 原版的 [0, 2, 1, 3] 对应角度 0 / 90 / 180 / 270 —— 它本来就是**按角度升序**排的，
++# 只是被写成了下标字面量。所以这里不手写下标，改成运行时**按角度排序**推出来
++# （_mp8_setup_seats）：4 人时算出来的正是 [0, 2, 1, 3]，与原版逐值相同；
++# 8 人时是 [0, 4, 2, 6, 1, 5, 3, 7]（0→45→90→…→315，枪一路顺时针扫过去不回头）。
++#
++# ⚠️ 表里只放**本局实际有人的座位**。多放的话 round_eliminate 会走 else 分支
++# 把 sequential 置 false，转枪变成慢速+另一种音效 —— 4 人局的手感就跟原版不一样了。
+ var shotgun_check_order: Array[int] = [0, 2, 1, 3]
+ 
+ var first_round: bool = true
+@@ -87,9 +106,419 @@ var round_time_remaining: int
+ var spectate_positions: Array[Vector3]
+ var can_submit: bool = false
+ 
++
++# [MP8] ================ 凿刻考验（ChiselGauntlet）8 人适配 ================
++#
++# 逆向出来的场景事实（probe17 dump 原装 PCK 量的，不是猜的）：
++#
++# 1. **所有玩家共用同一个出生点**：spawn_players() 里
++#    `teleport_rpc(player_spawn_node.global_position, Vector3(0, player_rotations[counter], 0))`，
++#    PlayerSpawnNode 在原点，**玩家只靠 yaw 区分**。玩家场景 ./Visuals 局部偏移
++#    (0, -0.037, -8.0) 把人推到半径 8 米的圆周上 → 座位 = 一个角度，不是一个坐标。
++#    **所以加座位不需要新的出生点几何体，扩 player_rotations 就够了。**
++#
++# 2. **桌子碰撞体**：`Colliders/StaticBody3D{,2,3,4}`，四个全在原点、只有 yaw 不同，
++#    子节点 `collision shape desk` 局部偏移 (0.037, 0.822, 4.613)。
++#    → 复制一份、绕 Y 转过去就是新座位的桌子碰撞体。
++#
++# 3. **可见桌子不是一整块**（这条和最初的侦察结论相反，必须记下来）：
++#    `Geometry/environment` 那一整块是 **`visible = false` 的灰盒**，不是玩家看到的东西；
++#    真正的美术在 `./chisel gauntlet art2`，其中
++#    `walls/control panel alpha|bravo|charlie|delta` 是**四份独立的 MeshInstance3D**，
++#    和碰撞体一样全在原点、只有 yaw 不同。→ 可见桌子也能整份复制+旋转。
++#    **教训：判断"能不能拆"之前先确认你看的那块网格是不是真的在画面上。**
++#
++# 一切配对（碰撞体 ↔ 座位、可见件 ↔ 座位）**一律按空间角度算，不用下标算术**
++# —— 残骸平台翻转配对那个坑（HANDOFF 坑第 5 条/T18）就是栽在下标上。
++
++const MP8_MAX_SEATS: int = 8
++
++## 随座位走的可见美术件（`chisel gauntlet art2/walls` 下）。
++## 四份互为 90° 旋转的同一件东西，整份复制 + 绕 Y 转到新方位即可。
++## ⚠️ `control panel hole mesh` / `control panel hole wires` 是场地中心的单件，
++## 名字像但**不随座位走**，绝不能进这张表。
++const MP8_SEAT_ART_NODES: Array[String] = [
++	"control panel alpha", "control panel bravo",
++	"control panel charlie", "control panel delta",
++]
++
++## 座位上方的招牌（alpha/bravo/charlie/delta 四块）。默认跟着桌子一起复制。
++const MP8_SEAT_SIGN_NODES: Array[String] = [
++	"sign_alpha", "sign_bravo", "sign_charlie", "sign_delta",
++]
++
++var _mp8_seat_count: int = 0
++## 给新座位复制**可见**桌子。用户 2026-08-16 定案：要可见桌子，所以默认开。
++## `mp8chiselnodesk` 可关掉（退回只有碰撞体的样子，用来对照）。
++var _mp8_clone_desk_art: bool = true
++## mp8chiselnosign：复制可见桌子时不带招牌
++var _mp8_clone_sign: bool = true
++
++
++func _mp8_setup_seats() -> void :
++
++	var args := Array(OS.get_cmdline_args())
++
++	_mp8_clone_desk_art = not args.has("mp8chiselnodesk")
++	_mp8_clone_sign = not args.has("mp8chiselnosign")
++
++	# ⚠️ 先把**运行时真值**打出来再动它（坑第 3 条：@export 的真实值以场景为准，
++	# 脚本里的默认值是骗人的。本项目已因此翻车两次）。
++	print("[MP8] 凿刻考验：运行时 player_rotations（真值）= %s，共 %d 项" % [
++		str(player_rotations), player_rotations.size()
++	])
++
++	var want: int = clampi(PlayerManager.player_presences.size(), 0, MP8_MAX_SEATS)
++	if want > player_rotations.size():
++		push_warning("[MP8] 凿刻考验：%d 人但 player_rotations 只有 %d 项，座位不够" % [
++			want, player_rotations.size()
++		])
++		want = player_rotations.size()
++	_mp8_seat_count = want
++
++	# ---- 散弹枪扫描顺序：按角度升序排，不手写下标 ----
++	_mp8_rebuild_shotgun_order(want)
++
++	if args.has("mp8noexpand"):
++		print("[MP8] 凿刻考验：mp8noexpand，不加任何座位家当（纯原版对照组）")
++		return
++
++	if want <= 4:
++		print("[MP8] 凿刻考验：%d 人，用原版 4 套座位家当，不动" % want)
++		return
++
++	_mp8_expand_seats(want)
++
++
++# 原版 [0, 2, 1, 3] 就是"按角度 0→90→180→270 升序"，只是写成了下标字面量。
++# 这里把它还原成算法：4 人时结果与原版逐值相同，8 人时自动得到 [0,4,2,6,1,5,3,7]。
++func _mp8_rebuild_shotgun_order(seat_count: int) -> void :
++
++	var vanilla := shotgun_check_order.duplicate()
++
++	var order: Array[int] = []
++	for i in seat_count:
++		order.append(i)
++	order.sort_custom(func(a, b):
++		return _mp8_wrap360(player_rotations[a]) < _mp8_wrap360(player_rotations[b])
++	)
++	shotgun_check_order = order
++
++	var parts := PackedStringArray()
++	for i in order:
++		parts.append("%d(%.0f°)" % [i, _mp8_wrap360(player_rotations[i])])
++	print("[MP8] 凿刻考验：散弹枪扫描顺序 %s → %s   %s" % [
++		str(vanilla), str(order), ", ".join(parts)
++	])
++
++	if seat_count == 4 and order != vanilla:
++		push_warning("[MP8] 凿刻考验：4 人时扫描顺序与原版不一致（%s vs %s），请检查" % [
++			str(order), str(vanilla)
++		])
++
++
++func _mp8_expand_seats(seat_count: int) -> void :
++
++	# ---- 1. 座位的方位角：拿玩家场景里 ./Visuals 的真实偏移算，不写死 8.0/180 ----
++	# （偏移是从 PackedScene 里读的运行时真值，美术哪天改了这里自动跟着变。）
++	var visuals_offset: Vector3 = _mp8_player_visuals_offset()
++	if is_zero_approx(Vector2(visuals_offset.x, visuals_offset.z).length()):
++		push_warning("[MP8] 凿刻考验：量不出玩家 Visuals 的水平偏移，放弃加座位家当")
++		return
++	print("[MP8] 凿刻考验：玩家 Visuals 局部偏移 = %s（半径 %.2f 米）" % [
++		str(visuals_offset), Vector2(visuals_offset.x, visuals_offset.z).length()
++	])
++
++	var seat_dir: Array[float] = []
++	for i in seat_count:
++		seat_dir.append(_mp8_seat_direction(visuals_offset, player_rotations[i]))
++
++	# ---- 2. 先验证"新座位 = 原版座位整体转 MP8_SEAT_STEP 度" ----
++	# 整个复制策略的前提就是这一条。成立才敢整组转，不成立就只能退回逐件配对。
++	if not _mp8_verify_rotational_layout(seat_dir):
++		push_warning("[MP8] 凿刻考验：座位不是「原版整体转 %.0f°」的关系，放弃加座位家当" % MP8_SEAT_STEP)
++		return
++
++	# ---- 3. 桌子碰撞体 ----
++	var colliders: Node3D = get_node_or_null("Colliders") as Node3D
++	if colliders != null:
++		var desks: Array[Node3D] = []
++		for c in colliders.get_children():
++			if c is StaticBody3D and _mp8_find_child_named(c, "desk") != null:
++				desks.append(c)
++		_mp8_clone_group_rotated(colliders, desks, "桌子碰撞体")
++	else:
++		push_warning("[MP8] 凿刻考验：找不到 Colliders 节点，桌子碰撞体没加")
++
++	# ---- 4. 可见桌子 + 招牌 ----
++	var walls: Node3D = get_node_or_null("chisel gauntlet art2/walls") as Node3D
++	if walls == null:
++		push_warning("[MP8] 凿刻考验：找不到 'chisel gauntlet art2/walls'，可见件全部跳过")
++		return
++
++	if not _mp8_clone_desk_art:
++		print("[MP8] 凿刻考验：新座位只有碰撞桌子、**没有可见桌子**（mp8chiselnodesk 生效中）")
++		return
++
++	var groups: Array = [MP8_SEAT_ART_NODES]
++	var labels: Array = ["可见桌子"]
++	if _mp8_clone_sign:
++		groups.append(MP8_SEAT_SIGN_NODES)
++		labels.append("座位招牌")
++
++	for g in groups.size():
++		var srcs: Array[Node3D] = []
++		for nm in groups[g]:
++			var n: Node3D = walls.get_node_or_null(nm) as Node3D
++			if n == null:
++				push_warning("[MP8] 凿刻考验：可见件 '%s' 不在，跳过" % nm)
++				continue
++			srcs.append(n)
++		_mp8_clone_group_rotated(walls, srcs, labels[g])
++
++
++## 新座位相对原版座位的角度步长。八座位 = 四座位各补一个中间位。
++const MP8_SEAT_STEP: float = 45.0
++
++
++# 验证"新座位 = 原版四座位整体转 MP8_SEAT_STEP 度"。
++#
++# 这是整组旋转策略的**唯一前提**，所以显式验一遍而不是默认它成立：
++# 每个新座位都必须能在原版座位里找到一个"正好差 MP8_SEAT_STEP 度"的对应者，
++# 且对应关系是一一对应（不能两个新座位抢同一个原版座位）。
++func _mp8_verify_rotational_layout(seat_dir: Array[float]) -> bool :
++
++	if seat_dir.size() <= 4:
++		return true
++
++	var used: Array[int] = []
++	for i in range(4, seat_dir.size()):
++		var found: int = -1
++		for j in 4:
++			if absf(_mp8_angle_delta(seat_dir[j], seat_dir[i]) - MP8_SEAT_STEP) < 1.0:
++				found = j
++				break
++		if found < 0 or used.has(found):
++			return false
++		used.append(found)
++	return true
++
++
++# 把一组"每座位一份"的节点整组复制一份、每份绕场地中心转 MP8_SEAT_STEP 度。
++#
++# ⚠️ **不做"这一份服务哪个座位"的判断** —— 那正是上一版栽跟头的地方：
++# 它用"网格 AABB 中心的方位角"认座位，而 `control panel *` 这四块网格是偏心的，
++# 包围盒重心比真实座位轴**偏了 33.2°**（招牌和巨幕屏幕不偏，所以只有桌子会错）。
++# 实测三种判据：AABB 中心角对招牌/屏幕准、对桌子错 33°；节点原点角全是同一个值
++# （这些件全摆在原点，只有 yaw 不同）→ 两种都不可靠。
++#
++# 正确做法是**绕开这个问题**：原版四份已经铺满原版四个座位，
++# 把这四份**整组**转 45° 就正好铺满四个新座位 —— 谁对谁根本不用判，
++# 这也是大厅排布那条教训（坑第 8 条：别自己算坐标，复制原件整体平移/旋转）。
++#
++# 代价：新座位的桌子是**一次补满四个**的，5~7 人时会有没人坐的空桌子。
++# 这在本游戏里不算穿帮 —— 人被淘汰后桌子本来就留在原地。
++func _mp8_clone_group_rotated(
++	parent: Node3D,
++	sources: Array[Node3D],
++	label: String
++) -> void :
++
++	if sources.is_empty():
++		push_warning("[MP8] 凿刻考验：%s 一份都没找到，跳过" % label)
++		return
++
++	# 自检：这四份必须是"同一件东西转 90°"的关系，整组旋转才说得通。
++	# 判据用节点自己的 yaw（姿态），不用网格重心 —— 见上面那段。
++	var yaws: Array[float] = []
++	for s in sources:
++		yaws.append(_mp8_wrap360(rad_to_deg(s.global_transform.basis.get_euler().y)))
++	var sorted_yaws := yaws.duplicate()
++	sorted_yaws.sort()
++	var even: bool = sources.size() == 4
++	if even:
++		for i in 4:
++			if absf(_mp8_angle_delta(sorted_yaws[i], sorted_yaws[(i + 1) % 4]) - 90.0) > 1.0:
++				even = false
++				break
++
++	var wire := PackedStringArray()
++	for i in sources.size():
++		wire.append("%s(yaw %.0f°)" % [String(sources[i].name), yaws[i]])
++	print("[MP8-WIRE] 凿刻考验：%s 原版 %d 份 —— %s   %s" % [
++		label, sources.size(), ", ".join(wire),
++		("✓四份互差90°" if even else "❌不是均匀四份，整组旋转可能不成立")
++	])
++	if not even:
++		push_warning("[MP8] 凿刻考验：%s 不是「四份互差 90°」，仍按整组转 %.0f° 处理，请看画面核对" % [
++			label, MP8_SEAT_STEP
++		])
++
++	var added := PackedStringArray()
++	for s in sources:
++		var dup: Node3D = s.duplicate()
++		dup.name = "%s_MP8" % String(s.name)
++		parent.add_child(dup)
++		_mp8_rotate_about_center(dup, s, MP8_SEAT_STEP)
++		added.append("%s→%s" % [String(s.name), String(dup.name)])
++
++	print("[MP8] 凿刻考验：%s 整组复制 %d 份、各转 %+.0f° —— %s" % [
++		label, added.size(), MP8_SEAT_STEP, ", ".join(added)
++	])
++
++
++# 场地中心的参考系。
++#
++# ⚠️⚠️ **`Minigame extends Node`，不是 Node3D** —— 本脚本的 `self` 上**没有**
++# `global_transform`/`global_position`。第一版在这里和 _mp8_node_direction 里
++# 直接写了 `global_transform`，`tools\build.ps1` **照样编译通过**
++# （gdre 不做基类标识符解析），但游戏一加载就是
++#   `Parse Error: Identifier "global_transform" not declared in the current scope`
++#   → 整个脚本 load 失败 → chisel_gauntlet 节点没有脚本 → 三个 Array[Node] 导出
++#     接不上（`Failed to get property 'speakers_switches'`）→ 小游戏永远起不来，
++#     表面症状是"卡在 SessionIntro"，跟 4→8 一点关系都没有。
++# **教训：编译通过 ≠ 能跑。判据只有一条 —— 日志里没有 `Parse Error`。**
++#
++# 用 `PlayerSpawnNode` 当基准：它是 Node3D，而且**定义上就是座位圆的圆心**
++# （spawn_players() 里所有人都被 teleport 到它的 global_position，靠 yaw 分方位）。
++# 比"小游戏根节点"更贴题，也不用假设场地在世界原点。
++func _mp8_field_transform() -> Transform3D :
++	if player_spawn_node != null:
++		return player_spawn_node.global_transform
++	return Transform3D.IDENTITY
++
++
++# 绕**场地中心**的 Y 轴把 dup 转 delta 度。
++#
++# ⚠️ 不能直接写 `dup.rotate_y()`：那是绕节点**自己**的原点转。
++# 所以统一在场地中心空间里左乘一个 Y 旋转。
++func _mp8_rotate_about_center(dup: Node3D, src: Node3D, delta_deg: float) -> void :
++	var base: Transform3D = _mp8_field_transform()
++	var rot := Transform3D(Basis(Vector3.UP, deg_to_rad(delta_deg)), Vector3.ZERO)
++	dup.global_transform = base * rot * base.affine_inverse() * src.global_transform
++
++
++# 一个节点在场地里的方位角（度，0 = 根节点的 +Z 方向）。
++# 网格件用**网格 AABB 的中心**而不是节点原点 —— 这些美术件全都摆在原点、
++# 只有 yaw 不同，节点原点算出来是 (0,0)，方位角毫无意义（美术把真实摆位烘进了网格）。
++func _mp8_node_direction(n: Node3D) -> float :
++
++	if n == null:
++		return 0.0
++
++	var p: Vector3 = n.global_position
++	var m = n.get("mesh")
++	if m != null and m is Mesh:
++		var ab: AABB = (m as Mesh).get_aabb()
++		p = n.global_transform * (ab.position + ab.size * 0.5)
++
++	var local: Vector3 = _mp8_field_transform().affine_inverse() * p
++	return _mp8_wrap360(rad_to_deg(atan2(local.x, local.z)))
++
++
++# 座位（= 一个 yaw）在场地里的方位角。玩家根节点在原点、只转 yaw，
++# 真正把人推出去的是 ./Visuals 的局部偏移，所以方位 = 偏移被 yaw 转过之后的朝向。
++func _mp8_seat_direction(visuals_offset: Vector3, yaw_deg: float) -> float :
++	var v: Vector3 = Basis(Vector3.UP, deg_to_rad(yaw_deg)) * visuals_offset
++	return _mp8_wrap360(rad_to_deg(atan2(v.x, v.z)))
++
++
++# 从玩家场景（PackedScene，只读取，不实例化）里量 ./Visuals 的局部偏移。
++# 不写死 8.0：这是"真实值只能从数据里读，别拿记忆当真值"那条规矩。
++func _mp8_player_visuals_offset() -> Vector3 :
++
++	var st: SceneState = player_scene.get_state()
++	for i in st.get_node_count():
++		var path: String = String(st.get_node_path(i)).trim_prefix("./")
++		if path != "Visuals":
++			continue
++		for k in st.get_node_property_count(i):
++			if String(st.get_node_property_name(i, k)) != "transform":
++				continue
++			var v = st.get_node_property_value(i, k)
++			if v is Transform3D:
++				return (v as Transform3D).origin
++	return Vector3.ZERO
++
++
++func _mp8_find_child_named(n: Node, needle: String) -> Node3D :
++	for c in n.get_children():
++		if c is Node3D and String(c.name).to_lower().contains(needle):
++			return c
++	return null
++
++
++func _mp8_wrap360(a: float) -> float :
++	return fposmod(a, 360.0)
++
++
++## 两个方位角之间的最短夹角（绝对值，0~180）
++func _mp8_angle_gap(a: float, b: float) -> float :
++	return absf(_mp8_angle_delta(a, b))
++
++
++## 从 a 转到 b 要转多少度（带符号，-180~180）
++func _mp8_angle_delta(a: float, b: float) -> float :
++	return rad_to_deg(angle_difference(deg_to_rad(a), deg_to_rad(b)))
++
++
++# [MP8] 自截图（照抄残骸平台/逆向行进那套）：游戏自己存 PNG，不需要任何屏幕权限。
++# ⚠️ 必须走 RPC 广播：调用点（generate_random_cube_instructions / start_round_timer）
++# 都在 `if not multiplayer.is_server(): return` 之后，直接调只有房主会存图，
++# 而"新座位有没有桌子"恰恰要看新座位那个人自己的第一人称画面。
++@rpc("authority", "call_local", "reliable")
++func mp8_shot_rpc(tag: String, delay: float) -> void :
++
++	if not Array(OS.get_cmdline_args()).has("mp8shot"):
++		return
++
++	await get_tree().create_timer(delay, false).timeout
++	if not is_inside_tree():
++		return
++	await RenderingServer.frame_post_draw
++
++	var me: int = multiplayer.get_unique_id() if multiplayer.has_multiplayer_peer() else 0
++	var who: String = "p%d" % me
++	if PlayerManager.player_presences.has(me):
++		who = String(PlayerManager.player_presences[me].network_name)
++
++	var img: Image = get_viewport().get_texture().get_image()
++	if img != null:
++		img.save_png("user://mp8_chisel_%s_%s.png" % [tag, who])
++
++
++# [MP8] 只读日志：结算时把名次/玩家名/得分打出来，**一分钱都不改**。
++# 凿刻考验是全 15 个小游戏里唯一会算出负分的（算分族 C），8 人下的实际数值
++# 必须有实测数据才能谈调整（按用户定的工作顺序，适配验收完才轮到得分）。
++func _mp8_log_scores() -> void :
++
++	if not multiplayer.is_server():
++		return
++
++	var rows: Array = []
++	for id in player_scores.keys():
++		var nm: String = "id%d" % id
++		if PlayerManager.player_presences.has(id):
++			nm = String(PlayerManager.player_presences[id].network_name)
++		rows.append({"name": nm, "score": player_scores[id]})
++	rows.sort_custom(func(a, b): return a["score"] > b["score"])
++
++	var parts := PackedStringArray()
++	for i in rows.size():
++		parts.append("第%d名 %s %d分" % [i + 1, rows[i]["name"], rows[i]["score"]])
++	print("[MP8] 凿刻考验结算（%d 人在场 / 起手分 %d）：%s" % [
++		player_count, player_count, " / ".join(parts)
++	])
++
++
+ func _ready() -> void :
+ 	super._ready()
+ 
++	# [MP8] 座位扩建必须跑在 spawn_players() 之前，而且**每台机器都要跑**
++	# （桌子是各机本地的场景节点，不走网络同步）。
++	# initialize() 只在服务器上跑，所以这段绝不能放进去。
++	_mp8_setup_seats()
++
+ 	if multiplayer.is_server():
+ 
+ 		multiplayer_synchronizer.set_multiplayer_authority(1)
+@@ -205,9 +634,21 @@ func spawn_players():
+ 			player_spawn_node.global_position, 
+ 			Vector3(0.0, player_rotations[counter], 0.0)
+ 		)
+-		player_character.set_spectate_position_rpc.rpc(
+-			spectate_positions[counter]
+-		)
++		# [MP8] spectate_positions 来自 DeadLobby/SpectatePositions 的 4 个 Marker3D，
++		# 按 [counter] 索引。节点名 "SpectatePositions" 在 network_manager 的
++		# MP8_SPAWN_CONTAINERS 白名单里，通用补位会补到 8 —— 但那是 call_deferred 的，
++		# 万一时序没赶上就是一次越界读。这里兜一层并**把实情打进日志**，
++		# 不靠"应该会被补上"（坑第 13 条：谁按这个长度索引，谁就得自己校验）。
++		var spectate_index: int = counter
++		if spectate_index >= spectate_positions.size():
++			spectate_index = maxi(spectate_positions.size() - 1, 0)
++			push_warning("[MP8] 凿刻考验：观战点只有 %d 个，第 %d 人退回用最后一个" % [
++				spectate_positions.size(), counter + 1
++			])
++		if not spectate_positions.is_empty():
++			player_character.set_spectate_position_rpc.rpc(
++				spectate_positions[spectate_index]
++			)
+ 		players[player_presence.network_id] = player_character
+ 		active_players[player_presence.network_id] = player_character
+ 		players_by_position[counter] = player_presence.network_id
+@@ -223,6 +664,18 @@ func spawn_players():
+ 	if GameManager.local_game:
+ 		local_handler.set_players(players.values())
+ 
++	# [MP8] 谁坐在哪个方位 —— 事后对照画面/对照散弹枪扫描顺序时全靠这行。
++	var seats := PackedStringArray()
++	for i in player_count:
++		var nm: String = "id%d" % players_by_position.get(i, 0)
++		var pid: int = players_by_position.get(i, 0)
++		if PlayerManager.player_presences.has(pid):
++			nm = String(PlayerManager.player_presences[pid].network_name)
++		seats.append("座位%d=%s(%.0f°)" % [i, nm, _mp8_wrap360(player_rotations[i])])
++	print("[MP8] 凿刻考验：%d 人就座（观战点 %d 个）—— %s" % [
++		player_count, spectate_positions.size(), ", ".join(seats)
++	])
++
+ func generate_random_cube_instructions():
+ 
+ 	var instructions: Array[int] = []
+@@ -234,12 +687,19 @@ func generate_random_cube_instructions():
+ 
+ 	update_instructions_rpc.rpc(instructions)
+ 
++	# [MP8] 记忆阶段：这时所有人都在看巨幕，能看到对面几个座位的全景
++	mp8_shot_rpc.rpc("memorize", 3.0)
++
+ func start_round_timer(_duration: float):
+ 
+ 	round_time_remaining = carving_duration
+ 	round_timer.wait_time = 1.0
+ 	round_timer.start()
+ 
++	# [MP8] 凿刻阶段：这时每个人都低头看**自己的桌子** ——
++	# "新座位有没有可见桌子"就看这一张。
++	mp8_shot_rpc.rpc("desk", 2.0)
++
+ func check_all_submitted():
+ 
+ 	if submitted_solutions.size() == active_players.size():
+@@ -263,6 +723,21 @@ func check_game_end():
+ 			for player in active_players.values():
+ 				player.trigger_achievement_rpc.rpc()
+ 
++	# [MP8] 只读日志：本轮扣分的实际数值（起手 = 总人数，淘汰时 -= 还活着的人数，
++	# 这是全 15 个小游戏里唯一会算出负分的算分族）。**一分钱都不改。**
++	if multiplayer.is_server() and not eliminate_players.is_empty():
++		var outs := PackedStringArray()
++		for network_id in eliminate_players.keys():
++			var nm: String = "id%d" % network_id
++			if PlayerManager.player_presences.has(network_id):
++				nm = String(PlayerManager.player_presences[network_id].network_name)
++			outs.append("%s %d→%d" % [
++				nm, player_scores[network_id], player_scores[network_id] - players_alive.size()
++			])
++		print("[MP8] 凿刻考验：本轮淘汰 %d 人（扣 %d 分/人）—— %s" % [
++			eliminate_players.size(), players_alive.size(), ", ".join(outs)
++		])
++
+ 	for network_id in eliminate_players.keys():
+ 		player_scores[network_id] -= players_alive.size()
+ 
+@@ -277,6 +752,7 @@ func check_game_end():
+ 
+ 	if active_players.size() <= 1:
+ 
++		_mp8_log_scores()
+ 		player_scores_finalized.emit(player_scores)
+ 		await get_tree().create_timer(1.0).timeout
+ 		set_minigame_sfx_linear_volume_rpc.rpc(0.0)
+@@ -376,6 +852,22 @@ func _on_all_brief_ready():
+ 
+ func _on_player_eliminated(network_id: int):
+ 
++	# [MP8] 验收硬阻塞 ② 的直接证据：座位 4~7 的人到底会不会被枪打到。
++	# 只打日志，不改行为。
++	if multiplayer.is_server():
++		var seat: int = -1
++		for k in players_by_position.keys():
++			if players_by_position[k] == network_id:
++				seat = k
++				break
++		var nm: String = "id%d" % network_id
++		if PlayerManager.player_presences.has(network_id):
++			nm = String(PlayerManager.player_presences[network_id].network_name)
++		var deg: String = "座位查无此人"
++		if seat >= 0 and seat < player_rotations.size():
++			deg = "座位 %d（%.0f°）" % [seat, _mp8_wrap360(player_rotations[seat])]
++		print("[MP8] 凿刻考验：淘汰 %s —— %s" % [nm, deg])
++
+ 	if GameManager.local_game:
+ 		if players.has(network_id):
+ 			local_handler.hide_player_tag(players.get(network_id))

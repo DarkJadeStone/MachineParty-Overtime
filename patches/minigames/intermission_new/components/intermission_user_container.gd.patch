@@ -1,0 +1,71 @@
+diff --git a/minigames/intermission_new/components/intermission_user_container.gd b/minigames/intermission_new/components/intermission_user_container.gd
+--- a/minigames/intermission_new/components/intermission_user_container.gd
++++ b/minigames/intermission_new/components/intermission_user_container.gd
+@@ -31,6 +31,55 @@ var lerp_score_end_value = 0
+ func _ready() -> void :
+ 	for child in get_parent().get_children():
+ 		user_container_array.append(child)
++	_mp8_apply_bold()
++
++
++# [MP8] 名字上限与字重。**这段和 intermission_user_container_2d.gd 里那份一模一样**，
++# 不抽公共文件的理由见那边的注释（新加 class_name 要连 project.binary 一起打补丁）。
++# 唯一区别：这里是 Label3D，字体在 `font` 属性上，不走主题覆盖。
++const MP8_NAME_MAX: int = 7   # 用户定案 2026-08-15（原版 9，试过 20）
++const MP8_BOLD: float = 0.12  # 0.3 实测太肥，数字的内孔糊死（见 HANDOFF T16）
++
++
++static func _mp8_arg_int(prefix: String, fallback: int) -> int:
++	for a in OS.get_cmdline_args():
++		var t: String = String(a)
++		if t.begins_with(prefix):
++			return int(t.substr(prefix.length()))
++	return fallback
++
++
++static func _mp8_arg_float(prefix: String, fallback: float) -> float:
++	for a in OS.get_cmdline_args():
++		var t: String = String(a)
++		if t.begins_with(prefix):
++			return float(t.substr(prefix.length()))
++	return fallback
++
++
++static func _mp8_format_name(_name: String) -> String:
++	var limit: int = maxi(_mp8_arg_int("mp8name=", MP8_NAME_MAX), 2)
++	if _name.length() > limit:
++		return _name.left(limit - 1) + "-"
++	return _name
++
++
++func _mp8_apply_bold() -> void :
++
++	var amount: float = _mp8_arg_float("mp8bold=", MP8_BOLD)
++	if is_equal_approx(amount, 0.0):
++		return
++
++	for label: Label3D in [label_rank, label_score, label_name]:
++		if not is_instance_valid(label):
++			continue
++		if label.font == null:
++			continue
++		var fv := FontVariation.new()
++		fv.base_font = label.font
++		fv.variation_embolden = amount
++		label.font = fv
++
+ 
+ func _process(_delta: float) -> void :
+ 	check_to_switch_places_with_upstairs_container()
+@@ -43,10 +92,7 @@ func set_user_container_data(_score: int, _name: String):
+ 	user_score_value = _score
+ 	label_score.text = "%04d" % _score
+ 
+-	var formatted_name = _name
+-	if _name.length() > 9:
+-		formatted_name = _name.left(8)
+-		formatted_name += "-"
++	var formatted_name = _mp8_format_name(_name)  # [MP8] 原版砍到 8 字符
+ 
+ 	label_name.text = formatted_name
+ 

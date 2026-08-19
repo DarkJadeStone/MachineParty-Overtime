@@ -1,0 +1,49 @@
+MIT License
+
+Copyright (c) 2026 DarkJade335
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+NOTICE — what this license does and does not cover
+================================================================================
+
+The MIT license above covers ONLY the material authored by this project:
+
+  * installer/       the installer, in full
+  * tools/           the build scripts
+  * docs/            the documentation
+  * patches/         the ADDED lines in each patch file — i.e. the mod's own
+                     code (roughly 15,000 lines)
+
+It does NOT and CANNOT cover:
+
+  * The game "Machine Party", its code, assets, or data in any form.
+  * The unchanged lines of the game's own scripts that appear inside the patch
+    files as diff context (roughly 1,800 lines). Those remain the property of
+    their copyright holder and are present only in the minimum amount needed
+    for the patches to apply reliably.
+
+This project is an UNOFFICIAL third-party modification. It is not affiliated
+with, authorized by, sponsored by, or endorsed by the developer or publisher of
+Machine Party. No game files are redistributed: you must own a legitimate copy
+of the game, and the installer patches only your own local installation.
+
+If you are a rights holder and want this repository taken down, please open an
+issue and it will be handled.

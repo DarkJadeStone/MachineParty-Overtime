@@ -1,0 +1,121 @@
+diff --git a/modules/minigame/components/overlay/scripts/minigame_overlay.gd b/modules/minigame/components/overlay/scripts/minigame_overlay.gd
+--- a/modules/minigame/components/overlay/scripts/minigame_overlay.gd
++++ b/modules/minigame/components/overlay/scripts/minigame_overlay.gd
+@@ -32,8 +32,33 @@ func set_round_label(_round: int, _total: int):
+ 
+ 	round_label.text = tr("LOC_IM_ROUND") % [_round, _total]
+ 
++# [MP8] ===== 倒计时的自定义（默认全空，不影响其它 14 个小游戏）=====
++#
++# 这个 overlay 是**所有小游戏共用**的，所以这里只加"字段为空就什么都不做"的开关，
++# 由小游戏自己填。目前只有猎鸭在用（见 duck_hunt.gd 的 _mp8_setup_countdown）。
++#
++# 关键前提：倒计时文字是**每台机器各自渲染**的——服务器只广播 "3"/"2"/"1"/"GO!"
++# 这几个 token（见 Minigame._on_countdown_tick），所以同一时刻可以让鸭子看到一句话、
++# 猎人看到另一句话，不需要额外的 RPC。
++var mp8_go_text: String = ""        # 非空则替换 "GO!" 的文字（红色、大一号、剧烈抖动）
++var mp8_one_text: String = ""       # 非空则**整个替换掉倒计时的"1"**（红色），如"猎人已大幅增强"
++var mp8_shake_on_go: bool = false   # GO 那一下抖动
++
++const MP8_RED: Color = Color(1.0, 0.18, 0.18)
++const MP8_GO_FONT_SCALE: float = 1.18   # "大一号"（用户 2026-08-15 从大两号改回大一号）
++const MP8_SHAKE_AMPLITUDE: float = 34.0 # 抖动幅度（像素），越大越剧烈
++const MP8_SHAKE_STEPS: int = 16
++
++var _mp8_label_base_color: Color = Color.WHITE
++var _mp8_label_base_size: int = 128
++var _mp8_label_base_saved: bool = false
++var _mp8_label_base_position: Vector2 = Vector2.ZERO
++var _mp8_shake_tween: Tween = null
++
++
+ func set_countdown(text: String, _with_fade: bool = true, _fade_time: float = 0.5):
+ 	var is_valid_string = false
++	var mp8_token: String = text  # [MP8] 记下原始 token，替换文字之后就认不出来了
+ 	match text:
+ 		"3":
+ 			is_valid_string = true
+@@ -49,14 +74,82 @@ func set_countdown(text: String, _with_fade: bool = true, _fade_time: float = 0.
+ 			is_valid_string = true
+ 			pass
+ 	if is_valid_string:
+-		countdown_label.text = tr(text)
++		# [MP8] "GO!" 换成小游戏指定的口号；"1" 整个换成提示语（如"猎人已大幅增强"）
++		if mp8_token == "GO!" and mp8_go_text != "":
++			countdown_label.text = mp8_go_text
++		elif mp8_token == "1" and mp8_one_text != "":
++			countdown_label.text = mp8_one_text
++		else:
++			countdown_label.text = tr(text)
+ 	else:
+ 		print("Invalid string found for countdown label. Skipping text assignment.")
+ 		countdown_label.text = ""
+ 
++	_mp8_apply_countdown_style(mp8_token)
++
+ 	anim_countdown_show.play("RESET")
+ 	anim_countdown_show.play("show")
+ 
++	if mp8_token == "GO!" and mp8_shake_on_go:
++		_mp8_shake_countdown()
++
++
++# [MP8] 倒计时的配色与字号。
++#   token "1"   ：只有 mp8_one_text 非空（=独狼回合）才变成红色大字的那句话，
++#                 否则保持原版的白色 "1"。
++#   token "GO!" ：口号一律红色 + 大一号。
++#   其余（3/2）：恢复原版颜色和字号。
++func _mp8_apply_countdown_style(token: String) -> void :
++
++	# ⚠️ 总开关：**只有主动填过 MP8 字段的小游戏才走下面的代码**（目前只有猎鸭）。
++	# 其余 14 个小游戏在这里直接返回，连一次 add_theme_color_override 都不会执行，
++	# 行为和原版逐字节一致。（用户 2026-08-15：只改猎鸭，其余不动）
++	if not (mp8_shake_on_go or mp8_go_text != "" or mp8_one_text != ""):
++		return
++
++	if countdown_label == null:
++		return
++
++	if not _mp8_label_base_saved:
++		_mp8_label_base_color = countdown_label.get_theme_color("font_color")
++		_mp8_label_base_position = countdown_label.position
++		var s: int = countdown_label.get_theme_font_size("font_size")
++		if s > 0:
++			_mp8_label_base_size = s
++		_mp8_label_base_saved = true
++
++	var red: bool = (token == "GO!" and mp8_go_text != "") or (token == "1" and mp8_one_text != "")
++	countdown_label.add_theme_color_override(
++		"font_color", MP8_RED if red else _mp8_label_base_color
++	)
++
++	# 只有 GO 的口号放大；被替换掉的 "1"（那句提示）保持原字号，否则一行塞不下
++	var size: int = _mp8_label_base_size
++	if token == "GO!" and mp8_go_text != "":
++		size = int(_mp8_label_base_size * MP8_GO_FONT_SCALE)
++	countdown_label.add_theme_font_size_override("font_size", size)
++
++
++# [MP8] GO 的时候抖两下。抖的是 position，收尾一定要摆回原位，
++# 否则下一轮倒计时会从歪掉的位置开始。
++func _mp8_shake_countdown() -> void :
++
++	if countdown_label == null:
++		return
++	if _mp8_shake_tween != null and _mp8_shake_tween.is_valid():
++		_mp8_shake_tween.kill()
++
++	var base: Vector2 = _mp8_label_base_position
++	_mp8_shake_tween = create_tween()
++	for i in MP8_SHAKE_STEPS:
++		var amount: float = MP8_SHAKE_AMPLITUDE * (1.0 - float(i) / float(MP8_SHAKE_STEPS))
++		_mp8_shake_tween.tween_property(
++			countdown_label, "position",
++			base + Vector2(randf_range(-amount, amount), randf_range(-amount, amount)),
++			0.03
++		)
++	_mp8_shake_tween.tween_property(countdown_label, "position", base, 0.05)
++
+ func set_screens_visibility(_visibility: bool):
+ 
+ 	for s in screens:

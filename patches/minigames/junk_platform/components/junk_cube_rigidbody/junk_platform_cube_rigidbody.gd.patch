@@ -1,0 +1,26 @@
+diff --git a/minigames/junk_platform/components/junk_cube_rigidbody/junk_platform_cube_rigidbody.gd b/minigames/junk_platform/components/junk_cube_rigidbody/junk_platform_cube_rigidbody.gd
+--- a/minigames/junk_platform/components/junk_cube_rigidbody/junk_platform_cube_rigidbody.gd
++++ b/minigames/junk_platform/components/junk_cube_rigidbody/junk_platform_cube_rigidbody.gd
+@@ -124,6 +124,22 @@ func reset_rpc():
+ 	active = false
+ 	freeze = true
+ 
++	# ═══════ [MP8] 2026-08-19：回收时必须一并关掉落地阴影 ═══════
++	#
++	# `_physics_process` 一开头就是 `if not active: return`，
++	# 所以 active 置 false 之后阴影**再也不会被更新**，冻在最后一帧的样子。
++	# 原版 `setup_rpc` 的停用分支是关了阴影的（见那边的 else），
++	# 唯独 reset_rpc 漏了这一句。
++	#
++	# 原版撞不到这个坑：唯一的回收入口是"残骸掉出平台撞进 junk_catcher"，
++	# 那时射线早就不碰撞、阴影已经是关的了。
++	# 而 MP8 新增的超时回收（junk_handler._mp8_recycle_stuck_junk）收的是
++	# **停在平台上**的残骸 —— 射线正碰着地面，阴影会以 visible=true 冻住，
++	# 在平台上留下一块永久污渍，回收多少块就留多少块。
++	#
++	# 本函数是 call_local 广播，所以主客两端都会关，不会只有房主干净。
++	drop_shadow.visible = false
++
+ 	global_position = Vector3.UP * 999
+ 	global_rotation = Vector3.ZERO
+ 

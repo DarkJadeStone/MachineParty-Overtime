@@ -1,0 +1,122 @@
+diff --git a/minigames/knife_at_the_office/components/player/scripts/knife_at_the_office_player.gd b/minigames/knife_at_the_office/components/player/scripts/knife_at_the_office_player.gd
+--- a/minigames/knife_at_the_office/components/player/scripts/knife_at_the_office_player.gd
++++ b/minigames/knife_at_the_office/components/player/scripts/knife_at_the_office_player.gd
+@@ -221,9 +221,11 @@ func update_interact(delta: float):
+ 	if not can_search:
+ 		return
+ 
+-	if has_item:
+-		return
+-
++	# [MP8] 原版这里是 `if has_item: return` —— **拿到针筒就不准再搜**。
++	# 原版下这没问题：找到针筒 = 立刻进猎杀阶段，本来也没人还在搜。
++	# 但 5~8 人局有两支针筒，用户 2026-08-17 定：**先找到的那个人也要能继续搜**，
++	# 所以这条拦不能留在这儿。
++	# 猎杀阶段开始后照样禁搜 —— 由下面那句 `searching_disabled` 统一拦，一处即可。
+ 	if game_reference.searching_disabled:
+ 		check_if_searching_on_hunting_phase_start()
+ 		set_outline_stencil_alpha(0.0)
+@@ -281,7 +283,14 @@ func update_interact(delta: float):
+ 		search_progress += delta
+ 		if search_progress >= 1.0:
+ 
+-			game_reference.request_item_find_rpc.rpc(player_presence.network_id)
++			# [MP8] 把**开的是哪个柜子**一起告诉游戏侧（2026-08-17）。
++			# 原版只传 network_id，游戏侧根本不知道搜的是哪个容器 —— 于是针筒只能做成
++			# "第 N 次搜索出现"的计数模型。用户要的是**基于容器**的针筒
++			# （已感染者开到时针筒瞬移到别的没搜过的柜子），没有容器身份就做不出来。
++			# 参数带默认值，少传也不会报错。
++			game_reference.request_item_find_rpc.rpc(
++				player_presence.network_id, current_searchable.get_path()
++			)
+ 			set_outline_stencil_alpha(0.0)
+ 			current_searchable.set_searched_rpc.rpc(true)
+ 			current_searchable = null
+@@ -347,6 +356,20 @@ func update_has_knife(_delta: float):
+ 	if not has_item:
+ 		return
+ 
++	# [MP8] 拿到针筒 ≠ 马上能扎人（用户 2026-08-17 定）。
++	# 5~8 人局有两支针筒，第一个找到的人**先揣着、状态不变**，
++	# 要等第二支也被找到、猎杀阶段真正开始，才准动手。
++	#
++	# 闸门用 `game_reference.searching_disabled`：它是原版**已经广播同步**的状态
++	# （`set_searching_disabled_rpc`，call_local 广播），而且恰好在猎杀阶段开始那一刻置 true。
++	# 不新造同步 —— 自己加的标志位在客户端上是不同步的，会出现"房主能扎、别人不能"。
++	#
++	# ⚠️ 对 ≤4 人（一支针筒）的影响说清楚：原版里找到针筒到 `searching_disabled` 置位
++	# 之间有约 1.5 秒（`_on_item_found` 里那个 await），这一版把那个窗口也关掉了。
++	# 实际影响极小（刚搜完柜子，身边一般没人），而且"灯还没灭就能扎人"本来也不合理。
++	if game_reference != null and not game_reference.searching_disabled:
++		return
++
+ 	if DynamicInput.is_action_just_pressed(player_presence.device_id, "action_1") && !knife_on_cooldown:
+ 
+ 		if is_holding_syringe:
+@@ -624,14 +647,34 @@ func set_player_presence(_network_id: int):
+ func set_game_reference_from_path(_game_reference_path: NodePath):
+ 	game_reference = get_node(_game_reference_path)
+ 
+-@rpc("any_peer", "call_remote", "reliable")
+-func search_result_rpc(_found_item: bool):
++# ═══════ [MP8] 2026-08-19：call_remote → call_local ═══════
++#
++# 配套 `knife_at_the_office.gd` 那边把广播改成 `rpc_id(_network_id, ...)`。
++# 定点发之后，如果这里还是 `call_remote`：
++#   房主自己搜柜子 → `rpc_id(1, ...)` 目标就是自己 → 被 call_remote 挡掉
++#   → **一端都不执行、房主永远拿不到针筒**。
++# 改成 call_local 后，房主/客机两种情况都恰好执行一次。
++@rpc("any_peer", "call_local", "reliable")
++func search_result_rpc(_found_item: bool, _equip_item: bool = true):
+ 
+ 	if _found_item:
+-		set_has_item_rpc.rpc(true)
++		# [MP8] `_equip_item = false` = "拿到了但先不揭晓"：只记 has_item，
++		# 不出针筒模型、不变感染态、不响拔刀音。到猎杀阶段游戏侧会再发一次 true。
++		# 参数带默认值，少传就是原版行为。
++		set_has_item_rpc.rpc(true, _equip_item)
+ 
+ 	stop_searching()
+ 
++# [MP8] 感染者移速倍率（用户 2026-08-17 定：5 人以上压到 1.05）。
++# 必须走 RPC 广播 —— 移动是各端本地算的（`speed *= infected_move_speed_multiplier`），
++# 只在服务器上改这个值，别人那边的感染者照样跑 1.25。
++# ≤4 人时游戏侧根本不发这个 RPC，场景里的 @export 原值保持不变。
++@rpc("any_peer", "call_local", "reliable")
++func mp8_set_infected_speed_rpc(_multiplier: float):
++
++	infected_move_speed_multiplier = _multiplier
++
++
+ @rpc("any_peer", "call_local", "reliable")
+ func set_can_search_rpc(_can_search: bool):
+ 
+@@ -652,7 +695,16 @@ func set_has_item_rpc(_has_item: bool, _equip_item: bool = true):
+ 		tween_equip.tween_property(ik_left_hand, "influence", 1, 0.3)
+ 		tween_equip.tween_property(syringe_in_hand, "scale", Vector3(1, 1, 1), 0.3)
+ 
+-	is_infected = _has_item
++	# [MP8] 原版这两句在 `_equip_item` 判断**外面**，所以哪怕不装备针筒，
++	# 人也会立刻变成感染态（跑得更快、名牌变样）。
++	# 用户 2026-08-17 定：**第一个找到的人先保持不变，到猎杀阶段才变模型。**
++	# 所以把"变感染态"一并压进 `_equip_item`：
++	#   找到但还不揭晓 → set_has_item_rpc(true, false)：只记 has_item，外观一点不动
++	#   猎杀阶段开始   → set_has_item_rpc(true, true) ：这时才装备 + 变模型
++	# ⚠️ `has_item` 仍然照常置位 —— 它是"这个人身上有针筒"的事实，
++	# 游戏侧的 infected_players、结算都靠它，不能跟着延后。
++	if _equip_item:
++		is_infected = _has_item
+ 
+ 	if multiplayer.is_server() && _equip_item:
+ 
+@@ -667,7 +719,9 @@ func set_has_item_rpc(_has_item: bool, _equip_item: bool = true):
+ 	if has_item:
+ 		ach_active = true
+ 		ach_item_acquire_timer = ach_item_acquire_duration
+-		set_infected_name_label()
++		# [MP8] 名牌也压进 _equip_item，理由同上（不揭晓时外观一点不动）
++		if _equip_item:
++			set_infected_name_label()
+ 		item_found.emit(player_presence.network_id)
+ 	else:
+ 		animation_tree.set("parameters/infected_run_ts/scale", 1.2)

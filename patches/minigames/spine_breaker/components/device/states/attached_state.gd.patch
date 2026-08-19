@@ -1,0 +1,35 @@
+diff --git a/minigames/spine_breaker/components/device/states/attached_state.gd b/minigames/spine_breaker/components/device/states/attached_state.gd
+--- a/minigames/spine_breaker/components/device/states/attached_state.gd
++++ b/minigames/spine_breaker/components/device/states/attached_state.gd
+@@ -5,10 +5,10 @@ var attached_to: SpineBreakerPlayer
+ enum directions{RIGHT, LEFT, FORWARD, BACK}
+ 
+ enum attachedFromDirection{
+-	FromFront, 
+-	FromRight, 
+-	FromLeft, 
+-	FromBack, 
++	FromFront,
++	FromRight,
++	FromLeft,
++	FromBack,
+ }
+ 
+ func init() -> void :
+@@ -41,6 +41,16 @@ func enter(_msg: Dictionary = {}) -> void :
+ 
+ 		owner.attached_to = target
+ 
++		# [MP8] 让被扑的人记住"现在背着的是这一台"。
++		# 玩家脚本里的 spine_breaker_device 是 setup_rpc 时写死的第一台，
++		# 两台机器一上场就会错位：背着第二台的人按扔，扔的是第一台。
++		owner.mp8_bind_rpc.rpc(target.get_path())
++		if multiplayer.is_server():
++			print("[MP8] 碎骨者：%d 号机扑上了 %s（引信 %s）" % [
++				owner.mp8_index, String(target.name),
++				("已停，立即处决" if timed_out else "%.1f 秒" % owner.activation_timer.time_left)
++			])
++
+ 		owner.set_is_attached_rpc.rpc(true)
+ 		var attach_direction = directions.FORWARD
+ 		if multiplayer.is_server():

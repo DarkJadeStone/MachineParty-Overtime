@@ -1,0 +1,206 @@
+diff --git a/minigames/disco_dodge/scrips/disco_dodge.gd b/minigames/disco_dodge/scrips/disco_dodge.gd
+--- a/minigames/disco_dodge/scrips/disco_dodge.gd
++++ b/minigames/disco_dodge/scrips/disco_dodge.gd
+@@ -81,9 +81,49 @@ var game_end: bool = false
+ 
+ var ach_tile_limit: int = 10
+ 
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] 立足之本 8 人适配 —— **只摊开出生点，别的一个字不动**（用户 2026-08-17 定）
++# ═══════════════════════════════════════════════════════════════════════════
++#
++# 侦察结论（probe50 + 读码）：**这个小游戏几乎天然支持 8 人。**
++#   · 砖阵是 `spawn_tiles()` 按 `tile_rows × tile_columns` 现摆的，**自动以原点居中**；
++#     符号分配、抽砖、算分全是遍历 `tiles`，与人数无关；
++#   · 算分是纯 A 名次族（`player_scores[dead_players[i]] = i`，幸存者拿 `player_count`），
++#     随人数自动放大；
++#   · 全文件没有按玩家下标索引的定长数组（出生点那处是容器式，取 `get_children()`）。
++#
++# ⚠️ **场地真值和脚本默认值差 5 倍**（这个项目第六次被字面量骗）：
++#   脚本写 `tile_rows=20 / tile_columns=12`，**场景覆盖成 8 / 6** → 只有 48 块砖。
++#   每块 4.0 单位 → 场地 x∈[-16,+16]、z∈[-12,+12]。
++#
++# 唯一一眼就是 8 人缺陷的：**原版 4 个出生点全挤在 (±2, ±2) 的 4×4 米方框里**，
++# 而场地有 32×24。8 个人叠在中央那一小块开局。
++#
++# **改法**：出生点一律落在**砖心**上，一人一块砖，从中央往两侧摊开。
++#   砖心格点：x = -14,-10,-6,-2,2,6,10,14   z = -10,-6,-2,2,6,10
++#   原版那 4 个正好就是中央 2×2 四块砖的砖心（局部 ±2, ±2）——
++#   8 人只是把它延成 **4×2 = 8 块**：x∈{-6,-2,2,6} × z∈{-2,2}，间距仍是一块砖。
++#
++# ⚠️ **场地没有放大**（用户 2026-08-17 选的就是"只摊出生点"）。
++#   放大砖阵这条路查过：相机在 (0,14.25,+17.92)、俯角 39.1°、fov 67.8，
++#   视锥下缘打到地面约 z=+13.6，而砖阵近边已经在 z=+12 —— **近侧只剩 1.6 个单位余量**，
++#   `tile_columns` 一加，最近一排就掉出画面下缘。要放大**必须连相机一起动**。
++const MP8_MAX_PLAYERS: int = 8
++
++# ⚠️ 让 network_manager 的通用补位让开：出生点从这里起由本小游戏自己管。
++# 声明处就设 true —— 通用补位可能比 _ready() 先跑，写在 _ready() 里就晚了。
++var mp8_owns_spawns: bool = true
++var mp8_player_count: int = 0
++
++
+ func _ready() -> void :
+ 	super._ready()
+ 
++	# [MP8] 必须在 spawn_players() 之前 —— 它是 `player_spawn_positions[counter]`
++	# 按下标发人的。_ready() 比 initialize() 早，而且这里只用 @export 的
++	# tile_rows/columns/size 算格点，不依赖砖节点（砖是 spawn_players 之后才摆的）。
++	_mp8_setup_spawns()
++
+ 	if multiplayer.is_server():
+ 
+ 		multiplayer_synchronizer.set_multiplayer_authority(multiplayer.get_unique_id())
+@@ -156,6 +196,99 @@ func spawn_players():
+ 
+ 		counter += 1
+ 
++# [MP8] 把出生点摊到砖心上，一人一块砖。
++#
++# **原版那 4 个节点一个字节不碰** —— 只在它们没占的砖心上补新的。
++# ≤4 人整段不跑，与原版逐值一致。
++func _mp8_setup_spawns() -> void :
++
++	var args := Array(OS.get_cmdline_args())
++	mp8_player_count = PlayerManager.player_presences.size()
++
++	if player_spawn_positions_node == null:
++		push_warning("[MP8] 立足之本：没有出生点容器，没法摊开")
++		return
++
++	var have: int = player_spawn_positions_node.get_child_count()
++
++	print("[MP8] 立足之本：运行时真值 —— 砖阵 %d×%d（%d 块）/ 每块 %.1f / 每轮抽 %d 块 / 出生点 %d 个；本局 %d 人" % [
++		tile_rows, tile_columns, tile_rows * tile_columns, tile_size,
++		tiles_to_remove, have, mp8_player_count,
++	])
++
++	if args.has("mp8noexpand"):
++		print("[MP8] 立足之本：mp8noexpand，出生点一个字不改（纯原版对照组，⚠️ 必须配 4 人）")
++		return
++
++	if mp8_player_count <= 4:
++		print("[MP8] 立足之本：%d 人，用原版 %d 个出生点，一个字不改" % [mp8_player_count, have])
++		return
++
++	var want: int = mini(maxi(mp8_player_count, 5), MP8_MAX_PLAYERS)
++	if have >= want:
++		return
++
++	# 已经被原版占掉的砖心（按局部坐标认，容差半块砖）
++	var taken: Array[Vector2] = []
++	for c in player_spawn_positions_node.get_children():
++		if c is Node3D:
++			taken.append(Vector2((c as Node3D).position.x, (c as Node3D).position.z))
++
++	var added := PackedStringArray()
++	for p in _mp8_tile_centers():
++		if player_spawn_positions_node.get_child_count() >= want:
++			break
++		var dup: bool = false
++		for t in taken:
++			if t.distance_to(p) < tile_size * 0.5:
++				dup = true
++				break
++		if dup:
++			continue
++		var m := Marker3D.new()
++		m.name = "MP8Spawn%d" % player_spawn_positions_node.get_child_count()
++		player_spawn_positions_node.add_child(m)
++		m.position = Vector3(p.x, 0.0, p.y)
++		taken.append(p)
++		added.append("(%.0f,%.0f)" % [p.x, p.y])
++
++	print("[MP8] 立足之本：出生点 %d → %d，新增落在砖心 %s" % [
++		have, player_spawn_positions_node.get_child_count(), " ".join(added)
++	])
++
++
++# 所有砖心的**局部**坐标（和原版出生点同一套：父节点带 0.03 的 z 偏移，
++# 用局部坐标就自动继承，新旧点偏差一致）。
++#
++# 排序 = 先 |z| 再 |x| → **优先贴着中央那两排、往两侧摊**。
++# 这样 8 人正好铺成中央 4×2 一块，而不是摊成十字或不规则形状；
++# 也和场地形状对得上（x 有 8 块、z 只有 6 块，横向本来就更宽裕）。
++func _mp8_tile_centers() -> Array[Vector2] :
++
++	var out: Array[Vector2] = []
++	var start_x: float = - (tile_rows * 0.5) * tile_size + tile_size * 0.5
++	var start_z: float = - (tile_columns * 0.5) * tile_size + tile_size * 0.5
++
++	for ix in tile_rows:
++		for iz in tile_columns:
++			out.append(Vector2(start_x + ix * tile_size, start_z + iz * tile_size))
++
++	out.sort_custom(func(a: Vector2, b: Vector2) -> bool:
++		var az: float = absf(a.y)
++		var bz: float = absf(b.y)
++		if not is_equal_approx(az, bz):
++			return az < bz
++		var ax: float = absf(a.x)
++		var bx: float = absf(b.x)
++		if not is_equal_approx(ax, bx):
++			return ax < bx
++		if not is_equal_approx(a.y, b.y):
++			return a.y < b.y
++		return a.x < b.x
++	)
++	return out
++
++
+ func spawn_tiles():
+ 
+ 	var start_columns: float = - (tile_columns * 0.5) * tile_size + (tile_size * 0.5)
+@@ -300,8 +433,52 @@ func calculate_score():
+ 
+ 		break
+ 
++	# [MP8] 只读日志，**一分钱都不改**（用户 2026-08-17 定案：算分保持原版）
++	_mp8_log_scores()
++
+ 	player_scores_finalized.emit(player_scores)
+ 
++
++# [MP8] 结算时把名次/名字/得分打进日志，纯为事后对账，不动任何分数。
++#
++# ② 得分**用户 2026-08-17 定案：保持原版，一个字不改**（和凿刻考验那次同样的选择）。
++# 原版机制只有两处：
++#   `player_scores[dead_players[i]] = i`   —— 第 i 个掉下去的拿 i 分
++#   `player_scores[幸存者] = player_count` —— 活到最后的拿总人数
++# 于是 4 人 = 0/1/2/**4**、8 人 = 0/1/2/3/4/5/6/**8**，
++# **冠亚之间恒跳 2 分**，其余步长 1。用户判定这一分是"活到最后"应得的奖励，不压平。
++#
++# ⚠️ **已知未修的原版 bug（用户同一次一并选择不动）**：
++# `player_count` 是 `spawn_players()` 里记的**开局人数**，不随掉线更新。
++# 有人中途掉线时，幸存者拿的分比实际参与结算的人数多 —— 凭空多几分。
++# 残骸平台当初刻意用 `dead_players.size()` 而不是 `player_count`，躲的就是这条。
++# 要修就把 `:431` 换成 `dead_players.size() + 1`（无人掉线时与原版逐值相同）。
++#
++# ⚠️ 顺带记一条：`scoring_players` 是**死代码** —— 声明了、`remove_player` 里有一处
++# `erase`，但全文件从没 append 过。和枪械工厂的 `finished_players` 一模一样的形状。
++# 不影响算分，但别被它误导成"这里还有一套顺序数组能用"。
++func _mp8_log_scores() -> void :
++
++	var rows := PackedStringArray()
++
++	for i in dead_players.size():
++		var id: int = dead_players[i]
++		rows.append("第%d个掉 %s %d分" % [i + 1, _mp8_name(id), i])
++
++	for network_id in active_players.keys():
++		rows.append("幸存 %s %d分" % [_mp8_name(network_id), player_count])
++		break
++
++	print("[MP8] 立足之本结算（开局 %d 人 / %d 人掉下去）：%s" % [
++		player_count, dead_players.size(), " | ".join(rows)
++	])
++
++
++func _mp8_name(network_id: int) -> String :
++	if players.has(network_id) and is_instance_valid(players[network_id]):
++		return String(players[network_id].player_presence.network_name)
++	return str(network_id)
++
+ func finish_game():
+ 
+ 	await get_tree().create_timer(2.0).timeout

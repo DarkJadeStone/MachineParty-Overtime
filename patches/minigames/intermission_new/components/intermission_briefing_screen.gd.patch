@@ -1,0 +1,539 @@
+diff --git a/minigames/intermission_new/components/intermission_briefing_screen.gd b/minigames/intermission_new/components/intermission_briefing_screen.gd
+--- a/minigames/intermission_new/components/intermission_briefing_screen.gd
++++ b/minigames/intermission_new/components/intermission_briefing_screen.gd
+@@ -124,6 +124,361 @@ func _ready() -> void :
+ 
+ 	Globals.locale_changed.connect(debug_update)
+ 
++	# [MP8] 自动准备独立成 mp8ready 开关，不再绑死在 mp8fast 上——
++	# 排查时需要"不快进但仍然自动准备"的组合。
++	var _mp8_args := Array(OS.get_cmdline_args())
++	# mp8hold：只关掉自动准备，保留 mp8fast 的过场快进——
++	# 让赛前说明屏一直停着，好截图看排版。
++	_mp8_auto_ready_armed = (
++		(_mp8_args.has("mp8fast") or _mp8_args.has("mp8ready"))
++		and not _mp8_args.has("mp8hold")
++	)
++	# mp8noscore：排查开关，跳过记分板扩位（用来隔离"卡在 SessionIntro"是不是它造成的）
++	if not _mp8_args.has("mp8noscore"):
++		_mp8_extend_score_slots()
++	else:
++		print("[MP8] mp8noscore：跳过结算记分板扩位")
++
++
++# [MP8] 结算记分板只摆了 4 个玩家条（user_container_array 是 @export 数组，
++# 场景里填了 4 项；rank_y_positions 也是写死的 4 个 y 坐标），
++# 8 人下后 4 个人根本不显示分数。
++#
++# 做法沿用大厅排布那条血泪教训：**复制现成的条目，让原有代码去摆位置，不自己算坐标。**
++# reset_briefing_rpc() 本来就会按 rank_y_positions[i] 给每条设 y，
++# 所以这里只要把条目补到 8 个、把 y 坐标表按原间距续到 8 个即可，排序/填数据的代码一行不用动。
++func _mp8_extend_score_slots() -> void :
++
++	var target: int = NetworkManager.MAX_PLAYERS
++	var n: int = user_container_array.size()
++
++	if n == 0 or n >= target:
++		return
++
++	var src = user_container_array[0]
++	if not is_instance_valid(src):
++		return
++
++	var parent: Node = src.get_parent()
++	if parent == null:
++		return
++
++	for i in range(n, target):
++		var dup = src.duplicate()
++		dup.name = "MP8UserContainer%d" % i
++		parent.add_child(dup)
++		user_container_array.append(dup)
++
++	# ---- 排版：8 条必须缩小才塞得下 ----------------------------------------
++	# 面板几何（probe13/15 从原装 PCK 量出来的确定值，单位是"面板单位"，
++	# 整块 UI 被父节点 scale 4 倍后画进 1920×1080 的 SubViewport）：
++	#
++	#   玩家条起点 y = 69.25（user data container parent 的位置）
++	#   行间距       = 19        文字高 = 字号 221 × 0.06703 ≈ 14.8
++	#   准备按钮     y = 149.5   （local_ready_button 在 147.6）
++	#   进度条框     y = 227.5
++	#
++	# 于是可用高度只有 149.5 - 67.5 ≈ 79.5，而 8 条按原间距要 7×19+14.8 = 148，
++	# **原尺寸怎么排都塞不下**（哪怕把准备按钮压到进度条上也差 10 个单位）。
++	# 所以必须整条缩小：缩放 s、间距 19×s，占用 147.8×s ≤ 79.5 → s ≤ 0.538。
++	# 取 s = 0.5 / 间距 9.5：8 条占 73.9，完全落在原本 4 条的地盘里，
++	# **准备按钮、进度条、分页线一个都不用动**（改别的元素才是风险）。
++	var s: float = MP8_ROW_SCALE
++	var step: float = MP8_ROW_STEP
++	for a in OS.get_cmdline_args():
++		var t: String = String(a)
++		if t.begins_with("mp8row="):
++			var parts: PackedStringArray = t.substr(7).split(",")
++			if parts.size() >= 1 and parts[0] != "":
++				s = float(parts[0])
++			if parts.size() >= 2 and parts[1] != "":
++				step = float(parts[1])
++
++	var base_y: float = rank_y_positions[0] if rank_y_positions.size() > 0 else 0.0
++	rank_y_positions.clear()
++	for i in target:
++		rank_y_positions.append(base_y + float(i) * step)
++
++	for uc in user_container_array:
++		uc.scale = Vector2(s, s)
++
++	# 邀请按钮：先补到 8 套并把每条玩家条接到自己那一套，再按行距摆位。
++	# 顺序不能反 —— 摆位要对全部 8 套生效。
++	_mp8_extend_invite_buttons(target)
++	_mp8_align_invite_buttons(s, step)
++
++	# ⚠️ 这一屏还有另外两个**按玩家下标索引**的定长数组，必须一起补到 8。
++	# 只补 user_container_array 会直接导致原生崩溃（0xc0000005）：
++	#   sort_user_containers_by_score():  score_container_nodes[i] = ...   ← 越界【写】
++	#   show_score_nodes() / update_players():  speakers_show_player_card[i].play()  ← 越界【读】
++	# 发行版模板不带边界检查，越界写就是访问违例。
++	# （2026-08-14 实测：只补一个数组时 duck_hunt / dvd_roomba 必崩，
++	#   disco_dodge 侥幸不崩只是执行顺序的运气，并不安全。）
++	while score_container_nodes.size() < target:
++		score_container_nodes.append(user_container_array[score_container_nodes.size()])
++
++	# 音源只需要"数组够长、索引不越界"，**不要往场景树里塞新节点**。
++	# 试过用 duplicate() 建 4 个新 AudioStreamPlayer，结果整个流程卡在 SessionIntro
++	# 推进不下去（2026-08-14 实测，mp8noscore 关掉本函数即恢复正常）。
++	# 这里改成循环复用已有音源：第 5~8 张卡的音效会重触发前 4 个音源，
++	# 顶多是听感上少一层叠音，功能与稳定性都没有代价。
++	var spk_n: int = speakers_show_player_card.size()
++	if spk_n > 0:
++		while speakers_show_player_card.size() < target:
++			speakers_show_player_card.append(
++				speakers_show_player_card[speakers_show_player_card.size() % spk_n]
++			)
++
++	print("[MP8] 结算记分板：玩家条 %d->%d, score_container %d, 音源 %d, 缩放 %.2f, 间距 %.2f, y表 %s" % [
++		n, user_container_array.size(), score_container_nodes.size(),
++		speakers_show_player_card.size(), s, step, str(rank_y_positions)
++	])
++
++
++# [MP8] 玩家条排版参数。命令行 mp8row=<缩放>,<间距> 可临时覆盖，方便对着画面调。
++const MP8_ROW_SCALE: float = 0.5
++const MP8_ROW_STEP: float = 9.5
++
++
++# [MP8] 自截图：命令行传 mp8shot，赛前说明屏摆好后把画面存成 PNG。
++#
++# 为什么不用外部截屏：赛前说明屏是画进 1920×1080 的 SubViewport
++# 再贴到 3D 显示器网格上的，外面截到的是带透视和反光的"照片"，量不准排版；
++# 直接抓 SubViewport 拿到的是原始 UI，一个像素不差。
++# 存两张：ui = 那块屏本身，win = 整个游戏窗口（看它在场景里的实际观感）。
++func _mp8_shot() -> void :
++
++	if not Array(OS.get_cmdline_args()).has("mp8shot"):
++		return
++
++	await get_tree().create_timer(1.0, false).timeout
++	if not is_inside_tree():
++		return
++	await RenderingServer.frame_post_draw
++
++	var tag: int = multiplayer.get_unique_id() if multiplayer.has_multiplayer_peer() else 0
++
++	# 往上找承载这一屏的 SubViewport
++	var vp: Viewport = null
++	var node: Node = user_data_container_parent
++	while node != null:
++		if node is SubViewport:
++			vp = node
++			break
++		node = node.get_parent()
++
++	if vp != null:
++		var img: Image = vp.get_texture().get_image()
++		if img != null:
++			img.save_png("user://mp8_shot_ui_%d.png" % tag)
++
++	var win_img: Image = get_viewport().get_texture().get_image()
++	if win_img != null:
++		win_img.save_png("user://mp8_shot_win_%d.png" % tag)
++
++	print("[MP8] mp8shot：已存 user://mp8_shot_{ui,win}_%d.png" % tag)
++
++
++# [MP8] 邀请按钮：空位上的"点邀请好友"区域。原版 4 套，和玩家条一一对应。
++#
++# ⚠️ 这里有个坑：这两个数组**不在同一个坐标系**（probe69 量的实况）。
++#   invite_buttons_visuals   = SubViewport 内的 InviteButton0..3
++#                              （面板坐标，父节点 InviteButtonParent 在 y=69.25，
++#                                按钮 offset_top = 3.5 / 22.25 / 41.0 / 59.75，步长 18.75）
++#   invite_buttons_interacts = 屏幕覆盖层的 InviteOverlayButton0..3
++#                              （屏幕坐标，offset_top = 124 / 172 / 210 / 248，
++#                                注意**步长不均匀**：48 / 38 / 38，是人手摆的）
++# 真正能点的是后者，前者只是 ButtonClass 的 custom_ui_target（悬停时改透明度）。
++#
++# 🩸 旧版本这里错了两处，是用户 2026-08-18 报的"错位、只有三个"的成因：
++#   ① 映射系数取 (act[1]-act[0])/(vis[1]-vis[0]) = 48/18.75 = 2.56 ——
++#      正好取到那个**异常的第一段**（真实三段是 48/38/38）。
++#      改成对全部原始点做最小二乘拟合，斜率约 2.19。
++#   ② 只有 4 套，而 MP8 有 8 条玩家条 —— 见 _mp8_extend_invite_buttons。
++# （点击区跟着缩放那一条旧版本本来就是对的，保留。）
++var _mp8_inv_fit_ok: bool = false
++var _mp8_inv_k: float = 0.0        # 面板 y → 屏幕 y 的斜率
++var _mp8_inv_b: float = 0.0        # 截距
++var _mp8_inv_act_scale: Vector2 = Vector2.ONE
++
++
++# 拿原始的 4 对 (面板 y, 屏幕 y) 做最小二乘，得到两套坐标系之间的映射。
++# 用全部点而不是头两个：原版第一段间距是异常值，只看它会把后面几个越推越偏。
++func _mp8_fit_invite_mapping() -> void :
++
++	var vis: Array[Button] = invite_buttons_visuals
++	var act: Array[Button] = invite_buttons_interacts
++	var n: int = mini(vis.size(), act.size())
++	if n < 2:
++		return
++
++	var xs: Array[float] = []
++	var ys: Array[float] = []
++	for i in n:
++		if is_instance_valid(vis[i]) and is_instance_valid(act[i]):
++			xs.append(vis[i].position.y)
++			ys.append(act[i].position.y)
++	if xs.size() < 2:
++		return
++
++	var mx: float = 0.0
++	var my: float = 0.0
++	for i in xs.size():
++		mx += xs[i]
++		my += ys[i]
++	mx /= float(xs.size())
++	my /= float(xs.size())
++
++	var num: float = 0.0
++	var den: float = 0.0
++	for i in xs.size():
++		num += (xs[i] - mx) * (ys[i] - my)
++		den += (xs[i] - mx) * (xs[i] - mx)
++	if absf(den) < 0.0001:
++		return
++
++	_mp8_inv_k = num / den
++	_mp8_inv_b = my - _mp8_inv_k * mx
++	_mp8_inv_act_scale = act[0].scale if is_instance_valid(act[0]) else Vector2.ONE
++	_mp8_inv_fit_ok = true
++
++	print("[MP8] 邀请按钮映射：屏幕y = %.4f × 面板y + %.2f（%d 个原始点拟合）" % [
++		_mp8_inv_k, _mp8_inv_b, xs.size()])
++
++
++# [MP8] 把邀请按钮从 4 套补到 8 套，并把每条玩家条接到**自己**那一套。
++#
++# 🩸 不补的后果就是用户看到的现象。玩家条是用 duplicate() 复制出来的，
++#    而 duplicate() **不重映射 @export 引用**（坑第 14 条）：
++#    4~7 号条的 invite_visual_button / invite_interact_button 全都指着 0 号条那一套。
++#    于是 2 人局（0/1 号是玩家，2~7 号是空位）时：
++#      2 号 → InviteButton2 亮，3 号 → InviteButton3 亮，
++#      4/5/6/7 号 → 全都去点亮 InviteButton0
++#    → **屏幕上只有 3 个邀请按钮**，其中一个还压在 0 号玩家那一行上（"错位"）。
++#
++# 复制时要重接的引用（都是 duplicate() 不会帮你改的）：
++#   · 覆盖层按钮的 ButtonClass.custom_ui_target → 必须指向**新的**视觉按钮，
++#     否则悬停新按钮时闪的是 0 号那个；
++#   · 玩家条的两个 @export → 指向新的一套；
++#   · pressed 信号 → setup_invite_buttons() 已经跑过了（_ready 里在扩位之前），
++#     运行时连的 lambda 不会被 duplicate 带走，必须自己连。
++# ButtonClass 里的 speaker_press / speaker_hover 是**相对路径**，
++# 副本挂在同一个父节点下、深度一致，所以那两条不用动。
++func _mp8_extend_invite_buttons(target: int) -> void :
++
++	var vis: Array[Button] = invite_buttons_visuals
++	var act: Array[Button] = invite_buttons_interacts
++	if vis.size() == 0 or not is_instance_valid(vis[0]):
++		print("[MP8] 邀请按钮：场景里一个都没有，跳过")
++		return
++
++	# ⚠️ 映射必须在**动任何东西之前**拟合：下面摆位会把原始几何覆盖掉。
++	_mp8_fit_invite_mapping()
++
++	var n0: int = vis.size()
++	if n0 >= target:
++		return
++
++	var vis_parent: Node = vis[0].get_parent()
++	var act_parent: Node = act[0].get_parent() if (act.size() > 0 and is_instance_valid(act[0])) else null
++
++	for i in range(n0, target):
++		# ---- 视觉件 ----------------------------------------------------
++		var v: Button = vis[0].duplicate()
++		v.name = "MP8InviteButton%d" % i
++		v.visible = false
++		vis_parent.add_child(v)
++		vis.append(v)
++
++		# ---- 点击区 ----------------------------------------------------
++		if act_parent != null:
++			var a: Button = act[0].duplicate()
++			a.name = "MP8InviteOverlayButton%d" % i
++			a.visible = false
++			act_parent.add_child(a)
++			act.append(a)
++
++			# 悬停高亮的目标必须换成新的视觉件，否则闪的是 0 号
++			var bc: Node = a.get_node_or_null("ButtonClass")
++			if bc != null:
++				bc.set("custom_ui_target", v)
++
++			# _ready 里的 setup_invite_buttons() 早就跑完了，新按钮得自己接
++			if not GameManager.local_game:
++				a.pressed.connect(func():
++					Steam.activateGameOverlayInviteDialog(
++						NetworkManager.active_backend.lobby_id
++					)
++				)
++
++	# ---- 把每条玩家条接到自己那一套（0~3 号本来就是对的，4~7 号在此纠正）----
++	var fixed: int = 0
++	for i in user_container_array.size():
++		var uc = user_container_array[i]
++		if not is_instance_valid(uc):
++			continue
++		if i < vis.size() and is_instance_valid(vis[i]):
++			if uc.get("invite_visual_button") != vis[i]:
++				uc.set("invite_visual_button", vis[i])
++				fixed += 1
++		if i < act.size() and is_instance_valid(act[i]):
++			uc.set("invite_interact_button", act[i])
++
++	# 本地单机局整屏不给邀请（_ready 里已经把原版那 4 个关掉了，新增的补上）
++	if GameManager.local_game:
++		for b in vis:
++			if is_instance_valid(b):
++				b.visible = false
++		for b in act:
++			if is_instance_valid(b):
++				b.visible = false
++
++	print("[MP8] 邀请按钮：%d -> %d 套（视觉 %d / 点击区 %d），重接了 %d 条玩家条的悬空引用" % [
++		n0, target, vis.size(), act.size(), fixed])
++
++
++# [MP8] 邀请按钮的盒子高度占行距的比例。
++#
++# 为什么要单独收这一下（2026-08-18 看实机截图定的）：按钮高度是 anchor 驱动的
++# （anchor_bottom - anchor_top = 0.4 × 父高），运行时算出来**约等于一整行的行距**。
++# 4 行时行距 19，看着还行；压到 8 行、行距 9.5 之后，相邻两个盒子的边框直接贴死，
++# 六个空位连成一张表格，不像六个按钮。收到 0.78 就能露出缝。
++# ⚠️ 只收盒子高度，**不动字号**（字号在 theme_override 里，本来就只有 12×0.5，再小就糊了）。
++const MP8_INVITE_H_RATIO: float = 0.78
++
++var _mp8_invite_h_done: bool = false
++
++
++func _mp8_align_invite_buttons(s: float, step: float) -> void :
++
++	var vis: Array[Button] = invite_buttons_visuals
++	if vis.size() == 0:
++		return
++	var act: Array[Button] = invite_buttons_interacts
++
++	for i in vis.size():
++		# 原版 y = 3.5 + i×18.75，即"比玩家条低 3.5"，等比缩放后保持这层关系
++		var new_y: float = float(i) * step + 3.5 * s
++
++		if is_instance_valid(vis[i]):
++			# 先收高度再摆位：anchor 一改会重新算 rect，顺序反了位置会被冲掉。
++			# 加 _mp8_invite_h_done 是防重入 —— 这个函数万一被调两次，
++			# 比例会连乘两遍，盒子越缩越扁。
++			if not _mp8_invite_h_done:
++				var span: float = vis[i].anchor_bottom - vis[i].anchor_top
++				vis[i].anchor_bottom = vis[i].anchor_top + span * MP8_INVITE_H_RATIO
++			vis[i].scale = Vector2(s, s)
++			vis[i].position.y = new_y
++
++		# 点击区：走拟合出来的映射，并且**跟着一起缩小**——
++		# 不缩的话 8 行时相邻点击区会互相压住（原版点击区高约 36 屏幕像素，
++		# 而 8 行的行距映射过去只有约 21）。
++		if _mp8_inv_fit_ok and i < act.size() and is_instance_valid(act[i]):
++			act[i].position.y = _mp8_inv_k * new_y + _mp8_inv_b
++			act[i].scale = _mp8_inv_act_scale * s
++
++	_mp8_invite_h_done = true
++
+ func debug_update():
+ 	update_page_number_visuals()
+ 	update_page_content()
+@@ -212,6 +567,16 @@ func set_user_container_info():
+ 
+ func _physics_process(_delta: float) -> void :
+ 
++	# [MP8] ⚠️ 自动准备必须放在 game_focused 判断**前面**。
++	# 8 开的时候只有一个窗口有焦点，剩下 7 个的 _physics_process 会在下面那行直接 return，
++	# 于是只有被点中的那个窗口会自动准备，全员准备永远凑不齐，局就开不起来。
++	# 这是测试台专用路径（只有 mp8fast / mp8ready 才会武装），不影响真实对局。
++	_mp8_tick_auto_ready()
++
++	# [MP8] 🩸 冷却也必须在门前面清 —— 上面挪了自动准备却漏了这一半，
++	# 于是客机从**第二局的幕间**起再也准备不了。完整机制见 _mp8_tick_cooldown_offscreen()。
++	_mp8_tick_cooldown_offscreen()
++
+ 	if not GameManager.game_focused:
+ 		return
+ 
+@@ -352,6 +717,8 @@ func show_briefing_screen():
+ 	show_score_nodes()
+ 	set_briefing_screen_button_disabled(false)
+ 
++	_mp8_shot()  # [MP8] mp8shot：把这一屏自己存成 PNG（不需要任何屏幕录制权限）
++
+ 	update_progess_elements()
+ 
+ 	if multiplayer.is_server():
+@@ -391,6 +758,18 @@ func show_briefing_screen():
+ 	ready_button_parent.modulate.a = 1
+ 	is_ready = false
+ 
++	_mp8_auto_ready_done = false  # [MP8] 新一次显示，重新武装自动准备
++
++	# [MP8] 顺带把准备按钮的冷却清干净。原版从不在这里重置它 ——
++	# 真实对局无所谓（自己那台机器上窗口一直有焦点，冷却每帧都在走），
++	# 但测试台上没焦点的 7 个窗口永远走不到 check_ready_button_cooldown()，
++	# 冷却会一直卡在 true。上面那条 _mp8_tick_cooldown_offscreen() 已经能救，
++	# 这里再清一次是让**每一屏都从干净状态开始**，不依赖上一屏计时器走到哪儿。
++	if _mp8_auto_ready_armed:
++		ready_button_on_cooldown = false
++		ready_button_cooldown_counting = false
++		ready_button_cooldown_counter = 0
++
+ 	if not Globals.settings.get("original_finished", false) && not GameManager.pagination_highlight_shown:
+ 		if GameManager.local_game:
+ 			return
+@@ -872,6 +1251,128 @@ func _on_unpaused():
+ 		CursorManager.set_mouse_mode(Input.MouseMode.MOUSE_MODE_VISIBLE)
+ 		CursorManager.set_cursor(true, true)
+ 
++# [MP8] 自动化测试：赛前说明界面出现后倒数 3 秒，自动按一次"准备"。
++#
++# 为什么是"自动按按钮"而不是 Globals.debug_skip_brief：
++# skip_brief 会把赛前说明和倒计时整段砍掉，压缩局内时序，进而踩出原版
++# disco_dodge 里"显示符号"和 symbol_index 脱钩的隐患（该塌的不塌、不该塌的塌，
++# 详见 HANDOFF 第六节第 10 条）。本函数走的是和真人完全一样的准备流程，
++# 只是把"手点"换成"到点自动点"，时序不变，不会制造假 bug。
++# 倒计时秒数在"准备"按钮文字后面以括号显示，例如「准备 (3)」→「准备 (2)」→「准备 (1)」。
++# label_ready_button 的文字来自场景（本地化串），脚本里没有别处会写它，
++# 所以这里改完再还原是安全的。
++const MP8_AUTO_READY_SECONDS: int = 3
++
++var _mp8_auto_ready_armed: bool = false     # 命令行开关，_ready() 里缓存一次
++var _mp8_auto_ready_running: bool = false   # 本次显示的倒计时正在跑
++var _mp8_auto_ready_done: bool = false      # 本次显示已经自动按过了
++
++# 每帧轮询而不是在 show_briefing_screen() 里挂一发。
++# 原因：show_briefing_screen() 有两条几乎重复的调用路径（intermission_game_picker.gd
++# 的 405 与 435 行），各自带 `if not is_inside_tree(): return` 提前返回，
++# 到底哪条在第几局跑不好判断——实测就是第一局有倒计时、后面几局没有。
++# 轮询"按钮可按了且还没准备"这个状态本身，跟走哪条路径无关，稳。
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] 🩸 没焦点的窗口也要走准备按钮的冷却 —— 否则客机从第二局起再也准备不了
++# ═══════════════════════════════════════════════════════════════════════════
++#
++# **症状**（2026-08-18，用户要录像做宣传片时报的）：
++# 用 `-Room`（自己开局、每轮幕间自动准备）跑 8 开，第一局正常，
++# **第二局的幕间起客机全都不再自动准备**，局卡在赛前说明屏开不下去。
++#
++# ### 三件事叠起来才出事，缺一条都不犯
++#
++# 1. `check_ready_button_cooldown()` 是**唯一**清 `ready_button_on_cooldown` 的地方，
++#    而它在 `_physics_process` 里位于 `game_focused` 门**之后** ——
++#    8 开时只有 1 个窗口有焦点，另外 7 个永远跑不到它；
++# 2. `_on_ready_button_pressed()` 第一句就是 `if ready_button_on_cooldown: return`；
++# 3. `show_briefing_screen()` 从不重置 `ready_button_on_cooldown`。
++#
++# 于是客机第一次自动按下之后，冷却**永远卡在 true**，此后每一屏的自动准备
++# 都在第 2 条那里被挡掉 —— 而且**一条日志都不会打**，看起来像"自动准备没触发"。
++#
++# ### ⚠️ 这是原版结构，不是我们引入的；**真实对局没有这个 bug**
++#
++# 原版 `_physics_process` 就是「先 `game_focused` 门、再 `check_ready_button_cooldown()`」，
++# 原版 `show_briefing_screen()` 也从不重置冷却。
++# 真实对局里每个人在自己那台机器上窗口都是有焦点的，冷却每帧都在走，永远不会卡。
++# **只有我们的 8 开测试台会犯**（7 个窗口没焦点）。
++# 所以这个修复**整个锁在 `_mp8_auto_ready_armed` 里**（只有 mp8fast / mp8ready 武装），
++# 真实对局逐帧与原版一致 —— 符合"原版那份一个字节都不许动"。
++#
++# ### 🩸 为什么拖到现在才暴露
++#
++# 默认测试模式带 `mp8fast`，它会设 `debug_instant_start`，
++# **那条路径直接跳掉赛前说明屏** —— 客机的自动准备从来没被真正跑完过。
++# 换成 `mp8ready`（走完整时序）之后才露出来。
++#
++# **判据：一个"为了跑得快"的开关，可能同时跳过了你想验的那段逻辑。**
++# 这跟坑第 10、20 条同源 —— `-Clean` 那一节讲的就是这件事。
++func _mp8_tick_cooldown_offscreen() -> void :
++
++	if not _mp8_auto_ready_armed:
++		return
++	# 有焦点的窗口下面那条原版路径会走，别重复计时
++	if GameManager.game_focused:
++		return
++
++	check_ready_button_cooldown()
++
++
++func _mp8_tick_auto_ready() -> void :
++
++	if not _mp8_auto_ready_armed:
++		return
++	if _mp8_auto_ready_running or _mp8_auto_ready_done:
++		return
++	if not ready_button_press_allowed:
++		return
++	if button_ready == null or not button_ready.visible:
++		return
++	if is_ready:
++		return
++
++	_mp8_auto_ready_running = true
++	_mp8_auto_ready_countdown()
++
++
++func _mp8_auto_ready_countdown() -> void :
++
++	var base_text: String = ""
++	if label_ready_button:
++		base_text = label_ready_button.text
++
++	for remaining in range(MP8_AUTO_READY_SECONDS, 0, -1):
++
++		if not is_inside_tree():
++			_mp8_auto_ready_running = false
++			return
++		# 人先手动按了就让人说了算，别再自动按一次把它按回未准备
++		if is_ready:
++			break
++
++		if label_ready_button:
++			label_ready_button.text = "%s (%d)" % [base_text, remaining]
++
++		await get_tree().create_timer(1.0, false).timeout
++
++	if label_ready_button:
++		label_ready_button.text = base_text
++
++	_mp8_auto_ready_running = false
++
++	if not is_inside_tree():
++		return
++	if is_ready:
++		return
++	if not ready_button_press_allowed:
++		return
++
++	_mp8_auto_ready_done = true
++	print("[MP8] 赛前说明：倒计时到，自动准备")
++	_on_ready_button_pressed()
++
++
+ func _on_ready_button_pressed():
+ 
+ 	if ready_button_on_cooldown:

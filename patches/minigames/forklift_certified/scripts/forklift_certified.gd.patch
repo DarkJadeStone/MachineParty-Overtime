@@ -1,0 +1,1155 @@
+diff --git a/minigames/forklift_certified/scripts/forklift_certified.gd b/minigames/forklift_certified/scripts/forklift_certified.gd
+--- a/minigames/forklift_certified/scripts/forklift_certified.gd
++++ b/minigames/forklift_certified/scripts/forklift_certified.gd
+@@ -2,6 +2,55 @@ extends Minigame
+ 
+ class_name ForkliftCertifiedMinigame
+ 
++# ============================================================ [MP8] 叉车认证 8 人适配
++#
++# 本局与之前所有小游戏都不同：**每个玩家「拥有」一块送货区**。
++# 原版 spawn_players() 里出生点和送货区是**同一个下标**取的：
++#     spawn_positions[idx] / delivery_areas[idx] / delivery_area_nodes[idx]
++# 场景里只有 4 块区（DropAreas 下 4 个**内联**节点，不是独立 .tscn），
++# 所以第 5 个人就是 delivery_areas[4] 越界读 → null → 取属性报错。
++#
++# **做法（用户 2026-08-17 定）：不加区，改成两人一队。**
++# 8 人 = 4 队 x 2 人，一队共用一块送货区；箱子进区就算全队的。
++# 选这条路的一个附带好处：**局数结构与原版完全一样** ——
++# 4 队淘汰到只剩 1 队 = 3 轮，和原版 4 人淘到剩 1 人一模一样。
++# （原先那版"补到 8 块区"的做法已作废，别再照着 probe60 的边中点坐标去加区。）
++#
++# probe59/60/61 实测出来、在 8 人下会真的发作的几处：
++#
++#   1. **板条箱撒点死循环**（最要命，服务器当场冻住）
++#      initialize() 调 spawn_crates(人数x2)：8 人 = 16。
++#      撒点区 12x12、点间最小距离 4.0，3000 次采样**一次都没到 16**
++#      → 原版那句无上界的 `while points.size() < target_size` 永不退出。
++#      修在 crate_manager.gd（撒点区可配 + while 加上界留最好的一次），
++#      参数在本文件 `_mp8_apply_crate_profile()`。
++#
++#   2. **出生点只有 4 个**：两人一队要 8 个（每块区两个，队友并排）。
++#      通用补位那条路也不能用 —— 原版 4 点 (±16,±16) 的排列顺序是 [左下,右下,左上,右上]，
++#      取"相邻两点中点"时 j=1 取 [1][2]、j=3 取 [3][0]，**算出来两个都是 (0,0)**，
++#      正好是场地正中、箱子堆里。所以挂 `mp8_owns_spawns` 让通用补位让开，本局自管。
++#      （坑第 33 条）
++#
++#   3. **血迹贴花只有 4 个**：本局最多死 6 个人（3 队 x 2）。
++#      spawn_blood_rpc 每次 `get_child(0)` 取一个走，取空后返回 null → `decal.get_parent()` 崩。
++#      修法照坑第 14 条：**循环复用已有的**，不新建节点。
++#
++#   4. **`_on_crate_numbers_changed` 裸取 `active_players[da.belongs_to_id]`**：
++#      队友死了、区还没来得及置 -2 的那一瞬间，箱子被撞出区就会触发这里 → 取不到键报错。
++#      原版 1 人 1 区时窗口极窄，两人一队后这个窗口变宽了。加 has() 兜底。
++#
++# 4 人及以下**一个字不改**：每块区仍然只有 1 个人，走的是原版那 4 个出生点、
++# 原版的撒点参数、原版的箱子数（人数x2）。两人一队只在 5 人及以上才成立。
++#
++# 摆位归用户（硬规矩第 1 条）：队友那个副出生点的内置值只是初值，
++# 用 `play.ps1 -ForkEdit` 局内手摆，存盘落 user://mp8_forklift_layout.txt，下次开局自动生效。
++# 删掉那个文件 = 回到内置初值。
++#
++# ⚠️ 本轮只做 ① 适配。② 得分没动 —— check_game_end() 的 `player_scores = player_count`
++# 有和隧道险境 T28 一样的掉线洞，且两人一队后队友必然同分（0,0,2,2,4,4,8,8），
++# 冠亚断层从 2 分变成 4 分。这些都等 ① 实机验收后再谈。
++# ==============================================================================
++
+ const player_scene = preload("uid://bsv3e0qog8k42")
+ 
+ @export_category("Variables")
+@@ -44,9 +93,57 @@ var set_inactive_area_to: int = -2
+ 
+ var ach_crate_number: int = 4
+ 
++
++# ------------------------------------------------------------------ [MP8] 常量与状态
++
++const MP8_TEAM_SIZE: int = 2
++const MP8_LAYOUT_FILE: String = "user://mp8_forklift_layout.txt"
++
++# 队友副位相对主位的默认偏移：朝**场地中心**方向挪，别朝墙挪。
++# 4.5 米 = 叉车碰撞盒宽 3.0 + 1.5 米空隙（probe60 实测车身碰撞盒 3.0 x 6.0）。
++# 挪完仍在自己那块区里（区 x 半宽 7.21，主位在 ±16 → 副位 ±11.5 在 [8.79, 23.21] 内）。
++const MP8_MATE_OFFSET: float = 4.5
++
++# 送货区碰撞盒（probe60 实测 Box 14.42 x 1.00 x 13.02），手调时判"还在自己区里吗"用
++const MP8_ZONE_HX: float = 7.21
++const MP8_ZONE_HZ: float = 6.51
++# 场地护栏内沿（probe60：side railing_002 x[-28.49,28.49] z[-33.10,33.07]）
++const MP8_FIELD_X: float = 28.49
++const MP8_FIELD_Z: float = 33.07
++# 叉车碰撞盒（probe60），手调时判两台车叠没叠
++const MP8_CAR_HX: float = 1.5
++const MP8_CAR_HZ: float = 3.0
++
++# 出生点表：一行 = [位置 Vector3, 朝向度数 float]。
++# **下标编码 = 区号 * MP8_TEAM_SIZE + 队内序号**，即 [0][1] 是 0 号区那一队的两个位。
++var _mp8_spawns: Array = []
++var _mp8_spawns_src: String = "未初始化"
++
++# [区下标] -> [network_id, ...]。整队一起淘汰，所以判活/判分都按这个走。
++var _mp8_area_members: Array = []
++
++# 让通用补位 network_manager._mp8_topup() 让开：本局出生点自管（理由见文件头第 2 条）。
++var mp8_owns_spawns: bool = true
++
++var _mp8_blood_pool: Array = []           # 已摆出去的血迹，按摆放顺序；池子取空后从头复用
++
++var _mp8_edit_on: bool = false
++var _mp8_edit_sel: int = 0
++var _mp8_edit_step_i: int = 0
++var _mp8_edit_canvas: CanvasLayer = null
++var _mp8_edit_panel: Label = null
++var _mp8_markers: Array[Node3D] = []
++const MP8_EDIT_STEPS: Array = [0.25, 1.0, 4.0]
++const MP8_EDIT_YAW_STEP: float = 15.0
++
++
+ func _ready() -> void :
+ 	super._ready()
+ 
++	# [MP8] 出生点表要在任何人用到之前建好（spawn_players 和手调模式都读它）
++	_mp8_init_flags()
++	_mp8_build_spawns()
++
+ 	if multiplayer.is_server():
+ 
+ 		for c in delivery_area_parent.get_children():
+@@ -65,6 +162,65 @@ func _ready() -> void :
+ 		await get_tree().create_timer(1.0).timeout
+ 		minigame_ready.emit(1)
+ 
++	if _mp8_edit_on:
++		_mp8_edit_begin()
++
++	# [MP8] 倒计时里插一句"单人队已增幅"的提示。**必须在这里调**（_ready 每端都跑），
++	# 不能塞进上面那个 is_server() 块 —— 这句话是给所有人看的。
++	_mp8_setup_countdown()
++
++
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] 倒计时提示：告诉全场"单人队的分被增幅了"（用户 2026-08-18 要求）
++# ═══════════════════════════════════════════════════════════════════════════
++#
++# **为什么需要**：单人队一箱算两箱（见 _mp8_refresh_score_mults）是本 mod 加的规则，
++# 而且**计数牌直接显示乘完的数**（叉进 1 箱牌上写 2）。不说的话，
++# 两人队看到对面一箱变两箱只会以为是 bug 或者作弊。
++#
++# **为什么 8 人局不显示**（用户明确点名）：8 人 = 4 队 × 2 人，**一个单人队都没有**，
++# 倍率全是 ×1。这时候还弹"单人已增幅"纯属误导。
++# 同理 ≤4 人也不显示：每队 1 人 → 最大队人数 1 → 全部 ×1，没有谁被增幅。
++# 所以条件恰好是 **5 / 6 / 7 人**（队形 [2,1,1,1] / [2,2,1,1] / [2,2,2,1]）。
++#
++# **实现走 mp8_one_text**：这是 overlay 已有的机制（猎鸭"猎人已大幅增强"用的同一条），
++# 把倒计时的 "1" 整个换成一句红字提示。好处是不新增任何 UI 节点、
++# 每端本机渲染不需要 RPC（服务器只广播 "3"/"2"/"1"，文字各端自己决定）。
++#
++# ⚠️ 人数用 `PlayerManager.player_presences.size()` 而不是 `player_count` ——
++# 后者只在服务器的 spawn_players() 里赋过值，客户端恒为 0，
++# 拿它判断的话**除房主外没人看得见这句提示**。
++func _mp8_setup_countdown() -> void :
++
++	if minigame_overlay == null:
++		return
++
++	var n: int = PlayerManager.player_presences.size()
++	var zh: bool = TranslationServer.get_locale().to_upper().begins_with("ZH")
++
++	# 先无条件清空：overlay 是每个小游戏自带的实例，但显式清一遍才经得起
++	# "同一实例被 initialize() 多次"（每轮一次）——人数中途因掉线变了就得跟着变。
++	minigame_overlay.mp8_one_text = ""
++
++	if n >= 5 and n <= 7:
++		minigame_overlay.mp8_one_text = (
++			"单人玩家得分已被增幅" if zh else "SOLO PLAYERS' SCORE BOOSTED"
++		)
++
++	print("[MP8] 叉车认证：倒计时提示 —— %d 人 → %s" % [
++		n, ("显示「单人已增幅」" if minigame_overlay.mp8_one_text != "" else "不显示（无单人队）")
++	])
++
++
++# [MP8] 让每一端重算提示。掉线会改人数（8 人掉一个 → 7 人 → 冒出单人队），
++# 那时倍率当场重算了，提示也得跟着变，否则接下来几轮"分被增幅了却没人告诉你"。
++# ⚠️ 必须是 call_local 的广播：`_mp8_setup_countdown()` 改的是**本机** overlay 的字段，
++# 只在服务器上调等于只有房主的提示是对的。
++@rpc("authority", "call_local", "reliable")
++func mp8_hint_refresh_rpc() -> void :
++	_mp8_setup_countdown()
++
++
+ func fade_in_ambience():
+ 	for speaker_controller in ambience_speaker_controllers:
+ 		speaker_controller.speaker.volume_linear = 0
+@@ -84,7 +240,9 @@ func initialize(_round_number: int, _total_rounds: int, _scores: Dictionary = {}
+ 	super.initialize(_round_number, _total_rounds, _scores)
+ 
+ 	spawn_players()
+-	crate_manager.spawn_crates(PlayerManager.player_presences.keys().size() * 2)
++
++	# [MP8] 撒点参数按人数选档，然后才敢要这么多箱子。见 _mp8_apply_crate_profile()。
++	crate_manager.spawn_crates(_mp8_apply_crate_profile(PlayerManager.player_presences.keys().size()))
+ 
+ 	round_number = _round_number
+ 	total_rounds = _total_rounds
+@@ -92,32 +250,99 @@ func initialize(_round_number: int, _total_rounds: int, _scores: Dictionary = {}
+ 
+ 	state_machine.transition_to_rpc.rpc(&"Round", {"round": _round_number, "total": _total_rounds})
+ 
+-func spawn_players():
+ 
+-	var shuffled_indicies: Array[int] = []
+-	for i in player_spawn_positions_node.get_child_count():
+-		shuffled_indicies.append(i)
+-	shuffled_indicies.shuffle()
++# [MP8] 板条箱：要几个、撒点区多大、点间最小距离多少。
++#
++# 原版恒为 `人数 x 2`，撒点区 12x12（半宽 6.0）、最小距离 4.0。
++# probe61 实测（每格 1500 次采样，radius = 点间最小距离）：
++#
++#   半宽 6.0 / 距离 4.0（原版）: 中位 7 个 —— target 8 达标率 49%，**target 12 起取不到**
++#   半宽 7.0 / 距离 3.2        : 中位 14 个 —— 10:100%  12:99%  14:74%  16:17%
++#
++# 用户 2026-08-17 定案：**8 人 14 个箱子，区 14x14、最小间距 3.2**。
++#   · 3.2 > 箱子碰撞盒 3.0 → 不会生成即互嵌；
++#   · 半宽 7.0 时箱子最远压到 7.0+1.5=8.5，而四角送货区的内沿在 x=8.79 → 不会撒进谁的得分区。
++#
++# ⚠️ 这个数是在"8 块区、一人一区"的旧方案下定的。改成两人一队后**区仍是 4 块**，
++# 于是每区可及的箱子从原版的 2.0 个变成 3.5 个。人均仍是 1.75（原版 2.0），
++# 但**每队 2 人抢 3.5 个箱子**，节奏会比原版快。觉得太多就把这里的 14 调小，
++# 一行的事（10 个 = 每区 2.5，最接近原版每区密度）。
++#
++# **4 人及以下一个字不改**：撒点区、最小距离、箱子数全走原版 ——
++# 箱子密度是玩法本体，属于"4 人局与原版逐值一致"真正成立的那一类（T21 工作台桌位那条）。
++func _mp8_apply_crate_profile(count: int) -> int :
++
++	if count <= 4:
++		crate_manager.mp8_half_extent = 6.0
++		crate_manager.spawn_radius = 4.0
++		return count * 2
++
++	crate_manager.mp8_half_extent = 7.0
++	crate_manager.spawn_radius = 3.2
++	return mini(count * 2, 14)
++
++
++func spawn_players():
+ 
+-	var spawn_positions = player_spawn_positions_node.get_children()
+-	var delivery_area_nodes = delivery_area_parent.get_children()
+ 	player_count = PlayerManager.player_presences.size()
+ 
++	var area_nodes = delivery_area_parent.get_children()
++	var area_count: int = area_nodes.size()
++
++	# [MP8] 原版：`for i in player_spawn_positions_node.get_child_count()`（恒为 4）+
++	# `spawn_positions[shuffled_indicies[counter]]`。第 5 个人就越界。
++	#
++	# 改成**先分队再摆人**：
++	#   · 区的顺序照原版那样 shuffle（原版就是随机分区的，这一点没变）；
++	#   · 第一轮每区先放 1 人，人还有剩才回头放第二个 —— 5 人局是 [2,1,1,1] 而不是 [2,2,1,0]，
++	#     免得人少时凭空出现一支空队（空队会让 check_game_end 提前成立）。
++	var shuffled_areas: Array[int] = []
++	for i in area_count:
++		shuffled_areas.append(i)
++	shuffled_areas.shuffle()
++
++	_mp8_area_members = []
++	for i in area_count:
++		_mp8_area_members.append([])
++
++	var seats: Array = []      # [区下标, 队内序号]，按分配顺序排好
++	for pass_i in MP8_TEAM_SIZE:
++		for a in shuffled_areas:
++			seats.append([a, pass_i])
++
++	if player_count > seats.size():
++		# 理论上到不了（4 区 x 2 = 8 = 人数上限）。真到了宁可有人叠着也不能有人不生成 ——
++		# check_game_end() 要只剩 1 队才结束，少生成一个人这一小局可能永远结束不了。
++		push_warning("[MP8] 叉车认证：%d 个人只有 %d 个座位，末尾循环复用" % [player_count, seats.size()])
++
+ 	var counter: int = 0
+ 	for i in PlayerManager.player_presences.size():
+ 		var network_id = PlayerManager.player_presences.keys()[i]
+ 
++		var seat: Array = seats[counter % seats.size()]
++		var area_i: int = int(seat[0])
++		var mate_i: int = int(seat[1])
++		var row: Array = _mp8_spawns[area_i * MP8_TEAM_SIZE + mate_i]
++
+ 		var player_character = player_scene.instantiate()
+ 		players_node.add_child(player_character, true)
+ 
+ 		player_character.set_player_presence.rpc(network_id)
+ 		player_character.setup_rpc.rpc(
+-			spawn_positions[shuffled_indicies[counter]].global_position, 
+-			spawn_positions[shuffled_indicies[counter]].global_rotation, 
+-			delivery_areas[shuffled_indicies[counter]].get_path()
++			row[0] as Vector3,
++			Vector3(0.0, deg_to_rad(float(row[1])), 0.0),
++			delivery_areas[area_i].get_path()
+ 		)
+ 
+-		delivery_area_nodes[shuffled_indicies[counter]].set_owner_rpc.rpc(network_id)
++		# 区的"主人"仍然是队里第一个人（原版语义：belongs_to_id 是单个 int，
++		# 一堆判活代码靠它 > check_id_threshold）。第二个人另外登记，
++		# 只为了让他也能看见自己区的射灯 —— 见 delivery_area 的 mp8_add_owner_rpc。
++		if mate_i == 0:
++			area_nodes[area_i].set_owner_rpc.rpc(network_id)
++		else:
++			area_nodes[area_i].mp8_add_owner_rpc.rpc(network_id)
++
++		_mp8_area_members[area_i].append(network_id)
+ 
+ 		players[network_id] = player_character
+ 		active_players[network_id] = player_character
+@@ -125,6 +350,9 @@ func spawn_players():
+ 
+ 		counter += 1
+ 
++	_mp8_refresh_score_mults()
++	_mp8_log_teams()
++
+ func cleanup():
+ 
+ 	if is_multiplayer_authority():
+@@ -143,21 +371,27 @@ func player_disconnected(_network_id: int):
+ 
+ func check_game_end(from_disconnect: bool = false):
+ 
+-	if active_players.size() > 1:
++	# [MP8] 原版是 `active_players.size() > 1`（一人一区，人数 = 队数）。
++	# 两人一队后必须数**队**：还剩 2 个人时可能是同一队的两个人，那已经该结束了；
++	# 也可能是两队各剩一人（队友掉线），那还得接着打。
++	# 4 人及以下每队只有 1 人 → 这个数恒等于 active_players.size()，与原版逐值一致。
++	if _mp8_active_team_count() > 1:
+ 		if from_disconnect:
+ 			return
+ 		else:
+ 			start_new_round()
+ 			return
+ 
++	# [MP8] 原版只给第一个人发冠军分就 `break`。两人一队时冠军是**两个人**，
++	# 都得拿到 —— 漏一个的话那个人这一局记 0 分。
++	# 4 人及以下 active_players 只剩 1 个 → 与原版逐值一致。
+ 	for network_id in active_players.keys():
+ 		player_scores[network_id] = player_count
+ 
+-
+-		break
+-
+ 	player_scores_finalized.emit(player_scores)
+ 
++	_mp8_log_scores()
++
+ 	await get_tree().create_timer(2.0).timeout
+ 	set_minigame_sfx_linear_volume_rpc.rpc(0.0)
+ 
+@@ -204,11 +438,15 @@ func remove_zero_scoring_players():
+ 
+ 		if delivery_area.crates_in_area.size() == 0:
+ 			zero_scoring_areas.append(delivery_area)
+-			zero_scoring_player_ids.append(delivery_area.belongs_to_id)
++			# [MP8] 原版只收 belongs_to_id 一个人。两人一队 → 整队一起走。
++			for pid in _mp8_members_of_area(delivery_area):
++				zero_scoring_player_ids.append(pid)
+ 
+ 	var players_removed: Array[int]
+ 	for network_id in zero_scoring_player_ids:
+ 		remove_active_player_rpc.rpc(network_id)
++		# dead_players 是在下面那个循环里才追加的，所以本轮一起淘汰的人**同分** —— 原版就是这个性质，
++		# 两人一队后正好让队友同分，不用另外处理。
+ 		player_scores[network_id] = dead_players.size()
+ 		players_removed.append(network_id)
+ 
+@@ -221,7 +459,8 @@ func remove_zero_scoring_players():
+ 
+ func calculate_results():
+ 
+-	if active_players.keys().size() <= 1:
++	# [MP8] 原版 `active_players.keys().size() <= 1`；两人一队要数队（同 check_game_end）。
++	if _mp8_active_team_count() <= 1:
+ 		return
+ 
+ 
+@@ -236,10 +475,14 @@ func calculate_results():
+ 
+ 	var player_ids_by_score: Dictionary
+ 	for delivery_area in active_delivery_areas:
+-		var score = delivery_area.crates_in_area.size()
++		# [MP8] 原版是裸的 crates_in_area.size()；现在过一道倍率（单人队一箱算两箱）。
++		# ≤4 人和 8 人倍率恒为 1 → 与原版逐值一致。
++		var score = _mp8_area_score(delivery_area)
+ 		if not player_ids_by_score.has(score):
+ 			player_ids_by_score[score] = []
+-		player_ids_by_score[score].append(delivery_area.belongs_to_id)
++		# [MP8] 原版 append(belongs_to_id) 一个人；两人一队 → 整队进同一档。
++		for pid in _mp8_members_of_area(delivery_area):
++			player_ids_by_score[score].append(pid)
+ 
+ 	var lowest_score: int = player_ids_by_score.keys().min()
+ 	var heighest_score: int = player_ids_by_score.keys().max()
+@@ -252,7 +495,7 @@ func calculate_results():
+ 			player_scores[player_id] = dead_players.size()
+ 			players_removed.append(player_id)
+ 			for delivery_area in all_delivery_areas:
+-				if delivery_area.belongs_to_id == player_id:
++				if _mp8_area_has_member(delivery_area, player_id):
+ 					delivery_area.set_owner_rpc.rpc(set_inactive_area_to)
+ 
+ 	for score in player_ids_by_score.keys():
+@@ -265,7 +508,7 @@ func calculate_results():
+ 				player_scores[network_id] = dead_players.size()
+ 				players_removed.append(network_id)
+ 				for delivery_area in all_delivery_areas:
+-					if delivery_area.belongs_to_id == network_id:
++					if _mp8_area_has_member(delivery_area, network_id):
+ 						delivery_area.set_owner_rpc.rpc(set_inactive_area_to)
+ 
+ 	for pid in players_removed:
+@@ -318,20 +561,38 @@ func disconnect_player_rpc(_network_id: int):
+ 		active_players[_network_id].queue_free()
+ 		active_players.erase(_network_id)
+ 
+-	var remove_delivery_area_index: int = -1
+-	for i in delivery_areas.size():
+-		var da = delivery_areas[i]
+-		if da.belongs_to_id == _network_id:
+-			remove_delivery_area_index = i
+-			da.set_owner_rpc.rpc(set_inactive_area_to)
++	# [MP8] 原版：找到这个人的区 → 置 -2 → 并把它从 delivery_areas 里 remove_at。
++	# 两人一队后不能这么干：
++	#   · 队友还活着时**不能**把区关掉，否则活着的那个人从此得不了分；
++	#   · `remove_at` 会让 delivery_areas 的下标错位，而 _mp8_area_members 是按下标对齐的。
++	# 区被 -2 之后所有地方都靠 `belongs_to_id <= check_id_threshold` 过滤，
++	# 不 remove_at 在行为上是等价的（delivery_areas 只在 _on_crate_numbers_changed 里被遍历，
++	# 那里正是按这个阈值过滤的），所以这里只置 -2、不动数组。
++	for i in _mp8_area_members.size():
++		var members: Array = _mp8_area_members[i]
++		if not members.has(_network_id):
++			continue
++		members.erase(_network_id)
++		if members.is_empty() and i < delivery_areas.size():
++			delivery_areas[i].set_owner_rpc.rpc(set_inactive_area_to)
++		elif i < delivery_areas.size() and delivery_areas[i].belongs_to_id == _network_id:
++			# 走的是队长 → 把区过户给还活着的队友，否则区会被当成"没人的区"过滤掉
++			delivery_areas[i].set_owner_rpc.rpc(int(members[0]))
++
++	# [MP8] 名册变了 → 计分倍率重算。**掉线是唯一会改名册的事**（淘汰不动名册），
++	# 所以也是唯一需要重算的时机。两人队掉一个 → 剩下那个人当场变成单人队、一箱算两箱；
++	# 若场上再没有两人队，倍率整体退回 1（倍率的意义就是"补偿人少"，人都少了就不该再补）。
++	# 后果：**局中牌面数字会跳变**（倍率一变，服务器当场重播一次计数）。这是有意的。
++	# 觉得跳变难看就把这一次调用删掉，倍率即固定在开局值。
++	_mp8_refresh_score_mults()
++
++	# [MP8] 倍率变了，提示也要跟着变（8 人掉一个 → 7 人 → 冒出单人队）
++	mp8_hint_refresh_rpc.rpc()
+ 
+ 	player_scores.erase(_network_id)
+ 	if not dead_players.has(_network_id):
+ 		dead_players.append(_network_id)
+ 
+-	if remove_delivery_area_index >= 0:
+-		delivery_areas.remove_at(remove_delivery_area_index)
+-
+ @rpc("authority", "call_local", "reliable")
+ func remove_active_player_rpc(_network_id: int):
+ 
+@@ -341,9 +602,9 @@ func remove_active_player_rpc(_network_id: int):
+ 
+ 		if multiplayer.is_server():
+ 			var blood_decal_position = Vector3(
+-				active_players[_network_id].global_position.x, 
+-				1.3, 
+-				active_players[_network_id].global_position.z, 
++				active_players[_network_id].global_position.x,
++				1.3,
++				active_players[_network_id].global_position.z,
+ 			)
+ 			spawn_blood_rpc.rpc(blood_decal_position)
+ 		active_players.erase(_network_id)
+@@ -351,9 +612,27 @@ func remove_active_player_rpc(_network_id: int):
+ @rpc("authority", "call_local", "reliable")
+ func spawn_blood_rpc(_at_pos: Vector3):
+ 
+-	var decal: Node3D = blood_decals_environment_parent.get_child(0)
+-	decal.get_parent().remove_child(decal)
+-	add_child(decal)
++	# [MP8] 原版无条件 `get_child(0)`。场景里只有 4 块贴花，而本局最多死 6 个人
++	# （3 队 x 2）→ 第 5 次取到 null，下一行 `decal.get_parent()` 直接崩。
++	# 照坑第 14 条：需要"每人一个"的纯装饰件时**循环复用已有的**，不要 duplicate 新节点
++	# （那条坑的实测代价是"卡死在 SessionIntro 且零报错"）。
++	# 代价：第 5 块血迹会把第 1 块挪走。比崩了强。
++	var decal: Node3D = null
++
++	if blood_decals_environment_parent.get_child_count() > 0:
++		decal = blood_decals_environment_parent.get_child(0)
++		decal.get_parent().remove_child(decal)
++		add_child(decal)
++		_mp8_blood_pool.append(decal)
++	elif not _mp8_blood_pool.is_empty():
++		decal = _mp8_blood_pool.pop_front()
++		if not is_instance_valid(decal):
++			return
++		_mp8_blood_pool.append(decal)
++	else:
++		push_warning("[MP8] 叉车认证：一块血迹贴花都没有，这次不画")
++		return
++
+ 	decal.global_position = _at_pos
+ 	decal.global_rotation = Vector3(decal.global_rotation.x, randf_range(0, 360), decal.global_rotation.z)
+ 
+@@ -368,23 +647,26 @@ func _on_crate_numbers_changed():
+ 
+ 	var highest_score: int = 0
+ 	for da in delivery_areas:
++		# [MP8] 成就按**真实箱子数**给 —— "真的叉够 4 箱"的成就不该被单人队倍率放水。
+ 		var crate_numbers: int = da.crates_in_area.size()
+ 
+ 		if crate_numbers >= ach_crate_number:
+ 			if da.belongs_to_id > check_id_threshold:
+-				if active_players.has(da.belongs_to_id):
+-					active_players[da.belongs_to_id].trigger_achievement_rpc.rpc()
++				# [MP8] 成就给全队（原版只给 belongs_to_id 一个人）
++				for pid in _mp8_members_of_area(da):
++					if active_players.has(pid):
++						active_players[pid].trigger_achievement_rpc.rpc()
+ 
+-		if crate_numbers > highest_score:
+-			highest_score = da.crates_in_area.size()
++		# [MP8] 但"谁领先"必须用**算完倍率的分**，否则射灯会指错人（和淘汰判定用的不是一个数）
++		if _mp8_area_score(da) > highest_score:
++			highest_score = _mp8_area_score(da)
+ 
+ 	if highest_score == 0:
+ 		for da in delivery_areas:
+ 			if da.belongs_to_id <= check_id_threshold:
+ 				continue
+ 
+-			da.set_indicator_light_rpc.rpc(false)
+-			active_players[da.belongs_to_id].set_indicator_light_rpc.rpc(false)
++			_mp8_set_indicator(da, false)
+ 		return
+ 
+ 	for da in delivery_areas:
+@@ -392,12 +674,31 @@ func _on_crate_numbers_changed():
+ 		if da.belongs_to_id <= check_id_threshold:
+ 			continue
+ 
+-		if da.crates_in_area.size() == highest_score:
+-			da.set_indicator_light_rpc.rpc(true)
+-			active_players[da.belongs_to_id].set_indicator_light_rpc.rpc(true)
+-		else:
+-			da.set_indicator_light_rpc.rpc(false)
+-			active_players[da.belongs_to_id].set_indicator_light_rpc.rpc(false)
++		_mp8_set_indicator(da, _mp8_area_score(da) == highest_score)
++
++
++# ═══════ [MP8] 2026-08-19：指示灯只在**真的翻转**时才广播 ═══════
++#
++# 旧版每次箱数一动就把所有送货区的灯重发一遍，不管状态变没变。而
++# `forklift_certified_delivery_area.set_indicator_light_rpc` 的 true/false
++# **两个分支都会 `speaker_mechanism.play()`**（只是 pitch 不同）。
++# 8 个区 = 8 个**不同**的 AudioStreamPlayer3D，所以是 8 个声部真的一起响 ——
++# 这跟"同一个播放器被 play 8 次只会重启一次"不是一回事。
++# 叉车来回进出送货区时箱数变动很密，那台机构音就一直在响。
++#
++# 顺带省掉 `_mp8_light_team()` 的整轮车辆灯 RPC（一队最多 2 人，8 人局就是 8 个）。
++#
++# 缓存存在区节点上（`mp8_indicator_state`），`set_owner_rpc` 会把它置回 -1，
++# 所以区易主 / 被收回之后第一次一定会重发，不会卡在陈旧状态。
++func _mp8_set_indicator(da, winning: bool) -> void :
++
++	var want: int = 1 if winning else 0
++	if da.mp8_indicator_state == want:
++		return
++
++	da.mp8_indicator_state = want
++	da.set_indicator_light_rpc.rpc(winning)
++	_mp8_light_team(da, winning)
+ 
+ func _on_round_timer_timeout():
+ 
+@@ -426,3 +727,582 @@ func _on_player_died(_network_id: int):
+ 	await get_tree().create_timer(1.0).timeout
+ 
+ 	check_game_end()
++
++
++# ============================================================== [MP8] 以下全是新增
++
++func _mp8_init_flags() -> void :
++
++	for s in OS.get_cmdline_args():
++		if s == "mp8forkedit":
++			_mp8_edit_on = true
++
++
++# 队伍工具 -------------------------------------------------------------------
++
++func _mp8_members_of_area(area) -> Array :
++
++	# 优先用自己维护的名册；名册还没建好（例如 4 人局的 _ready 早期）就退回原版语义。
++	var idx: int = delivery_areas.find(area)
++	if idx >= 0 and idx < _mp8_area_members.size():
++		var members: Array = _mp8_area_members[idx]
++		if not members.is_empty():
++			return members
++
++	if area.belongs_to_id > check_id_threshold:
++		return [area.belongs_to_id]
++	return []
++
++
++func _mp8_area_has_member(area, network_id: int) -> bool :
++	return _mp8_members_of_area(area).has(network_id)
++
++
++# 还剩几支队伍（至少有一个人活着就算一支）。
++# 4 人及以下每队 1 人 → 恒等于 active_players.size()，与原版逐值一致。
++func _mp8_active_team_count() -> int :
++
++	if _mp8_area_members.is_empty():
++		return active_players.size()
++
++	var n: int = 0
++	for members in _mp8_area_members:
++		for pid in members:
++			if active_players.has(pid):
++				n += 1
++				break
++	return n
++
++
++# 计分倍率：**单人队一个箱子算两个**（用户 2026-08-17 定）-----------------------
++#
++# 为什么要有：5~7 人时队伍不等大（`[2,1,1,1]` / `[2,2,1,1]` / `[2,2,2,1]`），
++# 2 人队约等于两倍收箱速度，而判定是"非最高分全队淘汰" ——
++# 不补偿的话单人队第一轮几乎必死，5 人局等于开局就知道谁赢。
++#
++# 怎么算：倍率 = **最大队人数 ÷ 本队人数**（整数，队人数只可能是 1 或 2）。
++#
++#   ≤4 人：每队 1 人 → 最大队人数 1 → 全部 ×1，**与原版逐值一致**（牌面数字也一样）
++#   5~7 人：最大队人数 2 → 2 人队 ×1，单人队 **×2**
++#   8 人  ：每队 2 人 → 全部 ×1
++#
++# 用户 2026-08-17 明确否掉的另一条路：**不**为了凑等大的队去关掉某块区
++#（6 人开 3 区那种）。分队仍然照原版 shuffle 随机分。
++#
++# ⚠️ 倍率同时作用于**淘汰判定**（calculate_results）、**领先射灯**
++#（_on_crate_numbers_changed）和**计数牌显示**（delivery_area 那边），三处必须是同一个数 ——
++# 单人区叉进 1 箱，牌上就显示 2（用户 2026-08-17 明确要求）。
++# 唯一按真实箱子数走的是成就 `ach_crate_number`。
++func _mp8_refresh_score_mults() -> void :
++
++	var areas: Array = delivery_area_parent.get_children()
++
++	var max_team: int = 1
++	for members in _mp8_area_members:
++		max_team = maxi(max_team, (members as Array).size())
++
++	for i in _mp8_area_members.size():
++		if i >= areas.size():
++			continue
++		var n: int = (_mp8_area_members[i] as Array).size()
++		if n <= 0:
++			continue
++		areas[i].mp8_set_score_mult_rpc.rpc(max_team / n)
++
++
++func _mp8_area_score(area) -> int :
++	return area.crates_in_area.size() * area.mp8_score_mult
++
++
++func _mp8_light_team(area, on: bool) -> void :
++
++	for pid in _mp8_members_of_area(area):
++		# ⚠️ 原版这里是裸的 `active_players[da.belongs_to_id]`。人刚被淘汰、
++		# 区还没置 -2 的那一瞬间，箱子被撞出区就会走到这里 → 取不到键报错。
++		# 两人一队后这个窗口更宽（队友一起淘汰），所以补上 has()。
++		if active_players.has(pid):
++			active_players[pid].set_indicator_light_rpc.rpc(on)
++
++
++func _mp8_log_teams() -> void :
++
++	var areas: Array = delivery_area_parent.get_children()
++
++	var lines := PackedStringArray()
++	for i in _mp8_area_members.size():
++		var members: Array = _mp8_area_members[i]
++		if members.is_empty():
++			continue
++		var names := PackedStringArray()
++		for pid in members:
++			names.append("%s(%d)" % [_mp8_name_of(pid), pid])
++		# 倍率 >1 的（单人队）打出来，验收时一眼能看出补偿有没有生效
++		var mult: int = (int(areas[i].mp8_score_mult) if i < areas.size() else 1)
++		lines.append("区%d=[%s]%s" % [
++			i, ", ".join(names), ("" if mult <= 1 else " 一箱算%d箱" % mult)
++		])
++
++	print("[MP8] 叉车认证：%d 人分 %d 队 —— %s" % [
++		player_count, _mp8_active_team_count(), "  ".join(lines)
++	])
++
++	# 出生点自证：把实际用到的点两两最小间距打出来。
++	# ⚠️ 只打"补够了"是没用的（坑第 33 条）—— 要看间距。
++	var used: Array = []
++	for i in _mp8_area_members.size():
++		for j in _mp8_area_members[i].size():
++			used.append((_mp8_spawns[i * MP8_TEAM_SIZE + j] as Array)[0])
++	var worst: float = INF
++	for a in used.size():
++		for b in range(a + 1, used.size()):
++			var pa: Vector3 = used[a]
++			var pb: Vector3 = used[b]
++			worst = minf(worst, Vector2(pa.x - pb.x, pa.z - pb.z).length())
++	if used.size() >= 2:
++		print("[MP8] 叉车认证：出生点 %d 个，彼此最小间距 %.2f 米（车身 3.0x6.0，来源=%s）" % [
++			used.size(), worst, _mp8_spawns_src
++		])
++		if worst < 3.2:
++			push_warning("[MP8] 叉车认证：出生点最小间距只有 %.2f 米，两台车可能叠在一起" % worst)
++
++
++func _mp8_name_of(network_id: int) -> String :
++	if PlayerManager.player_presences.has(network_id):
++		var p = PlayerManager.player_presences[network_id]
++		if p != null:
++			return String(p.network_name)
++	return "?"
++
++
++func _mp8_log_scores() -> void :
++
++	var rows := PackedStringArray()
++	for pid in player_scores.keys():
++		rows.append("%s(%d)=%d" % [_mp8_name_of(pid), pid, player_scores[pid]])
++	print("[MP8] 叉车认证结算：%s" % "  ".join(rows))
++
++
++# 出生点表 -------------------------------------------------------------------
++
++func _mp8_build_spawns() -> void :
++
++	_mp8_spawns = []
++
++	var area_count: int = delivery_area_parent.get_child_count()
++	var markers: Array = player_spawn_positions_node.get_children()
++
++	# 主位 = 场景原版那个点，一个数字都不改（4 人局走的就是这些）。
++	# 副位 = 主位朝**场地中心**方向挪 MP8_MATE_OFFSET，朝向抄主位。
++	for i in area_count:
++
++		var pos: Vector3 = Vector3.ZERO
++		var yaw: float = 0.0
++
++		if i < markers.size():
++			var m: Node3D = markers[i]
++			pos = m.global_position
++			var rot: Vector3 = m.rotation_degrees
++			# 出生点只有水平朝向有意义。万一原版真带了 x/z 分量，先报出来，别默默吃掉。
++			if absf(rot.x) > 0.01 or absf(rot.z) > 0.01:
++				push_warning("[MP8] 叉车认证：出生点 %s 的 rotation 带 x/z 分量 %s，只取 y" % [
++					String(m.name), str(rot)
++				])
++			yaw = rot.y
++		else:
++			# 出生点比区还少（原版不会这样）。退回用区自己的位置，至少不会 null。
++			push_warning("[MP8] 叉车认证：出生点只有 %d 个、区有 %d 块，第 %d 块退回用区的位置" % [
++				markers.size(), area_count, i
++			])
++			pos = (delivery_area_parent.get_child(i) as Node3D).global_position
++
++		_mp8_spawns.append([pos, yaw])
++
++		var toward_center: float = (-1.0 if pos.x > 0.0 else 1.0)
++		_mp8_spawns.append([
++			Vector3(pos.x + toward_center * MP8_MATE_OFFSET, pos.y, pos.z),
++			yaw,
++		])
++
++	_mp8_spawns_src = "场景原版 + 内置副位"
++
++	var rows: Array = _mp8_load_layout_file()
++	if not rows.is_empty():
++		if rows.size() < _mp8_spawns.size():
++			push_warning("[MP8] 叉车认证：存盘文件只有 %d 行、要 %d 行，缺的那几个仍用内置值" % [
++				rows.size(), _mp8_spawns.size()
++			])
++		for i in mini(rows.size(), _mp8_spawns.size()):
++			_mp8_spawns[i] = rows[i]
++		_mp8_spawns_src = "存盘文件（%d 行）" % rows.size()
++
++	print("[MP8] 叉车认证：出生点表 %d 个（%d 区 x %d 人），来源=%s" % [
++		_mp8_spawns.size(), area_count, MP8_TEAM_SIZE, _mp8_spawns_src
++	])
++
++
++func _mp8_load_layout_file() -> Array :
++
++	if not FileAccess.file_exists(MP8_LAYOUT_FILE):
++		return []
++
++	var f := FileAccess.open(MP8_LAYOUT_FILE, FileAccess.READ)
++	if f == null:
++		push_warning("[MP8] 叉车认证：读不了 %s（错误 %d）" % [
++			MP8_LAYOUT_FILE, FileAccess.get_open_error()
++		])
++		return []
++
++	var rows: Array = []
++	while not f.eof_reached():
++		var line: String = f.get_line().strip_edges()
++		if line.is_empty() or line.begins_with("#"):
++			continue
++		var parts: PackedStringArray = line.split(",", false)
++		if parts.size() < 2:
++			push_warning("[MP8] 叉车认证：布局文件这一行看不懂，跳过 —— '%s'" % line)
++			continue
++		var x: float = float(parts[0].strip_edges())
++		var z: float = float(parts[1].strip_edges())
++		var yaw: float = (float(parts[2].strip_edges()) if parts.size() >= 3 else 0.0)
++		rows.append([Vector3(x, 0.0, z), yaw])
++	f.close()
++	return rows
++
++
++func _mp8_save_layout_file() -> bool :
++
++	var f := FileAccess.open(MP8_LAYOUT_FILE, FileAccess.WRITE)
++	if f == null:
++		push_warning("[MP8] 叉车认证：写不了 %s（错误 %d）" % [
++			MP8_LAYOUT_FILE, FileAccess.get_open_error()
++		])
++		return false
++
++	f.store_line("# 叉车认证（mp8game=16）出生点表 —— 两人一队，一块送货区两个位")
++	f.store_line("# 一行一个点：x, z, 朝向度数。**顺序不能乱**：")
++	f.store_line("#   第 1、2 行 = 0 号区那一队（主位、副位），第 3、4 行 = 1 号区，以此类推。")
++	f.store_line("#   区的顺序就是场景里 DropAreas 的子节点顺序。")
++	f.store_line("# 删掉本文件 = 回到内置值（主位=场景原版那 4 个点，副位=主位朝场地中心挪 %.1f 米）。" % MP8_MATE_OFFSET)
++	f.store_line("# 可以直接用记事本改。存于 %s" % Time.get_datetime_string_from_system())
++	f.store_line("")
++	for i in _mp8_spawns.size():
++		var r: Array = _mp8_spawns[i]
++		var p: Vector3 = r[0]
++		f.store_line("%.2f, %.2f, %.0f    # 区%d %s" % [
++			p.x, p.z, float(r[1]), i / MP8_TEAM_SIZE,
++			("主位" if i % MP8_TEAM_SIZE == 0 else "副位")
++		])
++	f.close()
++
++	print("[MP8] 叉车认证：出生点表已存盘（%d 个）→ %s" % [
++		_mp8_spawns.size(), ProjectSettings.globalize_path(MP8_LAYOUT_FILE)
++	])
++	return true
++
++
++# 局内手调 -------------------------------------------------------------------
++# 沿用碎骨者 -SpineEdit / 内部暗手 -KnifeEdit 那一套：只在 1 号窗口开，
++# 存盘落 user://，下次开局自动生效。
++
++func _mp8_edit_begin() -> void :
++
++	if _mp8_spawns.is_empty():
++		push_warning("[MP8] 叉车认证：出生点表是空的，手调模式不启动")
++		_mp8_edit_on = false
++		return
++
++	var lbl := Label.new()
++	lbl.name = "MP8ForkEditPanel"
++	lbl.set_anchors_preset(Control.PRESET_BOTTOM_LEFT)
++	lbl.offset_left = 16.0
++	lbl.offset_top = -190.0
++	lbl.offset_right = 1100.0
++	lbl.offset_bottom = -8.0
++	_mp8_style_label(lbl, Color(0.6, 0.95, 1.0))
++	_mp8_edit_layer().add_child(lbl)
++	_mp8_edit_panel = lbl
++
++	_mp8_rebuild_markers()
++	_mp8_edit_check_keys()
++	_mp8_edit_refresh()
++
++	print("[MP8] 叉车认证：出生点手调已开 —— %d 个点，来源 %s" % [
++		_mp8_spawns.size(), _mp8_spawns_src
++	])
++
++
++func _mp8_edit_layer() -> CanvasLayer :
++	if _mp8_edit_canvas == null:
++		_mp8_edit_canvas = CanvasLayer.new()
++		_mp8_edit_canvas.layer = 100
++		add_child(_mp8_edit_canvas)
++	return _mp8_edit_canvas
++
++
++# ⚠️ 必须显式指定游戏自己的字体：默认主题字体**字距是坏的**
++# （实测会把 "P3  id 104..." 显示成 "P36idc104..."）。猎鸭、残骸平台、枪械工厂都栽过。
++func _mp8_style_label(lbl: Label, color: Color) -> void :
++	var f = load("res://fonts/Terminal F4.ttf")
++	if f != null:
++		lbl.add_theme_font_override("font", f)
++	lbl.add_theme_font_size_override("font_size", 22)
++	lbl.add_theme_color_override("font_color", color)
++	lbl.add_theme_color_override("font_outline_color", Color.BLACK)
++	lbl.add_theme_constant_override("outline_size", 6)
++	lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
++
++
++func _mp8_rebuild_markers() -> void :
++
++	for m in _mp8_markers:
++		if is_instance_valid(m):
++			m.queue_free()
++	_mp8_markers.clear()
++
++	var font = load("res://fonts/Terminal F4.ttf")
++
++	for i in _mp8_spawns.size():
++
++		var root := Node3D.new()
++		root.name = "MP8ForkMarker%d" % i
++		add_child(root)
++
++		var mi := MeshInstance3D.new()
++		var box := BoxMesh.new()
++		box.size = Vector3(MP8_CAR_HX * 2.0, 0.2, MP8_CAR_HZ * 2.0)   # 按叉车碰撞盒画，好看出叠没叠
++		mi.mesh = box
++		var mat := StandardMaterial3D.new()
++		mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
++		mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
++		mat.albedo_color = Color(0.2, 1.0, 0.3, 0.45)
++		mi.material_override = mat
++		mi.position.y = 0.1
++		root.add_child(mi)
++
++		# 朝向指示：往正前方伸一小截，好确认 yaw 对不对
++		var nose := MeshInstance3D.new()
++		var nb := BoxMesh.new()
++		nb.size = Vector3(0.18, 0.18, 1.2)
++		nose.mesh = nb
++		nose.material_override = mat
++		nose.position = Vector3(0.0, 0.35, -MP8_CAR_HZ - 0.6)
++		root.add_child(nose)
++
++		var tag := Label3D.new()
++		tag.billboard = BaseMaterial3D.BILLBOARD_ENABLED
++		tag.font_size = 180
++		tag.outline_size = 36
++		tag.outline_modulate = Color.BLACK
++		tag.no_depth_test = true      # 被墙挡住也要看得见，否则找不着自己在调哪个
++		if font != null:
++			tag.font = font
++		tag.text = "%d%s" % [i / MP8_TEAM_SIZE + 1, ("A" if i % MP8_TEAM_SIZE == 0 else "B")]
++		tag.position = Vector3(0.0, 3.0, 0.0)
++		root.add_child(tag)
++
++		_mp8_markers.append(root)
++
++	_mp8_sync_markers()
++
++
++func _mp8_sync_markers() -> void :
++
++	for i in _mp8_markers.size():
++		if i >= _mp8_spawns.size():
++			break
++		var root: Node3D = _mp8_markers[i]
++		if not is_instance_valid(root):
++			continue
++		var r: Array = _mp8_spawns[i]
++		root.global_position = r[0] as Vector3
++		root.rotation_degrees = Vector3(0.0, float(r[1]), 0.0)
++
++		# 颜色 = 判据结果：选中黄，合法绿，不合法红
++		var col := Color(0.2, 1.0, 0.3, 0.45)
++		if not _mp8_spawn_ok(i):
++			col = Color(1.0, 0.25, 0.2, 0.55)
++		if i == _mp8_edit_sel:
++			col = Color(1.0, 0.95, 0.2, 0.65)
++		for c in root.get_children():
++			if c is MeshInstance3D:
++				var m = (c as MeshInstance3D).material_override
++				if m is StandardMaterial3D:
++					(m as StandardMaterial3D).albedo_color = col
++
++
++# 三条判据，全是量出来的，不是拍脑袋：
++#   1. 车要在护栏里（probe60 的 side railing_002）；
++#   2. 两台车不能叠（碰撞盒 3.0 x 6.0，留 0.2 米余量）；
++#   3. 人该生在**自己那块区**里（原版就是这样，主位离自己区 0~1.17 米）。
++func _mp8_spawn_ok(i: int) -> bool :
++
++	var p: Vector3 = (_mp8_spawns[i] as Array)[0]
++
++	if absf(p.x) > MP8_FIELD_X - MP8_CAR_HX or absf(p.z) > MP8_FIELD_Z - MP8_CAR_HZ:
++		return false
++
++	for j in _mp8_spawns.size():
++		if j == i:
++			continue
++		var q: Vector3 = (_mp8_spawns[j] as Array)[0]
++		if absf(p.x - q.x) < MP8_CAR_HX * 2.0 + 0.2 and absf(p.z - q.z) < MP8_CAR_HZ * 2.0 + 0.2:
++			return false
++
++	var area_i: int = i / MP8_TEAM_SIZE
++	if area_i < delivery_area_parent.get_child_count():
++		var c: Vector3 = (delivery_area_parent.get_child(area_i) as Node3D).global_position
++		if absf(p.x - c.x) > MP8_ZONE_HX or absf(p.z - c.z) > MP8_ZONE_HZ:
++			return false
++
++	return true
++
++
++func _mp8_edit_check_keys() -> void :
++
++	var mine: Dictionary = {
++		KEY_Q: "上一个点", KEY_E: "下一个点",
++		KEY_I: "远", KEY_K: "近", KEY_J: "左", KEY_L: "右",
++		KEY_U: "左转", KEY_O: "右转",
++		KEY_5: "步长", KEY_0: "存盘", KEY_9: "复位", KEY_8: "打报告",
++	}
++	var clash := PackedStringArray()
++
++	for action in InputMap.get_actions():
++		for ev in InputMap.action_get_events(action):
++			var k := ev as InputEventKey
++			if k == null:
++				continue
++			for code in [k.keycode, k.physical_keycode]:
++				if code != 0 and mine.has(code):
++					clash.append("%s(%s)↔动作 %s" % [
++						OS.get_keycode_string(code), mine[code], String(action)
++					])
++
++	if clash.is_empty():
++		print("[MP8] 叉车认证：手调按键与游戏 InputMap 无冲突（查了 %d 个动作）" % InputMap.get_actions().size())
++	else:
++		push_warning("[MP8] 叉车认证：手调按键和游戏动作撞车 —— %s" % ", ".join(clash))
++		print("[MP8] 叉车认证：⚠️ 按键撞车 —— %s" % ", ".join(clash))
++
++
++func _unhandled_key_input(event: InputEvent) -> void :
++
++	if not _mp8_edit_on or _mp8_spawns.is_empty():
++		return
++	var key := event as InputEventKey
++	if key == null or not key.pressed or key.echo:
++		return
++
++	var step: float = MP8_EDIT_STEPS[_mp8_edit_step_i]
++	_mp8_edit_sel = clampi(_mp8_edit_sel, 0, _mp8_spawns.size() - 1)
++
++	match key.keycode:
++
++		KEY_Q, KEY_E:
++			var d: int = (-1 if key.keycode == KEY_Q else 1)
++			_mp8_edit_sel = posmod(_mp8_edit_sel + d, _mp8_spawns.size())
++			_mp8_sync_markers()
++			_mp8_edit_refresh()
++
++		KEY_I, KEY_K, KEY_J, KEY_L:
++			# 按**屏幕方向**推，不是世界坐标轴 —— 从当前相机基向量实时算。
++			# （枪械工厂 v1 就是没这么干才把桌子摆成一坨，见坑第 25 条。）
++			var dir := Vector2.ZERO
++			match key.keycode:
++				KEY_I: dir = Vector2(0, -1)
++				KEY_K: dir = Vector2(0, 1)
++				KEY_J: dir = Vector2(-1, 0)
++				KEY_L: dir = Vector2(1, 0)
++			var world := _mp8_screen_to_world(dir)
++			var moved: Array = _mp8_spawns[_mp8_edit_sel]
++			moved[0] = (moved[0] as Vector3) + world * step
++			_mp8_sync_markers()
++			_mp8_edit_refresh()
++
++		KEY_U, KEY_O:
++			var dy: float = (- MP8_EDIT_YAW_STEP if key.keycode == KEY_U else MP8_EDIT_YAW_STEP)
++			var arr: Array = _mp8_spawns[_mp8_edit_sel]
++			arr[1] = fposmod(float(arr[1]) + dy, 360.0)
++			_mp8_sync_markers()
++			_mp8_edit_refresh()
++
++		KEY_5:
++			_mp8_edit_step_i = (_mp8_edit_step_i + 1) % MP8_EDIT_STEPS.size()
++			_mp8_edit_refresh()
++
++		KEY_0:
++			_mp8_save_layout_file()
++			_mp8_edit_refresh()
++
++		KEY_9:
++			_mp8_build_spawns()
++			_mp8_rebuild_markers()
++			_mp8_edit_refresh()
++
++		KEY_8:
++			_mp8_edit_report()
++
++
++func _mp8_screen_to_world(dir: Vector2) -> Vector3 :
++
++	var cam := get_viewport().get_camera_3d()
++	if cam == null:
++		return Vector3(dir.x, 0.0, dir.y)
++
++	var right: Vector3 = cam.global_transform.basis.x
++	var fwd: Vector3 = -cam.global_transform.basis.z
++	right.y = 0.0
++	fwd.y = 0.0
++	if right.length() < 0.001 or fwd.length() < 0.001:
++		return Vector3(dir.x, 0.0, dir.y)
++	return (right.normalized() * dir.x + fwd.normalized() * -dir.y).normalized()
++
++
++func _mp8_edit_refresh() -> void :
++
++	if _mp8_edit_panel == null or not is_instance_valid(_mp8_edit_panel):
++		return
++
++	var r: Array = _mp8_spawns[_mp8_edit_sel]
++	var p: Vector3 = r[0]
++
++	var bad := PackedStringArray()
++	for i in _mp8_spawns.size():
++		if not _mp8_spawn_ok(i):
++			bad.append("%d%s" % [i / MP8_TEAM_SIZE + 1, ("A" if i % MP8_TEAM_SIZE == 0 else "B")])
++
++	_mp8_edit_panel.text = "\n".join([
++		"[叉车认证 出生点手调]  QE 选点   IJKL 推(屏幕方向)   UO 转   5 步长   0 存盘   9 复位   8 报告",
++		"当前 %d%s（区%d %s）  x=%.2f  z=%.2f  yaw=%.0f   步长 %.2f 米" % [
++			_mp8_edit_sel / MP8_TEAM_SIZE + 1,
++			("A" if _mp8_edit_sel % MP8_TEAM_SIZE == 0 else "B"),
++			_mp8_edit_sel / MP8_TEAM_SIZE, ("主位" if _mp8_edit_sel % MP8_TEAM_SIZE == 0 else "副位"),
++			p.x, p.z, float(r[1]), MP8_EDIT_STEPS[_mp8_edit_step_i],
++		],
++		"共 %d 个点（%s）  不合格：%s" % [
++			_mp8_spawns.size(), _mp8_spawns_src,
++			("无" if bad.is_empty() else ", ".join(bad)),
++		],
++	])
++
++
++func _mp8_edit_report() -> void :
++
++	print("[MP8] 叉车认证：出生点报告（%d 个，来源 %s）" % [_mp8_spawns.size(), _mp8_spawns_src])
++	for i in _mp8_spawns.size():
++		var r: Array = _mp8_spawns[i]
++		var p: Vector3 = r[0]
++		print("   %d%s  区%d %-4s  (%7.2f, %7.2f)  yaw=%4.0f   %s" % [
++			i / MP8_TEAM_SIZE + 1, ("A" if i % MP8_TEAM_SIZE == 0 else "B"),
++			i / MP8_TEAM_SIZE, ("主位" if i % MP8_TEAM_SIZE == 0 else "副位"),
++			p.x, p.z, float(r[1]),
++			("OK" if _mp8_spawn_ok(i) else "❌ 出界/叠车/不在自己区里"),
++		])
++
++	var worst: float = INF
++	for a in _mp8_spawns.size():
++		for b in range(a + 1, _mp8_spawns.size()):
++			var pa: Vector3 = (_mp8_spawns[a] as Array)[0]
++			var pb: Vector3 = (_mp8_spawns[b] as Array)[0]
++			worst = minf(worst, Vector2(pa.x - pb.x, pa.z - pb.z).length())
++	print("   彼此最小间距 %.2f 米（车身 3.0 x 6.0）" % worst)

@@ -1,0 +1,36 @@
+diff --git a/minigames/smoke_break/states/round_play_state.gd b/minigames/smoke_break/states/round_play_state.gd
+--- a/minigames/smoke_break/states/round_play_state.gd
++++ b/minigames/smoke_break/states/round_play_state.gd
+@@ -37,6 +37,12 @@ func enter(_msg: Dictionary = {}) -> void :
+ 
+ 	while countdown_timer >= 0:
+ 
++		# [MP8] 手调座位时把倒计时冻住 —— 不然摆到一半这一轮就结束、人被枪毙了。
++		# 用 `owner.get()` 取标志位：属性不存在时返回 null，不会报错，
++		# 所以不开手调模式时这个 while 一次都不进，与原版逐值一致。
++		while owner.get("mp8_edit_paused") == true:
++			await get_tree().create_timer(0.25).timeout
++
+ 		countdown_timer -= 1
+ 		tick_rpc.rpc(countdown_timer + 1)
+ 		await get_tree().create_timer(1.0).timeout
+@@ -60,6 +66,19 @@ func update_physics(_delta: float) -> void :
+ @rpc("any_peer", "call_local", "reliable")
+ func tick_rpc(time):
+ 	timer_updated.emit(time)
++
++	# ═══════ [MP8] 2026-08-19 修：内层音效只由服务器发起 ═══════
++	#
++	# `tick_rpc` 本身是 `call_local` 广播 —— 8 个端**都会**执行到这里。
++	# 旧版没有这道 guard，于是 8 个端各自 `play_omni_rpc.rpc()` 广播一遍，
++	# 每个端最终收到 8 份。而 `play_omni_rpc` 是从 32 路池里取空闲槽的，
++	# **8 份 = 8 个声部同时响**（不是重启同一个播放器），约 +18 dB，
++	# 还带 RTT 拖尾拍成连击。倒计时 31 个 tick，整段都是这样。
++	#
++	# 加上 guard 之后：只有服务器发一次广播 → 每个端恰好播 1 次。
++	if not multiplayer.is_server():
++		return
++
+ 	SoundManager.play_omni_rpc.rpc(
+ 		"ekg_beep", 
+ 		&"MINIGAME_SFX", 

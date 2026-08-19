@@ -1,0 +1,192 @@
+diff --git a/minigames/dvd_roomba/scripts/dvd_roomba.gd b/minigames/dvd_roomba/scripts/dvd_roomba.gd
+--- a/minigames/dvd_roomba/scripts/dvd_roomba.gd
++++ b/minigames/dvd_roomba/scripts/dvd_roomba.gd
+@@ -37,9 +37,42 @@ var finished: bool = false
+ var player_count: int = 0
+ var roomba_spawned_count: int = 0
+ 
++
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] 出生点 4 → 8（2026-08-17）
++# ═══════════════════════════════════════════════════════════════════════════
++#
++# ⚠️⚠️ **通用补位在这个小游戏上会算出两个重合的点**，所以必须自己管。
++#
++# 原版 4 个 Marker 是正方形的四个角，但**场景里的排列顺序是对角交叉的**：
++#     originals[0]=(-3.54,-3.54)  [1]=(+3.54,+3.54)  [2]=(-3.54,+3.54)  [3]=(+3.54,-3.54)
++# 而容器式补位取的是"**相邻两点**的中点"（network_manager 的 `_mp8_topup`），
++# 这里的"相邻"实际取到的是**对角线**，两条对角线共享同一个中点：
++#     j=0: mid([0],[1]) = (0, 0)      ← 场地正中
++#     j=1: mid([1],[2]) = (0, +3.54)
++#     j=2: mid([2],[3]) = (0, 0)      ← 和 j=0 **完全重合**
++#     j=3: mid([3],[0]) = (0, -3.54)
++# → 8 人局有两个人叠在场地正中生成。
++#
++# T4b 已经把**数组式**那条路换成了凸包最远点插入（`_mp8_spread_inside`），
++# 但**容器式这条路还是老的取中点算法**，所以这个坑仍然在。
++# 这里不去动通用补位 —— 那条路上还挂着立足之本、残骸平台等**已验收**的小游戏，
++# 全局改法有回归风险（用户定的铁律：一次只动一个）。
++#
++# 本小游戏的摆法：**保留原版 4 角，在它们中间补 4 个，凑成正八边形**。
++# 半径和角度都从原版 4 个点**现算**（不写死 3.54 / 5.0）：
++# 新点 = 中心 + 平均半径 × (相邻两个原版角度的中分角)。
++# 原版角点到中心 5.01 米，八边形相邻间距 3.83 米，场地是 28×23 米，绰绰有余。
++var mp8_owns_spawns: bool = true
++
++
+ func _ready() -> void :
+ 	super._ready()
+ 
++	# 必须在 spawn_players() 读出生点之前建好；放 _ready() 每个端都会跑，
++	# 但这些 Marker 只有服务器会读（位置是 teleport_rpc 明发的），多建几个空节点无害。
++	_mp8_topup_spawns()
++
+ 	camera.current = true
+ 
+ 	if multiplayer.is_server():
+@@ -114,6 +147,119 @@ func spawn_players():
+ 
+ 		counter += 1
+ 
++# [MP8] 结算时把名次/名字/得分打进日志（不改任何分数）。
++# 格式与残骸平台、碎骨者、吃豆子一致，几个名次制小游戏对照着看方便。
++# ⚠️ 特别把「在场人数」和「阵亡人数」都打出来：两者差值 > 1 就说明有人掉线，
++# 而掉线正是本次唯一要修的东西 —— 不打出来没法验证修没修对。
++func _mp8_log_scores() -> void :
++
++	if not multiplayer.is_server():
++		return
++
++	var keys: Array = player_scores.keys()
++	keys.sort_custom(func(a, b): return player_scores[a] > player_scores[b])
++
++	var parts: PackedStringArray = []
++	for i in keys.size():
++		var nid = keys[i]
++		var nm: String = "id%d" % nid
++		if PlayerManager.player_presences.has(nid):
++			nm = String(PlayerManager.player_presences[nid].network_name)
++		parts.append("第%d名 %s %d分" % [i + 1, nm, player_scores[nid]])
++
++	print("[MP8] 致命反弹结算（开局 %d 人 / %d 人阵亡 / 幸存者拿 %d 分）：%s" % [
++		player_count, dead_players.size(), dead_players.size() + 1, " / ".join(parts)
++	])
++
++
++# [MP8] 把出生点补到 8 个，摆成正八边形。原版 4 个一个字节不动。
++#
++# ⚠️ 只补不够的数量：万一以后场景自己就给了 8 个，这里不重复补。
++# ⚠️ 全部从原版点**现算**，不写死坐标 —— 场景挪了位置这段也跟着对。
++func _mp8_topup_spawns() -> void :
++
++	if player_spawn_parent_node == null:
++		push_warning("[MP8] 致命反弹：没有出生点容器，8 席不做")
++		return
++
++	var originals: Array = []
++	for c in player_spawn_parent_node.get_children():
++		if c is Node3D:
++			originals.append(c)
++
++	var n: int = originals.size()
++	if n == 0 or n >= 8:
++		return
++
++	# 中心 = 原版点的形心；半径 = 到形心的平均距离
++	var center: Vector3 = Vector3.ZERO
++	for o in originals:
++		center += o.position
++	center /= float(n)
++
++	var radius: float = 0.0
++	for o in originals:
++		radius += Vector2(o.position.x - center.x, o.position.z - center.z).length()
++	radius /= float(n)
++
++	# 原版各点的角度，排序后取相邻两个的中分角当新点方向
++	var angles: Array = []
++	for o in originals:
++		angles.append(atan2(o.position.z - center.z, o.position.x - center.x))
++	angles.sort()
++
++	var added := PackedStringArray()
++
++	for i in angles.size():
++
++		if originals.size() + added.size() >= 8:
++			break
++
++		var a: float = angles[i]
++		var b: float = float(angles[(i + 1) % angles.size()])
++		if b <= a:
++			b += TAU                       # 跨过 -π/π 那一段，别算出反方向
++		var mid: float = (a + b) * 0.5
++
++		var p: Vector3 = Vector3(
++			center.x + cos(mid) * radius,
++			originals[0].position.y,
++			center.z + sin(mid) * radius
++		)
++
++		# 模板取离新点最近的原版点：旋转/缩放/脚本就近继承
++		var tmpl: Node3D = originals[0]
++		var best: float = INF
++		for o in originals:
++			var d: float = o.position.distance_to(p)
++			if d < best:
++				best = d
++				tmpl = o
++
++		var dup: Node3D = tmpl.duplicate()
++		dup.name = "MP8Spawn%d" % (n + added.size())
++		player_spawn_parent_node.add_child(dup)
++		dup.position = p
++		added.append("(%.2f, %.2f)" % [p.x, p.z])
++
++	# 自检：把最小间距打出来。**两点重合正是这类补位最典型的坏法**
++	# （原版容器补位在本小游戏上就会算出两个 (0,0)，见本文件顶部那段），
++	# 光看"4 -> 8 成功"这行日志是看不出来的。
++	var pts: Array = []
++	for c in player_spawn_parent_node.get_children():
++		if c is Node3D:
++			pts.append(c.position)
++
++	var min_d: float = INF
++	for i in pts.size():
++		for j in range(i + 1, pts.size()):
++			min_d = minf(min_d, Vector2(pts[i].x - pts[j].x, pts[i].z - pts[j].z).length())
++
++	print("[MP8] 致命反弹：出生点 %d → %d（中心 (%.2f, %.2f) 半径 %.2f，最小间距 %.2f 米）新增 %s" % [
++		n, pts.size(), center.x, center.z, radius, min_d, " ".join(added)
++	])
++
++
+ func spawn_roomba():
+ 	var spawn_positions = roomba_spawn_parent_node.get_children()
+ 	var position = spawn_positions.pick_random()
+@@ -149,11 +295,24 @@ func check_game_end():
+ 		player_scores[dead_players[i]] = i
+ 
+ 	for network_id in active_players.keys():
+-		player_scores[network_id] = player_count
+ 
++		# [MP8] 幸存者：`player_count` → **`dead_players.size() + 1`**
++		# （用户 2026-08-17 定：**这个游戏不压平，只堵掉线洞**）
++		#
++		# ⚠️ **`+1` 不能省** —— 省了就变成压平了，那是另一回事：
++		#   没人掉线时 dead = 人数−1，加 1 正好等于 player_count，**与原版逐值一致**，
++		#   冠亚之间那 2 分的断层原样保留（残骸平台 T13 / 碎骨者 T24 是特意去掉它，
++		#   本局和立足之本 T23 一样**保留**）。
++		#
++		# 那修的是什么：中途掉线的人在 `remove_player_rpc` 里只被
++		# `active_players.erase()`，**不会进 dead_players**。原版用 player_count，
++		# 那时它比真正参与结算的人数大 → 冠军凭空多拿分。改用死亡人数推
++		# = "比最后一个死的多 2 分"，掉线多少人都对。
++		player_scores[network_id] = dead_players.size() + 1
+ 
+ 		break
+ 
++	_mp8_log_scores()          # [MP8] 只读，纯为事后对账
+ 	player_scores_finalized.emit(player_scores)
+ 
+ 	await get_tree().create_timer(2.0).timeout

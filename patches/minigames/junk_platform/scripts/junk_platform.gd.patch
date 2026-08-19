@@ -1,0 +1,1095 @@
+diff --git a/minigames/junk_platform/scripts/junk_platform.gd b/minigames/junk_platform/scripts/junk_platform.gd
+--- a/minigames/junk_platform/scripts/junk_platform.gd
++++ b/minigames/junk_platform/scripts/junk_platform.gd
+@@ -30,21 +30,297 @@ var finished: bool = false
+ 
+ var player_count: int = 0
+ 
++# [MP8] ===== 残骸平台扩到 8 个 =====
++#
++# 这个小游戏是**每人一个实体平台**，不是补个出生点就行的那种：
++# 一个平台 = Area3D 碰撞体 + 平台视觉件 + 损伤指示圈 + 压缩机 + 警报音源，共 5 组节点。
++#
++# ---- 场景是怎么搭的（逆向出来的，改之前必读）----
++#
++# 1. **平台碰撞体是静止的，视觉件挂在会旋转的 `visuals base` 上**。
++#    对面那半玩家把 `camera_base` 和 `visuals_base` 一起绕 Y 转 180°，
++#    于是 1 号平台底下换成了对角那个平台的视觉件——所以脚本里要重新指认
++#    （`platform_visuals` → `platform_visuals_flipped`）。**翻转配对 = 正对角。**
++#
++# 2. **编号不可信，位置才可信**：`platform main parent1` 并不在 `Platform1` 底下
++#    （实测 parent1 在 (-13,+13)，而 Platform1 在 (-13,-13)），
++#    而且对角两个平台**互相引用同一批视觉件**（1 引用 1 和 3，3 引用 3 和 1）。
++#    所以搬家**必须按空间位置认组**，不能按编号认，否则会把同一个节点搬两次。
++#
++# 3. `junk platform compactors` 这个父节点自带 -90° 旋转，
++#    压缩机的局部坐标要乘上父变换才是世界坐标（换算后每台确实在对应平台正上方）。
++#
++# ---- 布局（2026-08-16 用户定案）----
++#
++# 原版 4 个平台在 (±13, 0, ±13)、半径 6，彼此间距 26（边缘空隙 14）——是**孤岛**。
++#
++# ⚠️ 初版排成"两排各 4 个"（z=±13，x=±6.5/±19.5）：功能全正常，但间距压到 13、
++#    边缘只剩 1 的空隙，**人一步就能走到别人的平台上**，孤岛感没了。
++#
++# 定案（用户 2026-08-16）：**八边形** —— 原版那 4 个一动不动，
++# 新增 4 个摆在 0°/90°/180°/270° 方位、半径 MP8_NEW_RADIUS 处，
++# 并各自绕 Y 转 45° 让朝向和站位一致。半径 22.5 时相邻边缘间隙约 4.1（初版是 1.0），走不过去。
++#
++# ⚠️⚠️ **相机一律保持原版，一个字都不改**（用户 2026-08-16 明确要求，等他的反馈再说）。
++# 上一版的"自动后拉构图"已经**默认关掉**，只在传 mp8junkcam 时才跑（见 _mp8_pull_camera_back）。
++# 上一版为什么被否：自动构图是沿视线后退的，而视线俯角 34.5°，
++# 退 9 个单位就把相机抬到 y≈28、高过压缩机顶端 y≈27，顶盖糊在画面上方挡视野。
++#
++# 相机不动的代价是**构图余量由原版决定，不能再靠拉相机去凑**：
++# 原版近侧那排平台（z=+13）中心已经压在画面下边界附近，
++# 所以圆环半径一大，正前方那个平台就会掉到画面外面去。
++# `_mp8_report_camera()` 会把每个平台在两种朝向下的"进没进画面"直接打进日志，
++# 不用靠人盯着画面猜。半径可以用命令行 mp8junkr=<半径> 临时改，不用重新编译。
++
++# 新平台所在半径。原版四角在 √(13²+13²) = 18.38 处。
++# 半径越大离得越开，但正前方那个平台也越贴近相机（相机在 z=27.66）：
++#   18.38（同一个圆）→ 相邻间隙仅 2.1，可能还是能走过去
++#   22.5            → 间隙 4.1，基本走不过去
++# ⚠️ 相机现在不动了，所以这个值是**唯一的旋钮**，构图好不好全看它。
++# 命令行 mp8junkr=<半径> 可临时覆盖，不用重新编译（配合日志里的 [MP8-CAM] 体检行调）。
++const MP8_NEW_RADIUS: float = 22.5
++
++# 新平台绕 Y 转 45°，让它的朝向和"站在 45° 方位"这件事一致（用户要求）
++const MP8_NEW_YAW_DEGREES: float = 45.0
++
++# 玩家落位：platforms[i] ↔ 出生点[i] ↔ 第 i 个玩家，而 platforms 的顺序是
++# **原版 4 个在前、复制件在后**，所以边界情况天然分成两半：
++#   P1~P4 = 原版四角平台（原始节点，位置一动没动）
++#   P5~P8 = 新增的 45° 方位平台（复制件 + 转了 45°）
++# 于是"只有复制件坏"的症状就是 P5~P8 全出问题，和"某一侧坏"区分得很干净。
++# P8 还占着数组末位，按下标索引的越界会先打在他身上。
++
++var _mp8_expanded: bool = false
++
++
++# [MP8] ===== 调试设施：右上角"我是谁" + 数字键切落石速度 =====
++#
++# 1. **右上角玩家 id**：8 开的时候光看画面分不清哪个窗口是谁
++#    （平台名牌能看出"这个平台是谁的"，但看不出"我正在操作的是谁"）。
++# 2. **数字键切落石速度**：原版落石节奏很快（3 秒一批、10 秒内加速到 1 秒一批），
++#    想看清楚指示圈/塌陷/压缩机根本来不及。用户 2026-08-16 要求把倍数交给按钮控制。
++#
++# ⚠️ 落石计时器**只在服务器上跑**（junk_handler 里 `if multiplayer.is_server()` 才连 timeout），
++# 所以按键必须走 RPC 通知服务器，客户端自己改本地的值没有任何效果。
++
++const MP8_JUNK_SPEED_KEYS: Dictionary = {
++	KEY_1: 1.0,    # 原速
++	KEY_2: 2.0,    # 2 倍慢
++	KEY_3: 5.0,    # 5 倍慢
++	KEY_4: 10.0,   # 10 倍慢
++	KEY_5: 0.0,    # 暂停落石
++}
++
++# [MP8] 调试辅助总开关（用户 2026-08-16 要求：收尾时这三样必须关掉）。
++# 管三样东西：① 数字键切落石速度 ② 右上角"我是谁" ③ 平台头顶名牌。
++# 跟着 `-debug-tools` 走 —— 测试台一定带它，**发布版一定不带**，所以正式游玩天然是干净的。
++# 想在测试台上也关掉看正式效果：传 `mp8nojunkdebug`。
++var _mp8_debug_aids: bool = false
++var _mp8_junk_keys: bool = false
++var _mp8_junk_mult: float = 1.0
++var _mp8_junk_base_interval: float = 0.0
++var _mp8_junk_base_min: float = 0.0
++var _mp8_debug_canvas: CanvasLayer = null
++var _mp8_id_label: Label = null
++var _mp8_junk_label: Label = null
++
++
+ func _ready() -> void :
+ 	super._ready()
+ 
++	# [MP8] ⚠️ 开关必须在 _mp8_expand_platforms() **之前**算好：
++	# 平台头顶名牌是在扩平台那一步里建的，晚了就来不及拦。
++	_mp8_init_flags()
++
+ 	camera.current = true
+ 
++	# [MP8] 扩平台。**必须在 spawn_players() 之前跑完**——出生点是从平台位置推的，
++	# 而垃圾的掉落点又是从出生点推的（add_spawn_point(id, 出生点 + 20米)）。
++	if not Array(OS.get_cmdline_args()).has("mp8noexpand"):
++		_mp8_expand_platforms()
++
+ 	if multiplayer.is_server():
+ 
+ 		countdown_state.countdown_started.connect(_on_countdown_started)
+ 		countdown_state.tick.connect(_on_countdown_tick)
+ 		countdown_state.expired.connect(_on_countdown_expired)
+ 
++	# [MP8] 调试设施。落石基准值必须在这里记下来——后面按键是"原值 × 倍数"，
++	# 不记基准的话反复按会变成连乘（按两次 5 倍就成了 25 倍）。
++	_mp8_init_debug()
++
+ 	if GameManager.local_game:
+ 		await get_tree().create_timer(1.0).timeout
+ 		minigame_ready.emit(1)
+ 
++
++# [MP8] 调试辅助开关，必须在建任何 HUD / 名牌之前算好
++func _mp8_init_flags() -> void :
++
++	var args: Array = Array(OS.get_cmdline_args())
++	_mp8_debug_aids = (args.has("-debug-tools") or args.has("mp8junkdebug")) \
++		and not args.has("mp8nojunkdebug")
++	_mp8_junk_keys = _mp8_debug_aids or args.has("mp8junkkeys")
++
++
++# [MP8] 调试设施初始化：记基准值、建 HUD
++func _mp8_init_debug() -> void :
++
++	if junk_handler != null:
++		_mp8_junk_base_interval = junk_handler.spawn_interval
++		_mp8_junk_base_min = junk_handler.min_spawn_interval
++
++	# 起始倍数：命令行 mp8junkslow=<倍率> 优先；没传就在调试台默认 5 倍慢
++	# （用户 2026-08-16："把石头的倒计时拉长 5 倍"），发布版不带 -debug-tools 则保持原速。
++	var v: String = _mp8_arg("mp8junkslow=")
++	if v.is_valid_float():
++		_mp8_junk_mult = float(v)
++	elif _mp8_junk_keys:
++		_mp8_junk_mult = 5.0
++
++	if multiplayer.is_server():
++		_mp8_apply_junk_speed()
++
++	_mp8_show_id_hud()
++	_mp8_update_junk_hud()
++
++
++# [MP8] 调试覆盖层，右上角 id 和落石速度提示共用一个
++func _mp8_debug_layer() -> CanvasLayer:
++	if _mp8_debug_canvas == null:
++		_mp8_debug_canvas = CanvasLayer.new()
++		_mp8_debug_canvas.layer = 100
++		add_child(_mp8_debug_canvas)
++	return _mp8_debug_canvas
++
++
++# [MP8] 给调试 Label 套上游戏自己的字体。
++# ⚠️ 不套的话用的是默认主题字体，**字距是坏的**：实测字会挤成一团
++# （"P3  id 104..." 显示成 "P36idc104..."），空格换半角也没用。见猎鸭那边同样的坑。
++func _mp8_style_label(lbl: Label, color: Color) -> void :
++
++	var f = load("res://fonts/Terminal F4.ttf")
++	if f != null:
++		lbl.add_theme_font_override("font", f)
++	lbl.add_theme_font_size_override("font_size", 26)
++	lbl.add_theme_color_override("font_color", color)
++	lbl.add_theme_color_override("font_outline_color", Color.BLACK)
++	lbl.add_theme_constant_override("outline_size", 6)
++	lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
++
++
++# [MP8] 右上角常驻显示"我是谁"：玩家名 + 网络 id。
++#
++# 这是**第一人称 HUD**，每台机器只显示自己那个人。
++# 名字要等 PlayerManager 填好，_ready 时不一定拿得到，所以
++# spawn_players 广播名牌时会再调一次刷新（见 mp8_set_platform_labels_rpc）。
++func _mp8_show_id_hud() -> void :
++
++	# [MP8] 收尾要求（用户 2026-08-16）：正式游玩不显示，只在调试台出现
++	if not _mp8_debug_aids:
++		return
++
++	if _mp8_id_label == null:
++		var lbl := Label.new()
++		lbl.set_anchors_preset(Control.PRESET_TOP_RIGHT)
++		lbl.offset_left = -420.0
++		lbl.offset_top = 12.0
++		lbl.offset_right = -16.0
++		lbl.offset_bottom = 52.0
++		lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
++		_mp8_style_label(lbl, Color(1.0, 0.95, 0.4))
++		_mp8_debug_layer().add_child(lbl)
++		_mp8_id_label = lbl
++
++	var me: int = multiplayer.get_unique_id() if multiplayer.has_multiplayer_peer() else 0
++	var who: String = ""
++	if PlayerManager.player_presences.has(me):
++		who = String(PlayerManager.player_presences[me].network_name)
++
++	if who == "":
++		_mp8_id_label.text = "id %d" % me
++	else:
++		_mp8_id_label.text = "%s   id %d" % [who, me]
++
++
++# [MP8] 落石速度提示（只有开了调试键才显示，免得挡正式游玩的画面）
++func _mp8_update_junk_hud() -> void :
++
++	if not _mp8_junk_keys:
++		return
++
++	if _mp8_junk_label == null:
++		var lbl := Label.new()
++		lbl.set_anchors_preset(Control.PRESET_TOP_WIDE)
++		lbl.offset_top = 12.0
++		lbl.offset_bottom = 52.0
++		lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
++		_mp8_style_label(lbl, Color(0.6, 0.9, 1.0))
++		_mp8_debug_layer().add_child(lbl)
++		_mp8_junk_label = lbl
++
++	var state: String
++	if _mp8_junk_mult <= 0.0:
++		state = "暂停落石"
++	elif is_equal_approx(_mp8_junk_mult, 1.0):
++		state = "原速（%.1f 秒一批）" % _mp8_junk_base_interval
++	else:
++		state = "%.0f 倍慢（%.1f 秒一批）" % [_mp8_junk_mult, _mp8_junk_base_interval * _mp8_junk_mult]
++
++	_mp8_junk_label.text = "[落石调试] %s    1=原速 2=2倍慢 3=5倍慢 4=10倍慢 5=暂停" % state
++
++
++# [MP8] 数字键切落石速度。
++# 按键在**任何一台机器**上都能按，但真正生效的是服务器上的计时器，所以走 RPC 广播。
++func _unhandled_key_input(event: InputEvent) -> void :
++
++	if not _mp8_junk_keys:
++		return
++	var key := event as InputEventKey
++	if key == null or not key.pressed or key.echo:
++		return
++	if not MP8_JUNK_SPEED_KEYS.has(key.keycode):
++		return
++
++	mp8_set_junk_speed_rpc.rpc(float(MP8_JUNK_SPEED_KEYS[key.keycode]))
++	get_viewport().set_input_as_handled()
++
++
++# [MP8] any_peer：谁按的键谁发起；call_local 让按键那台自己也立刻刷新 HUD。
++# 每台机器都收到 → 8 个窗口的提示行保持一致，不会出现"我按了但别人那儿还是旧值"。
++@rpc("any_peer", "call_local", "reliable")
++func mp8_set_junk_speed_rpc(mult: float) -> void :
++
++	_mp8_junk_mult = mult
++	if multiplayer.is_server():
++		_mp8_apply_junk_speed()
++	_mp8_update_junk_hud()
++	print("[MP8] 落石速度 -> %s" % [
++		"暂停" if mult <= 0.0 else ("%.0f 倍慢" % mult if mult > 1.0 else "原速")
++	])
++
++
++# [MP8] 真正改计时器的地方，**只有服务器跑**。
++# 倍数同时作用在 spawn_interval 和 min_spawn_interval 上：
++# 原版是"开局 3 秒一批，10 秒内线性加速到 1 秒一批"，两个端点一起乘才是整条曲线放慢，
++# 只乘起点的话照样会在 10 秒后加速到 1 秒一批，等于没调。
++func _mp8_apply_junk_speed() -> void :
++
++	if junk_handler == null or _mp8_junk_base_interval <= 0.0:
++		return
++
++	if _mp8_junk_mult <= 0.0:
++		if junk_handler.timer != null:
++			junk_handler.timer.stop()
++		return
++
++	junk_handler.spawn_interval = _mp8_junk_base_interval * _mp8_junk_mult
++	junk_handler.min_spawn_interval = _mp8_junk_base_min * _mp8_junk_mult
++
++	# 计时器已经按旧间隔跑着了，不重启的话这一轮还是旧节奏（按下去像没反应）
++	if junk_handler.active and junk_handler.timer != null:
++		junk_handler.timer.start(junk_handler.spawn_interval)
++
+ func fade_in_ambience():
+ 	for speaker_controller in ambience_speaker_controllers:
+ 		speaker_controller.speaker.volume_linear = 0
+@@ -71,6 +347,638 @@ func initialize(_round_number: int, _total_rounds: int, _scores: Dictionary = {}
+ 
+ 	state_machine.transition_to_rpc.rpc(&"Round", {"round": _round_number, "total": _total_rounds})
+ 
++# [MP8] 把 4 个平台扩成 MAX_PLAYERS 个。
++func _mp8_expand_platforms() -> void :
++
++	if _mp8_expanded:
++		return
++	var target: int = NetworkManager.MAX_PLAYERS
++	var n: int = platforms.size()
++	if n == 0 or n >= target:
++		return
++	_mp8_expanded = true
++
++	# ---- 1. 按空间位置把"每个平台的一整套家当"认出来 ----
++	# 不按编号认（见文件头第 2 条）：编号对不上，而且对角平台互相引用同一批节点。
++	var groups: Array = []
++	for p in platforms:
++		groups.append({"platform": p, "nodes": [], "pos": p.global_position})
++
++	for parent_path in [
++		"visuals base/junk platform visuals2",
++		"visuals base/damage indicators",
++		"junk platform compactors",
++	]:
++		var parent: Node = get_node_or_null(parent_path)
++		if parent == null:
++			continue
++		for child in parent.get_children():
++			if child is Node3D:
++				_mp8_assign_to_nearest(groups, child)
++
++	# 警报音源是根节点下的散件（speaker_indicator alarm1..4）
++	for child in get_children():
++		if child is Node3D and String(child.name).begins_with("speaker_indicator alarm"):
++			_mp8_assign_to_nearest(groups, child)
++
++	# ---- 2. 复制出缺的那几套 ----
++	# 复制整组并**整体平移**，这样组内的相对关系（压缩机在平台正上方等）自动保持，
++	# 不需要知道任何绝对偏移量——就是大厅排布那条血泪教训（坑第 8 条）。
++	var all_groups: Array = groups.duplicate()
++	for i in range(n, target):
++		var src: Dictionary = groups[i % n]
++		var clone: Dictionary = {"nodes": [], "pos": src["pos"]}
++
++		var dup_platform: JunkPlatformPlatform = src["platform"].duplicate()
++		dup_platform.name = "MP8Platform%d" % (i + 1)
++		src["platform"].get_parent().add_child(dup_platform)
++		dup_platform.global_position = src["platform"].global_position
++		clone["platform"] = dup_platform
++		platforms.append(dup_platform)
++
++		for node in src["nodes"]:
++			var dup_node: Node3D = node.duplicate()
++			dup_node.name = "MP8_%d_%s" % [i + 1, node.name]
++			node.get_parent().add_child(dup_node)
++			dup_node.transform = node.transform
++			clone["nodes"].append(dup_node)
++
++		all_groups.append(clone)
++
++	# ---- 3. 搬位置 ----
++	# 原版那 4 个**一动不动**（delta = 0），只有新增的 4 个要搬到 45° 方位上。
++	var original_positions: Array = []
++	for g in groups:
++		original_positions.append(g["pos"])
++	var slots: Array[Vector3] = _mp8_slot_positions(original_positions)
++
++	for i in all_groups.size():
++		if i >= slots.size():
++			break
++		var g: Dictionary = all_groups[i]
++		var delta: Vector3 = slots[i] - g["pos"]
++		delta.y = 0.0
++		if delta.length() < 0.01:
++			continue  # 原版那几个，不动
++
++		# 新平台还要绕场地中心转 45°，让它的朝向和站位一致（用户要求）。
++		# 整组一起转：绕 Y 轴旋转后再平移，组内相对关系（压缩机在正上方）保持不变。
++		var yaw: float = deg_to_rad(MP8_NEW_YAW_DEGREES)
++		_mp8_move_group(g, slots[i], yaw)
++
++	_mp8_report_gaps(slots)
++	_mp8_check_pairing(slots)
++
++	# ---- 4. 重新接线：自己那套 + 对角那套 ----
++	# ⚠️ duplicate() 不会重映射指向别处的 @export 引用（坑第 14 条），
++	# 不接的话 8 个平台会全指向原来那 4 套，塌一个亮一片。
++	for i in all_groups.size():
++		# ⚠️ 配对**必须按位置算**，不能用下标算术（本文件开头第 2 条：编号不可信，位置才可信）。
++		# 曾经写成 `(i + size/2) % size`，在八边形的槽位顺序下是错的：
++		#   0:(-13,-13) 1:(13,-13) 2:(13,13) 3:(-13,13) 4:(0,22.5) 5:(22.5,0) 6:(0,-22.5) 7:(-22.5,0)
++		# i+4 会把 0 配给 4，即 (-13,-13) 配 (0,22.5)，**根本不是 180° 对位**。
++		# 正确的是 0↔2、1↔3、4↔6、5↔7。
++		var partner: int = _mp8_opposite_index(slots, i)
++		_mp8_wire_platform(all_groups[i], all_groups[partner])
++
++		# 接线明细进日志：指示圈接的是哪个节点、有几个环。
++		# "我的圈跟着别人的垃圾亮"只有对着这行才判得出来，光看画面分不清是接错还是原版就这样。
++		var pl: JunkPlatformPlatform = all_groups[i]["platform"]
++		var own_i: Node3D = _mp8_pick(all_groups[i], "damage indicator")
++		var far_i: Node3D = _mp8_pick(all_groups[partner], "damage indicator")
++		print("[MP8-WIRE] 平台%d (%.0f,%.0f) 环数=%d 自己的圈=%s 翻转后的圈=%s(平台%d)" % [
++			i + 1, slots[i].x, slots[i].z, pl.damage_circles.size(),
++			"无" if own_i == null else own_i.name,
++			"无" if far_i == null else far_i.name, partner + 1
++		])
++
++	# ---- 5. 出生点补到一样多，顺序和平台一一对应 ----
++	_mp8_rebuild_spawn_points(slots)
++
++	# ---- 6. 相机构图 ----
++	# 先记下**原版相机**：此刻 camera_base 还没被转 180°，这是唯一干净的基准，
++	# 逐人模式判"谁的平台顶到边缘"要用它。
++	if camera != null:
++		_mp8_cam_xf0 = camera.global_transform
++		_mp8_cam_fov0 = camera.fov
++
++	# 默认**全场统一**后拉+下移+广角（用户 2026-08-16 选定的那一版）。
++	# 在这里做而不是逐人发 RPC，是因为偏移加在 camera_base 的**局部**空间里，
++	# 之后 camera_base 转 180° 时偏移跟着一起转，两边天然对称，不需要知道谁在哪边。
++	if not Array(OS.get_cmdline_args()).has("mp8junkcamper"):
++		var c: Vector3 = _mp8_cam_values()
++		_mp8_apply_camera(c.x, c.y, c.z)
++
++	# 构图好不好不靠肉眼猜——体检结果直接进日志。
++	_mp8_report_camera(all_groups, slots)
++
++	# ---- 7. 每个平台上方挂个名牌 ----
++	_mp8_build_platform_labels()
++
++	print("[MP8] 残骸平台：%d -> %d 个（原版四角不动 + 45°方位新增 4 个，半径 %.1f，相机保持原版）" % [
++		n, platforms.size(), _mp8_radius()
++	])
++
++
++# [MP8] 每个平台上方挂一个名牌。
++#
++# 4 个平台时不需要这东西：你的相机把你的平台摆在正前方，一眼就认得出。
++# 8 个平台时同一排挤了 4 个，光靠位置认不出哪个是自己的，所以补一个。
++#
++# 高度 8：玩家站在平台上（人高约 2），压缩机静止位在 27 米高、砸下来会经过中间，
++# 挂 8 米既在人头顶上方、又不会被压缩机顶到画面外。
++# 挂成平台的**子节点**，于是平台塌陷（visible=false）时名牌跟着消失，不用另外管。
++const MP8_LABEL_HEIGHT: float = 8.0
++const MP8_LABEL_FONT_SIZE: int = 96
++
++var _mp8_platform_labels: Array[Label3D] = []
++var _mp8_label_names: Array = []   # 服务器在 spawn_players 里填，填完广播
++
++
++func _mp8_build_platform_labels() -> void :
++
++	_mp8_platform_labels.clear()
++
++	# ⚠️ **`_mp8_label_names` 必须无条件撑到平台数**，哪怕名牌关掉也一样。
++	# `spawn_players()` 里是 `_mp8_label_names[nearest] = 名字` 按下标写的，
++	# 数组空着就是越界写 —— 正是坑第 13 条那个模式（发行版模板不带边界检查，
++	# 越界写直接是 0xc0000005 原生崩溃）。
++	_mp8_label_names.clear()
++	for p in platforms:
++		_mp8_label_names.append("")
++
++	# [MP8] 收尾要求（用户 2026-08-16）：平台头顶名牌正式游玩不显示，只在调试台出现。
++	# 代价是 8 个平台时光靠位置认不出哪个是自己的（这正是当初加名牌的理由），
++	# 用户看过画面后决定不要，按他的定。
++	if not _mp8_debug_aids:
++		return
++
++	for p in platforms:
++		var lbl := Label3D.new()
++		lbl.name = "MP8NameLabel"
++		lbl.text = ""
++		lbl.billboard = BaseMaterial3D.BILLBOARD_ENABLED  # 两侧玩家的相机差 180°，必须始终朝向观者
++		lbl.font_size = MP8_LABEL_FONT_SIZE
++		lbl.outline_size = 24
++		lbl.modulate = Color(1.0, 0.95, 0.4)
++		lbl.outline_modulate = Color.BLACK
++		var f = load("res://fonts/Terminal F4.ttf")
++		if f != null:
++			lbl.font = f
++		p.add_child(lbl)
++		lbl.position = Vector3(0.0, MP8_LABEL_HEIGHT, 0.0)
++		_mp8_platform_labels.append(lbl)
++
++
++# [MP8] 服务器算好"第 i 个平台归谁"，广播给所有人。
++# 名牌本身在每台机器的 _ready 里就建好了，这里只发文字。
++@rpc("authority", "call_local", "reliable")
++func mp8_set_platform_labels_rpc(names: Array) -> void :
++
++	for i in _mp8_platform_labels.size():
++		if i < names.size():
++			_mp8_platform_labels[i].text = String(names[i])
++		else:
++			_mp8_platform_labels[i].text = ""
++
++	# [MP8] 这时 PlayerManager 一定已经填好了，顺便把右上角的"我是谁"刷成带名字的版本
++	_mp8_show_id_hud()
++
++
++# [MP8] 把一整组家当搬到新位置，并绕自身中心转 yaw。
++# 先绕组的原中心旋转、再整体平移 —— 这样组内相对关系（压缩机在平台正上方、
++# 指示圈套在平台上）完全保持，不需要知道任何绝对偏移量。
++func _mp8_move_group(g: Dictionary, target: Vector3, yaw: float) -> void :
++
++	var center: Vector3 = g["pos"]
++	var basis_rot := Basis(Vector3.UP, yaw)
++
++	var nodes: Array = [g["platform"]]
++	nodes.append_array(g["nodes"])
++
++	for node in nodes:
++		var offset: Vector3 = node.global_position - center
++		offset = basis_rot * offset
++		node.global_position = target + offset
++		node.global_transform.basis = basis_rot * node.global_transform.basis
++
++
++# [MP8] 把相邻平台之间的**边缘间隙**打进日志。
++# 这是"能不能走到别人平台上"的直接判据：初版间隙只有 1，人一步就跨过去了。
++func _mp8_report_gaps(slots: Array[Vector3]) -> void :
++
++	var radius: float = 6.0
++	if junk_handler != null and "platform_radius" in junk_handler:
++		radius = junk_handler.platform_radius
++
++	var min_gap: float = 1e20
++	for i in slots.size():
++		for j in range(i + 1, slots.size()):
++			var d: float = Vector2(
++				slots[i].x - slots[j].x, slots[i].z - slots[j].z
++			).length()
++			min_gap = minf(min_gap, d - radius * 2.0)
++
++	print("[MP8] 平台最小边缘间隙 %.2f（原版四角之间是 %.2f，间隙太小人能走过去）" % [
++		min_gap, 26.0 - radius * 2.0
++	])
++
++
++# [MP8] 把一个节点归给离它最近的平台（只看水平距离，压缩机在 28 米高空）
++func _mp8_assign_to_nearest(groups: Array, node: Node3D) -> void :
++
++	var best: int = -1
++	var best_dist: float = 1e20
++	var np: Vector3 = node.global_position
++	for i in groups.size():
++		var gp: Vector3 = groups[i]["pos"]
++		var d: float = Vector2(np.x - gp.x, np.z - gp.z).length()
++		if d < best_dist:
++			best_dist = d
++			best = i
++	# 离最近的平台还超过一个平台直径，说明是场地公共件（灯光、地面），不归任何平台
++	if best >= 0 and best_dist < 12.0:
++		groups[best]["nodes"].append(node)
++
++
++# [MP8] 8 个槽位的世界坐标。
++# 前 4 个 = 原版四角**原地不动**（保持"孤岛"间距 26）；
++# 后 4 个 = 在 45° 方位、半径 MP8_NEW_RADIUS 处。
++# 顺序必须和 platforms 数组一致（原始 4 个在前、复制件在后）。
++func _mp8_slot_positions(original_positions: Array) -> Array[Vector3]:
++
++	var out: Array[Vector3] = []
++
++	for p in original_positions:
++		out.append(Vector3(p.x, 0.0, p.z))
++
++	# 原版四角在 ±45°、±135°；新的插在 0°、90°、180°、270°
++	var r: float = _mp8_radius()
++	for k in 4:
++		var angle: float = deg_to_rad(90.0 * float(k))
++		out.append(Vector3(sin(angle) * r, 0.0, cos(angle) * r))
++	return out
++
++
++# [MP8] 读命令行 "<前缀>=<值>"，没传就返回空串
++func _mp8_arg(prefix: String) -> String:
++	for a in OS.get_cmdline_args():
++		var s: String = String(a)
++		if s.begins_with(prefix):
++			return s.substr(prefix.length())
++	return ""
++
++
++# [MP8] 新平台半径，命令行 mp8junkr=<半径> 可覆盖（相机不动了，这是唯一的构图旋钮）
++func _mp8_radius() -> float:
++	var v: String = _mp8_arg("mp8junkr=")
++	if v.is_valid_float():
++		return float(v)
++	return MP8_NEW_RADIUS
++
++
++# [MP8] 找 i 号槽的 180° 对位槽：把 (x,z) 取反之后离得最近的那个。
++#
++# 为什么必须这么算：对面那半玩家把 visuals_base 绕 Y 转了 180°，
++# 于是原本长在世界坐标 V 的视觉件会渲染到 (-V.x, -V.z) 去。
++# 那个位置正是"对位平台"的碰撞体所在，所以平台 i 在翻转后必须改用**对位平台**的视觉件。
++# 配对关系完全由几何决定，和数组下标没有任何关系。
++func _mp8_opposite_index(slots: Array[Vector3], i: int) -> int:
++
++	var target := Vector2( - slots[i].x, - slots[i].z)
++	var best: int = i
++	var best_d: float = 1e20
++	for j in slots.size():
++		var d: float = Vector2(slots[j].x, slots[j].z).distance_to(target)
++		if d < best_d:
++			best_d = d
++			best = j
++	return best
++
++
++# [MP8] 配对自检：翻转配对必须是**对合**（我的对位的对位 = 我自己），
++# 而且不能有两个平台抢同一个对位。任何一条不满足都说明槽位摆得不对称，
++# 会表现成"我的指示圈跟着别人的垃圾亮"——肉眼很难直接看出是配对错了。
++func _mp8_check_pairing(slots: Array[Vector3]) -> void :
++
++	var partners: Array[int] = []
++	for i in slots.size():
++		partners.append(_mp8_opposite_index(slots, i))
++
++	var bad: bool = false
++	var seen: Dictionary = {}
++	for i in partners.size():
++		if partners[partners[i]] != i:
++			bad = true
++		if seen.has(partners[i]):
++			bad = true
++		seen[partners[i]] = true
++
++	var txt: PackedStringArray = []
++	for i in partners.size():
++		txt.append("%d(%.0f,%.0f)->%d" % [
++			i + 1, slots[i].x, slots[i].z, partners[i] + 1
++		])
++	print("[MP8] 翻转配对 %s：%s" % [
++		"❌不成立（槽位不是 180° 对称）" if bad else "✓对合成立",
++		" ".join(txt)
++	])
++
++
++# [MP8] 把一个平台的引用全部指回它自己那套家当，flipped 指向对角那套
++func _mp8_wire_platform(own: Dictionary, partner: Dictionary) -> void :
++
++	var p: JunkPlatformPlatform = own["platform"]
++
++	var own_indicator: Node3D = _mp8_pick(own, "damage indicator")
++	var own_visual: Node3D = _mp8_pick(own, "platform main")
++	var own_compactor = _mp8_pick(own, "compactor")
++	var own_alarm = _mp8_pick(own, "speaker_indicator alarm")
++
++	var far_indicator: Node3D = _mp8_pick(partner, "damage indicator")
++	var far_visual: Node3D = _mp8_pick(partner, "platform main")
++	var far_compactor = _mp8_pick(partner, "compactor")
++	var far_alarm = _mp8_pick(partner, "speaker_indicator alarm")
++
++	if own_indicator != null:
++		p.damage_circle_parent = own_indicator
++	if far_indicator != null:
++		p.damage_circle_parent_flipped = far_indicator
++
++	var vis: Array[Node3D] = []
++	if own_indicator != null:
++		vis.append(own_indicator)
++	if own_visual != null:
++		vis.append(own_visual)
++	p.platform_visuals = vis
++
++	var vis_f: Array[Node3D] = []
++	if far_indicator != null:
++		vis_f.append(far_indicator)
++	if far_visual != null:
++		vis_f.append(far_visual)
++	p.platform_visuals_flipped = vis_f
++
++	if own_compactor != null:
++		p.compactor = own_compactor
++	if far_compactor != null:
++		p.compactor_flipped = far_compactor
++	if own_alarm != null:
++		p.speaker_alarm = own_alarm
++	if far_alarm != null:
++		p.speaker_alarm_flipped = far_alarm
++
++	p.assign_indicators()
++
++
++# 从一组家当里按名字前缀挑一个（复制件名字前面加了 "MP8_<序号>_"，所以用 contains）
++func _mp8_pick(group: Dictionary, keyword: String):
++	for node in group["nodes"]:
++		if String(node.name).contains(keyword):
++			return node
++	return null
++
++
++# [MP8] 出生点补到和平台一样多，并且**顺序与平台严格一致**。
++# 垃圾掉落点是从出生点推的（spawn_players 里 add_spawn_point(id, 出生点+20米)），
++# 出生点没跟着平台走的话，垃圾会掉到旧位置的虚空里。
++func _mp8_rebuild_spawn_points(slots: Array[Vector3]) -> void :
++
++	var container: Node3D = player_spawn_position_node
++	if container == null:
++		return
++
++	var kids: Array = container.get_children()
++	if kids.is_empty():
++		return
++
++	var template: Node3D = kids[0]
++	while container.get_child_count() < slots.size():
++		var dup: Node3D = template.duplicate()
++		dup.name = "MP8Spawn%d" % container.get_child_count()
++		container.add_child(dup)
++
++	var all: Array = container.get_children()
++	for i in slots.size():
++		if i >= all.size():
++			break
++		var m: Node3D = all[i]
++		# 站在平台中心，稍微抬高一点免得卡进碰撞体
++		m.global_position = slots[i] + Vector3(0.0, template.global_position.y, 0.0)
++
++
++# [MP8] ===== 相机：**按玩家单独调，能不动的一律不动**（用户 2026-08-16 提议）=====
++#
++# 能这么做的前提（逆向确认）：**相机是每台机器一份的**，不是全场共享一个。
++# 原版自己就在按玩家发相机指令（`rotate_camera_rpc.rpc_id(network_id, ...)`），
++# 所以给不同的人不同的相机完全走得通。
++#
++# ⚠️ **唯一锁死的是朝向：只能 0° 或 180°。**
++# 因为转的是 `camera_base` + `visuals_base` 两个一起转，而平台视觉件是**对角两两共用**的
++# （`platform_visuals` / `platform_visuals_flipped`），只有这两种状态。
++# **位置和 fov 则完全自由**，可以逐人不同。
++#
++# 实测（原版相机、八边形半径 22.5、平台半径 5）：8 个平台里只有**正对相机中轴**的
++# 那两个 (0,0,±R) 顶到画面边缘（纵向余量 +1.0 / +2.7 < 半径 5），
++# 其余 6 个原版构图绰绰有余（余量 7~13）。
++# 所以**只给这两个平台的主人补一点后拉+下移+广角，另外 6 个人的画面和原版一模一样**。
++# 改动面越小越不容易把本来对的地方改坏（坑第 21 条：原版是对的就别动它）。
++#
++# ⚠️⚠️ **必须挪相机在 camera_base 局部空间里的位置，绝对不能挪 camera_base 本身。**
++# camera_base 绕**自己的原点**转（实测它就在世界原点）。
++# 上一版写的是 `camera_base.global_position += back`，后果是：
++# 朝向 0° 那半人的相机确实往后退了，但 camera_base 一转 180°，
++# 同一个世界偏移就指向反方向 —— **另一半人的相机反而往前挪**。
++# 两边构图不一致，而且这种不对称在 8 个小窗口里肉眼极难发现。
++# 挪局部坐标就没这个问题：偏移跟着 camera_base 一起转，两边严格对称。
++#
++# 三个量用命令行 `mp8junkcam=<后拉>,<下移>,<广角增量>` 临时覆盖，不用重新编译，
++# 配合日志里的 [MP8-CAM] 体检行调。
++# 【2026-08-16 用户定案】用户实际选定的是**全场统一**的这一套：
++#   后拉 6 / 下移 2 / 广角 +10（原版 50.3 → 60.3），相机 (0,27.1,30.7) -> (0,25.1,36.7)。
++# 对应画面 `notes\shots\oct_cam_b6d2f10_t3_P1.png`。
++# 逐人模式（只调正对中轴那两个人、其余保持原版）仍然可用，传 `mp8junkcamper` 打开。
++const MP8_CAM_BACK: float = 6.0      # 沿视线**水平**后退（不抬高：抬高会越过压缩机顶端 y≈26.8，顶盖糊画面）
++const MP8_CAM_DOWN: float = 2.0      # 相机下移
++const MP8_CAM_FOV_ADD: float = 10.0  # 视场角增量（原版 50.3 → 60.3）
++
++var _mp8_cam_xf0: Transform3D        # 原版相机变换（_ready 里 camera_base 还没转，是干净基准）
++var _mp8_cam_fov0: float = 0.0
++
++
++# [MP8] 这个玩家的相机要不要动？返回 (后拉, 下移, 广角增量)，全 0 = 保持原版。
++#
++# 判据：**他自己的平台**在他那台机器的画面里是不是完整的。
++# 只看平台上表面（人站的那一面），不管平台柱子的下半截——原版近侧那两个平台的
++# 柱子本来就被下边缘切掉一截，那是原版长相，不是毛病。
++func _mp8_camera_adjust_for(pos: Vector3, rot: float) -> Vector3:
++
++	if _mp8_cam_fov0 <= 0.0:
++		return Vector3.ZERO
++
++	# 默认走**全场统一**（已在 _ready 里调过了），这里就不再逐人加，免得叠两次
++	if not Array(OS.get_cmdline_args()).has("mp8junkcamper"):
++		return Vector3.ZERO
++
++	var radius: float = 6.0
++	if junk_handler != null and "platform_radius" in junk_handler:
++		radius = junk_handler.platform_radius
++
++	# 他那台机器的相机只会转 0° 或 180°。转 180° 等价于把平台位置绕 Y 转 180°
++	# （(x,z) -> (-x,-z)）之后用**原版朝向**的相机去看，所以直接换算位置即可。
++	var p: Vector3 = Vector3(pos.x, 0.0, pos.z)
++	if absf(rot) > 90.0:
++		p = Vector3( - p.x, 0.0, - p.z)
++
++	var half_v: float = deg_to_rad(_mp8_cam_fov0) * 0.5
++	var half_h: float = atan(tan(half_v) * _mp8_aspect())
++	var m: Vector3 = _mp8_frame_margin(_mp8_cam_xf0, half_v, half_h, p)
++
++	if minf(m.y, m.z) >= radius:
++		return Vector3.ZERO   # 原版构图就够，一个字不改
++
++	return _mp8_cam_values()
++
++
++# [MP8] 相机微调量 (后拉, 下移, 广角增量)，命令行 mp8junkcam=<后拉>,<下移>,<广角增量> 可覆盖
++func _mp8_cam_values() -> Vector3:
++
++	var back: float = MP8_CAM_BACK
++	var down: float = MP8_CAM_DOWN
++	var fov_add: float = MP8_CAM_FOV_ADD
++	var v: String = _mp8_arg("mp8junkcam=")
++	if v != "":
++		var parts: PackedStringArray = v.split(",")
++		if parts.size() > 0 and String(parts[0]).is_valid_float():
++			back = float(parts[0])
++		if parts.size() > 1 and String(parts[1]).is_valid_float():
++			down = float(parts[1])
++		if parts.size() > 2 and String(parts[2]).is_valid_float():
++			fov_add = float(parts[2])
++	return Vector3(back, down, fov_add)
++
++
++# [MP8] 服务器按玩家单独下发。call_local 不用——服务器自己那份在 spawn_players 里直接调。
++@rpc("authority", "call_remote", "reliable")
++func mp8_adjust_camera_rpc(back: float, down: float, fov_add: float) -> void :
++	_mp8_apply_camera(back, down, fov_add)
++
++
++func _mp8_apply_camera(back: float, down: float, fov_add: float) -> void :
++
++	if camera == null or camera_base == null:
++		return
++
++	var before: Vector3 = camera.global_position
++	var before_fov: float = camera.fov
++
++	# camera_base 局部空间里，+Z 就是"背对视线"的方向（相机看向 -Z），
++	# 所以后拉 = +Z，下移 = -Y。偏移跟着 camera_base 的 180° 一起转，两边对称。
++	var t: Transform3D = camera_base.global_transform.affine_inverse() * camera.global_transform
++	t.origin += Vector3(0.0, - down, back)
++	camera.global_transform = camera_base.global_transform * t
++
++	camera.fov = before_fov + fov_add
++
++	print("[MP8] 本机相机微调：后拉 %.1f、下移 %.1f、广角 %.1f -> %.1f；位置 (%.1f, %.1f, %.1f) -> (%.1f, %.1f, %.1f)" % [
++		back, down, before_fov, camera.fov,
++		before.x, before.y, before.z,
++		camera.global_position.x, camera.global_position.y, camera.global_position.z
++	])
++
++
++func _mp8_aspect() -> float:
++	var vp: Viewport = get_viewport()
++	if vp != null and vp.get_visible_rect().size.y > 0.0:
++		return vp.get_visible_rect().size.x / vp.get_visible_rect().size.y
++	return 16.0 / 9.0
++
++
++# [MP8] 相机构图体检：把"哪个平台在画面里、哪个掉出去了"直接打成日志。
++#
++# 相机不动之后，构图余量完全由原版决定，靠人盯 8 个小窗口画面判断既慢又容易看漏
++# （尤其"掉出画面"和"被别的东西挡住"肉眼看起来很像）。所以这里算清楚再打出来。
++#
++# **两种朝向都要算**：对面那半玩家把 camera_base 绕 Y 转了 180°，
++# 等价于把平台位置绕 Y 转 180° 之后用同一个相机看，所以第二种朝向直接用 (-x, y, -z)。
++#
++# 余量的含义：视锥边界到该点的世界单位距离。
++#   余量 < 0        → 平台**中心**都在画面外，这个平台的主人根本看不见自己的平台
++#   0 ≤ 余量 < 半径 → 中心在画面里，但平台边缘被切掉一部分（原版近侧那排本来就是这样）
++#   余量 ≥ 半径     → 整块平台都在画面里
++func _mp8_report_camera(groups: Array, slots: Array[Vector3]) -> void :
++
++	if camera == null:
++		return
++
++	var xf: Transform3D = camera.global_transform
++	var half_v: float = deg_to_rad(camera.fov) * 0.5
++	var aspect: float = 16.0 / 9.0
++	var vp: Viewport = get_viewport()
++	if vp != null and vp.get_visible_rect().size.y > 0.0:
++		aspect = vp.get_visible_rect().size.x / vp.get_visible_rect().size.y
++	var half_h: float = atan(tan(half_v) * aspect)
++
++	var radius: float = 6.0
++	if junk_handler != null and "platform_radius" in junk_handler:
++		radius = junk_handler.platform_radius
++
++	print("[MP8-CAM] 相机 pos=(%.1f, %.1f, %.1f) 俯角=%.1f° fov=%.1f 半视角 V=%.1f° H=%.1f° 平台半径=%.1f camera_base=(%.1f, %.1f, %.1f)" % [
++		xf.origin.x, xf.origin.y, xf.origin.z,
++		- rad_to_deg(xf.basis.get_euler().x), camera.fov,
++		rad_to_deg(half_v), rad_to_deg(half_h), radius,
++		camera_base.global_position.x, camera_base.global_position.y, camera_base.global_position.z
++	])
++
++	for i in slots.size():
++		var s: Vector3 = slots[i]
++		var a: Vector3 = _mp8_frame_margin(xf, half_v, half_h, s)
++		var b: Vector3 = _mp8_frame_margin(xf, half_v, half_h, Vector3( - s.x, s.y, - s.z))
++		print("[MP8-CAM] 平台%d (x=%6.1f z=%6.1f)  朝向0°: 深度%5.1f 纵%+6.1f 横%+6.1f %s   朝向180°: 深度%5.1f 纵%+6.1f 横%+6.1f %s" % [
++			i + 1, s.x, s.z,
++			a.x, a.y, a.z, _mp8_verdict(a, radius),
++			b.x, b.y, b.z, _mp8_verdict(b, radius)
++		])
++
++	# 压缩机是场地上最高的东西（静止位实测 y≈26.8，和相机的 y≈27 几乎齐平）。
++	# 离镜头太近的那台会直接糊在画面上——上一版"上方的黑块"很可能就是它。
++	for i in groups.size():
++		var c = _mp8_pick(groups[i], "compactor")
++		if c == null:
++			continue
++		var cp: Vector3 = c.global_position
++		var d0: float = _mp8_frame_margin(xf, half_v, half_h, cp).x
++		var d1: float = _mp8_frame_margin(xf, half_v, half_h, Vector3( - cp.x, cp.y, - cp.z)).x
++		var near: float = minf(d0, d1)
++		if near < 12.0:
++			print("[MP8-CAM] ⚠️ 平台%d 的压缩机 (y=%.1f) 离镜头只有 %.1f，会糊在画面上挡视野" % [
++				i + 1, cp.y, near
++			])
++
++
++# [MP8] 返回 (深度, 纵向余量, 横向余量)。余量 = 视锥边界到该点的世界单位距离，负数 = 已在画面外。
++func _mp8_frame_margin(xf: Transform3D, half_v: float, half_h: float, p: Vector3) -> Vector3:
++
++	var local: Vector3 = xf.affine_inverse() * p
++	var depth: float = - local.z          # 相机看向 -Z
++	if depth <= 0.01:
++		return Vector3(depth, -999.0, -999.0)   # 在相机背后
++	return Vector3(
++		depth,
++		depth * tan(half_v) - absf(local.y),
++		depth * tan(half_h) - absf(local.x)
++	)
++
++
++func _mp8_verdict(m: Vector3, radius: float) -> String:
++	var worst: float = minf(m.y, m.z)
++	if worst < 0.0:
++		return "✗中心已出画面"
++	if worst < radius:
++		return "△边缘被切"
++	return "✓完整"
++
++
+ func spawn_players():
+ 
+ 	player_count = PlayerManager.player_presences.size()
+@@ -119,6 +1027,20 @@ func spawn_players():
+ 			else:
+ 				rotate_camera_rpc.rpc_id(network_id, camera_rotation)
+ 
++		# [MP8] 相机**按玩家**决定动不动：只有自己的平台顶到画面边缘的人才收到微调，
++		# 其余人一个字不改，画面和原版逐像素一致。
++		# （偏移是在 camera_base 局部空间里加的，和上面那个 0°/180° 翻转互不干扰，先后无所谓。）
++		if not GameManager.local_game:
++			var adj: Vector3 = _mp8_camera_adjust_for(position, camera_rotation)
++			if adj != Vector3.ZERO:
++				print("[MP8] 玩家 %s 在正对相机中轴的平台上，给他单独调相机" % [
++					PlayerManager.player_presences[network_id].network_name
++				])
++				if network_id == 1:
++					_mp8_apply_camera(adj.x, adj.y, adj.z)
++				else:
++					mp8_adjust_camera_rpc.rpc_id(network_id, adj.x, adj.y, adj.z)
++
+ 		player_character.emit_died.connect(_on_player_died)
+ 		player_character.event_fallen.connect(_on_player_fallen)
+ 
+@@ -126,6 +1048,33 @@ func spawn_players():
+ 		active_players[network_id] = player_character
+ 		player_scores[network_id] = 0
+ 
++		# [MP8] 记下这个玩家落在哪个平台上（**按出生点就近匹配**，不靠数组下标对齐——
++		# 万一以后出生点顺序或平台顺序变了，名牌也不会认错人）
++		# ⚠️ 上界必须校验：传 `mp8noexpand` 时 `_mp8_expand_platforms()` 整个不跑，
++		# `_mp8_label_names` 会是**空数组**，而这里是按下标写的 —— 不校验就是越界写。
++		# （坑第 13 条：定长结构改动前先 grep 所有按下标访问的点。这处正是漏网的那个。）
++		var nearest: int = _mp8_nearest_platform(position)
++		if nearest >= 0 and nearest < _mp8_label_names.size():
++			_mp8_label_names[nearest] = PlayerManager.player_presences[network_id].network_name
++
++	# [MP8] 名牌文字广播给所有人（名牌本身在每台机器的 _ready 里已经建好）
++	if not _mp8_label_names.is_empty():
++		mp8_set_platform_labels_rpc.rpc(_mp8_label_names)
++
++
++# [MP8] 离给定位置最近的平台下标（只看水平距离）
++func _mp8_nearest_platform(pos: Vector3) -> int:
++
++	var best: int = -1
++	var best_dist: float = 1e20
++	for i in platforms.size():
++		var pp: Vector3 = platforms[i].global_position
++		var d: float = Vector2(pos.x - pp.x, pos.z - pp.z).length()
++		if d < best_dist:
++			best_dist = d
++			best = i
++	return best
++
+ 
+ func cleanup():
+ 
+@@ -157,14 +1106,51 @@ func check_game_end():
+ 	for i in dead_players.size():
+ 		player_scores[dead_players[i]] = i
+ 
++	# [MP8] 压平冠亚断层（用户 2026-08-16 定，**本次只改这一条**）。
++	#
++	# 原版给幸存者 `player_count`，而最后一个死的拿 `dead_players.size() - 1`，
++	# 于是冠亚之间**恒跳 2 分**，其余名次步长都是 1：
++	#   8 人原版 → 0 1 2 3 4 5 6 然后直接跳到 8
++	#   8 人现在 → 0 1 2 3 4 5 6 7   （4 人：0 1 2 4 → 0 1 2 3）
++	#
++	# ⚠️ 用 `dead_players.size()` 而不是 `player_count - 1`：
++	# 中途掉线的人会从 `active_players` 里被移除，但**不会进 `dead_players`**
++	# （见 `remove_player_rpc`）。那时 `player_count` 比实际参与结算的人数大，
++	# 冠军会凭空多拿几分。用死亡人数推就是"比最后一个死的多 1 分"，掉线多少人都对。
++	# 无人掉线时两种写法结果完全一样。
++	#
++	# 本次**没有**动的（用户明确只选了压断层这一条）：
++	#   - 8 人下分差翻倍（单轮上限 340 → 680）不做归一化；
++	#   - 同帧双亡时"后被处理的那个白拿冠军"是原版行为，保留。
+ 	for network_id in active_players.keys():
+-		player_scores[network_id] = player_count
+-
+-
++		player_scores[network_id] = dead_players.size()
+ 		break
+ 
++	_mp8_log_scores()
++
+ 	player_scores_finalized.emit(player_scores)
+ 
++
++# [MP8] 结算明细进日志：名次 / 玩家名 / 得分。
++# 不改任何分数，纯粹是为了事后能核对——挂机测试时 agent 自己读日志就够，
++# 不需要用户去描述"谁拿了多少"。只有服务器会走到这里（check_game_end 是服务器侧）。
++func _mp8_log_scores() -> void :
++
++	var ranked: Array = player_scores.keys()
++	ranked.sort_custom(func(a, b): return player_scores[a] > player_scores[b])
++
++	var parts: PackedStringArray = []
++	for i in ranked.size():
++		var nid = ranked[i]
++		var nm: String = "id%d" % nid
++		if PlayerManager.player_presences.has(nid):
++			nm = String(PlayerManager.player_presences[nid].network_name)
++		parts.append("第%d名 %s %d分" % [i + 1, nm, player_scores[nid]])
++
++	print("[MP8] 残骸平台结算（%d 人在场 / %d 人阵亡）：%s" % [
++		player_count, dead_players.size(), " / ".join(parts)
++	])
++
+ 	await get_tree().create_timer(2.0).timeout
+ 	set_minigame_sfx_linear_volume_rpc.rpc(0.0)
+ 
+@@ -211,6 +1197,44 @@ func _on_countdown_expired():
+ 
+ 	state_machine.transition_to_rpc.rpc(&"Play")
+ 
++	# [MP8] mp8shot：开局连拍三张。3 秒看初始站位和相机构图，
++	# 12/25 秒看垃圾堆积、指示圈、压缩机、塌陷——那几条都要靠画面才判得出来。
++	#
++	# ⚠️ 必须走 RPC 广播：`countdown_state.expired` **只在服务器上连过**
++	# （见 _ready 里的 `if multiplayer.is_server()`），直接在这里调只有房主会存图。
++	# 而"按玩家单独调相机"这件事恰恰只能在**当事人那台机器**上看出来，
++	# 只有房主的图等于没验。文件名带玩家名，各存各的不打架。
++	mp8_shot_rpc.rpc()
++
++
++@rpc("authority", "call_local", "reliable")
++func mp8_shot_rpc() -> void :
++	_mp8_shot(3.0)
++	_mp8_shot(12.0)
++	_mp8_shot(25.0)
++
++
++# [MP8] 自截图，和猎鸭那套一样：游戏自己存 PNG，不需要任何屏幕录制权限。
++# 文件名带玩家名，好对上"哪个平台是谁的"。
++func _mp8_shot(delay: float) -> void :
++
++	if not Array(OS.get_cmdline_args()).has("mp8shot"):
++		return
++
++	await get_tree().create_timer(delay, false).timeout
++	if not is_inside_tree():
++		return
++	await RenderingServer.frame_post_draw
++
++	var me: int = multiplayer.get_unique_id() if multiplayer.has_multiplayer_peer() else 0
++	var who: String = "p%d" % me
++	if PlayerManager.player_presences.has(me):
++		who = String(PlayerManager.player_presences[me].network_name)
++
++	var img: Image = get_viewport().get_texture().get_image()
++	if img != null:
++		img.save_png("user://mp8_junk_t%d_%s.png" % [int(delay), who])
++
+ func _on_player_died(_network_id: int):
+ 
+ 	if active_players.has(_network_id):

@@ -1,0 +1,123 @@
+diff --git a/minigames/forklift_certified/components/delivery_area/forklift_certified_delivery_area.gd b/minigames/forklift_certified/components/delivery_area/forklift_certified_delivery_area.gd
+--- a/minigames/forklift_certified/components/delivery_area/forklift_certified_delivery_area.gd
++++ b/minigames/forklift_certified/components/delivery_area/forklift_certified_delivery_area.gd
+@@ -20,6 +20,19 @@ var crates_in_area: Array[ForkliftCertifiedCrate]
+ var check_threshold: int = 0
+ var belongs_to_threshold: int = 0
+ 
++# ═══════ [MP8] 2026-08-19：指示灯当前状态（-1 未知 / 0 落后 / 1 领先）═══════
++#
++# 只有服务器读写它，用来判断"这次到底变没变"。
++# 旧版 `_on_crate_numbers_changed` 每次箱数变动都把**所有**送货区的灯重发一遍，
++# 而 `set_indicator_light_rpc` 的 true/false **两个分支都会 `speaker_mechanism.play()`**
++# —— 8 个区是 8 个**不同**的喇叭，所以那是真的 8 个声部同时响，不是重启同一个。
++# 现在只在状态真的翻转时才广播。
++#
++# ⚠️ 放在区节点上而不是游戏脚本里，是因为 `set_owner_rpc` 会把颜色重画成 losing，
++# 缓存必须跟着失效 —— 挂在这里就能在下面那个函数里一次性清干净，
++# 不用去游戏脚本那 5 个 `set_owner_rpc` 调用点逐个补。
++var mp8_indicator_state: int = -1
++
+ signal crate_number_changed()
+ 
+ func _ready() -> void :
+@@ -40,7 +53,11 @@ func _ready() -> void :
+ 
+ func update_counter():
+ 
+-	counter_label.text = str(crates_in_area.size()).pad_zeros(2)
++	# [MP8] 这个函数在反编译出来的代码里**没有任何调用点**（死代码），
++	# 但场景里有没有把某个信号连到它、我们看不见。真被连上的话它会用**裸箱子数**
++	# 把牌面盖掉，而且只盖服务器那一端（客户端仍是 RPC 来的分）—— 两端显示不一致，
++	# 极难查。所以一并乘上倍率，与另外三处保持同一个数。
++	counter_label.text = str(crates_in_area.size() * mp8_score_mult).pad_zeros(2)
+ 
+ func _on_area_entered(body):
+ 
+@@ -53,7 +70,7 @@ func _on_area_entered(body):
+ 	crates_in_area.append(body)
+ 	body.in_delivery_area = true
+ 
+-	update_counter_rpc.rpc(crates_in_area.size())
++	update_counter_rpc.rpc(crates_in_area.size() * mp8_score_mult)   # [MP8] 牌面 = 算完倍率的分
+ 	crate_number_changed.emit()
+ 
+ func _on_area_exited(body):
+@@ -67,7 +84,7 @@ func _on_area_exited(body):
+ 	crates_in_area.erase(body)
+ 	body.in_delivery_area = false
+ 
+-	update_counter_rpc.rpc(crates_in_area.size())
++	update_counter_rpc.rpc(crates_in_area.size() * mp8_score_mult)   # [MP8] 同上
+ 	crate_number_changed.emit()
+ 
+ 
+@@ -92,11 +109,16 @@ func set_indicator_light_rpc(winning: bool):
+ func set_owner_rpc(network_id: int):
+ 	belongs_to_id = network_id
+ 
++	# [MP8] 2026-08-19：这里会把颜色重画成 losing / BLACK，
++	# 指示灯缓存必须一并失效，否则下一次 _on_crate_numbers_changed 会误判"没变"而跳过。
++	mp8_indicator_state = -1
++
+ 	if belongs_to_id > belongs_to_threshold:
+ 		material.albedo_color = losing_color
+ 	else:
+ 		material.albedo_color = Color.BLACK
+ 		counter_label.text = str(0).pad_zeros(2)
++		mp8_member_ids.clear()          # [MP8] 区被收回 → 队员名册也清掉
+ 
+ 	if GameManager.local_game:
+ 		if belongs_to_id > belongs_to_threshold:
+@@ -104,3 +126,51 @@ func set_owner_rpc(network_id: int):
+ 
+ 	if multiplayer.get_unique_id() == network_id:
+ 		area_light.visible = true
++
++
++# ------------------------------------------------------------------------ [MP8]
++# 两人一队：`belongs_to_id` 是单个 int，而且一大堆判活代码靠
++# `belongs_to_id > check_id_threshold` 走，所以**不动它** —— 它仍然是队里第一个人。
++# 第二个人只在这里登记，唯一作用是让他也能看见自己那块区的射灯
++# （原版 `multiplayer.get_unique_id() == network_id` 那句只认得队长）。
++# 队伍逻辑（谁跟谁一队、一起淘汰、一起算分）全在 forklift_certified.gd 里，
++# 本文件只管"我这块区亮给谁看"。
++var mp8_member_ids: Array[int] = []
++
++@rpc("any_peer", "call_local", "reliable")
++func mp8_add_owner_rpc(network_id: int):
++
++	if not mp8_member_ids.has(network_id):
++		mp8_member_ids.append(network_id)
++
++	if multiplayer.get_unique_id() == network_id:
++		area_light.visible = true
++
++
++# ------------------------------------------------------------------ [MP8] 计分倍率
++# **单人队一个箱子算两个**（用户 2026-08-17 定）。
++# 5~7 人时队伍不等大（`[2,1,1,1]` 这种），2 人队约等于两倍收箱速度，
++# 而判定是"非最高分全淘汰" —— 不补偿的话单人队第一轮基本必死。
++#
++# 倍率由 forklift_certified._mp8_refresh_score_mults() 算好后广播下来，
++# 值 = 最大队人数 / 本队人数：≤4 人和 8 人全是 1（**与原版逐值一致**），
++# 5~7 人时只有单人队是 2。
++#
++# ⚠️ **计数牌显示算完倍率的分**（用户 2026-08-17 明确要求：单人区叉进 1 箱就显示 2）。
++# 三处必须是同一个数：淘汰判定、领先射灯、计数牌 ——
++# 玩家看到的必须就是裁判用的，藏着算分是派对游戏大忌。
++#
++# 唯一按**真实箱子数**走的是成就 `ach_crate_number`
++#（"真的叉够 4 箱"不该被倍率放水），见 forklift_certified._on_crate_numbers_changed。
++var mp8_score_mult: int = 1
++
++@rpc("any_peer", "call_local", "reliable")
++func mp8_set_score_mult_rpc(mult: int):
++
++	mp8_score_mult = maxi(1, mult)
++
++	# 倍率可能在局中变（队友掉线 → 剩下那个人变成单人队），牌面要当场跟上。
++	# ⚠️ `crates_in_area` 只有服务器在维护（body_entered 只在服务器接），
++	# 所以刷新只能由服务器算完再广播，不能各端自己算 —— 客户端算出来恒为 0。
++	if multiplayer.is_server():
++		update_counter_rpc.rpc(crates_in_area.size() * mp8_score_mult)

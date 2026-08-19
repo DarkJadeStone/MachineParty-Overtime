@@ -1,0 +1,83 @@
+diff --git a/minigames/forklift_certified/scripts/crate_manager.gd b/minigames/forklift_certified/scripts/crate_manager.gd
+--- a/minigames/forklift_certified/scripts/crate_manager.gd
++++ b/minigames/forklift_certified/scripts/crate_manager.gd
+@@ -16,6 +16,26 @@ var active: bool = false
+ var instances: Dictionary[int, ForkliftCertifiedCrate]
+ var remove_indicies_after_move: Array[int]
+ 
++# ---------------------------------------------------------------- [MP8] 撒点参数
++# 原版把撒点区半宽写死成 6.0、`while` 无上界、循环里还有个 `counter >= 10` 的硬上限。
++# 三条在 4 人下都无害，8 人下第一条就把服务器冻住了：
++#
++#   `spawn_radius` 是**点与点的最小距离**（见 poisson_disc_sampling._is_valid_sample
++#   里的 `dist < poisson_radius`），场景把它设成 4.0。
++#   12x12 的区里塞最小距离 4 米的点，probe59 实测 3000 次采样：
++#   平均 7.44 个、最好 11 个，**一次都没到 16**（8 人 = 人数x2 = 16）。
++#   → `while points.size() < 16` 永不退出，服务器卡死在 initialize() 里，全场干等。
++#
++# 所以这里做两件事，都不改 4 人局的结果：
++#   1. 撒点区半宽改成可配（`mp8_half_extent`，默认仍是原版的 6.0）；
++#   2. `while` 改成**有上界、留最好的一次**。达标即退出 —— 与原版逐值等价；
++#      只有在原版会死循环的那种情况下才有区别（拿最好的一次继续，而不是冻住）。
++#
++# 参数由 forklift_certified.initialize() 按人数设，见那边的 `_mp8_apply_crate_profile()`。
++var mp8_half_extent: float = 6.0
++var mp8_max_attempts: int = 200
++const MP8_HARD_CEILING: int = 24     # 顶掉原版那个写死的 10；纯保险，正常够不着
++
+ func _physics_process(_delta: float) -> void :
+ 
+ 	if not multiplayer.is_server():
+@@ -23,27 +43,44 @@ func _physics_process(_delta: float) -> void :
+ 
+ func spawn_crates(amount: int):
+ 
+-	var size: float = 6.0
++	var size: float = mp8_half_extent
+ 	var polygon: PackedVector2Array = [
+-		Vector2( - size, - size), 
+-		Vector2(size, - size), 
+-		Vector2(size, size), 
+-		Vector2( - size, size), 
++		Vector2( - size, - size),
++		Vector2(size, - size),
++		Vector2(size, size),
++		Vector2( - size, size),
+ 	]
+ 
+ 	var target_size: int = amount
+ 	var points: PackedVector2Array
+ 
+-	while points.size() < target_size:
+-		points = PoissonDiscSampling.generate_points_for_polygon(
++	# [MP8] 原版：`while points.size() < target_size:` —— 取不到就是死循环。
++	# 改成有上界的重试，并**留住最好的一次**：够了立刻退出（和原版一样），
++	# 实在凑不齐也只是少几个箱子，不会把服务器挂住。
++	var attempts: int = 0
++	while points.size() < target_size and attempts < mp8_max_attempts:
++		attempts += 1
++		var got: PackedVector2Array = PoissonDiscSampling.generate_points_for_polygon(
+ 			polygon, spawn_radius, 20, Vector2.ZERO
+ 		)
++		if got.size() > points.size():
++			points = got
++
++	if points.size() < target_size:
++		push_warning("[MP8] 叉车认证：撒了 %d 次也只凑到 %d 个点（要 %d 个），就按 %d 个箱子开局。区半宽 %.1f，最小间距 %.1f" % [
++			attempts, points.size(), target_size, points.size(), mp8_half_extent, spawn_radius
++		])
++		target_size = points.size()
++
++	print("[MP8] 叉车认证：板条箱 %d 个（区 %.0fx%.0f，最小间距 %.1f，采样 %d 次）" % [
++		target_size, mp8_half_extent * 2.0, mp8_half_extent * 2.0, spawn_radius, attempts
++	])
+ 
+ 	var counter: int = 0
+ 	for i in target_size:
+ 		spawn_crate(Vector3(points[i].x, 0.0, points[i].y))
+ 		counter += 1
+-		if counter >= 10:
++		if counter >= MP8_HARD_CEILING:     # [MP8] 原版这里写死的是 10
+ 			return
+ 
+ func spawn_crate(_position: Vector3):

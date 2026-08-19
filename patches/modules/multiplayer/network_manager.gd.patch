@@ -1,0 +1,563 @@
+diff --git a/modules/multiplayer/network_manager.gd b/modules/multiplayer/network_manager.gd
+--- a/modules/multiplayer/network_manager.gd
++++ b/modules/multiplayer/network_manager.gd
+@@ -1,8 +1,13 @@
+ extends Node
+ 
+-const MAX_PLAYERS: int = 4
++const MAX_PLAYERS: int = 8  # [MP8] 原值 4
+ const MAX_DEBUG_PLAYERS: int = 5
+ 
++# [MP8] mod 版本号。**发布新版就改这里**，它会被追加进 Globals.game_version，
++# 直接决定"谁能跟谁联机"（见 _ready() 里那段版本握手）。
++# 格式随意但要短：主菜单右下角显示的是 `原版号+本标签`，太长会顶出去。
++const MP8_VERSION_TAG: String = "overtime-1.2"
++
+ enum NetworkBackendType{
+ 	Enet, Steam
+ }
+@@ -42,14 +47,543 @@ signal player_removed_from_join_queue(network_id)
+ 
+ func _ready() -> void :
+ 
++	# [MP8] ================ 版本握手 ================
++	#
++	# 原版两个后端**都自带**版本校验：客户端把 `Globals.game_version` 一起发过来，
++	# 房主对不上就 `refuse_client_rpc(..., RefuseReason.VersionMismatch)`
++	#（`enet_backend.gd:133` / `steam_backend.gd:169`）。
++	# 给它打上 mod 后缀就白得三件事：
++	#   ① 原版玩家进不了 mod 房、mod 玩家进不了原版房；
++	#   ② **不同 mod 版本之间也互相拒绝**；
++	#   ③ 用的是游戏自己的拒绝 UI，不是"能进去但 RPC 对不上、玩到一半开始鬼畜"。
++	# 改核心脚本的 mod 最怕混装，这道闸门是原版送的。
++	#
++	# ⚠️ 代价（知情选择）：**装了 mod 就不能跟原版朋友一起玩**，
++	# 要回去用安装器 `install_mp8.ps1 -Uninstall` 还原。
++	#
++	# ⚠️ 为什么写在这里、而不是 patch 掉 `autoloads/globals.gd`：
++	# 那个文件 553 行、反编译来的、一次都没被重编译验证过，
++	# 为一行字符串把它整个纳入补丁面不划算；本文件已被几十局 8 人测试验过。
++	# **前提是 autoload 顺序**：`Globals`（project.godot 第 20 行）排在
++	# `NetworkManager`（第 24 行）**之前**，所以这里读得到也改得动。
++	# 版本串只在**连线握手时**才被读，改得再早都来得及。
++	#
++	# 发新版 mod 就改 MP8_VERSION_TAG —— 老版本的人会被干净地挡在门外。
++	# 主菜单右下角那个版本号（`main_menu.gd:66`）也会跟着显示，
++	# 一眼就能看出对面装没装、装的是不是同一版。
++	if not Globals.game_version.contains(MP8_VERSION_TAG):
++		Globals.game_version += "+" + MP8_VERSION_TAG
++		print("[MP8] 版本握手：game_version = %s" % Globals.game_version)
++
+ 	var args = Array(OS.get_cmdline_args())
+ 	if args.has("-trailer"):
+ 		max_player_count = MAX_DEBUG_PLAYERS
+ 
+-	if not OS.has_feature("editor"):
++	# [MP8] 带 -debug-tools 启动时不强制 Steam，保留默认的 Enet 后端（本机多开测试用）
++	if not OS.has_feature("editor") and not args.has("-debug-tools"):
+ 		active_backend_type = NetworkBackendType.Steam
+ 		create_backend()
+ 
++	# [MP8] UID 解析自检：崩溃排查用。
++	# 现象：用 preload("uid://...") 的小游戏（猎鸭、致命反弹）一加载就 0xc0000005 原生崩溃，
++	# 用 preload("res://...") 的（立足之本）正常。怀疑重打包后 UID 注册表没了，
++	# uid:// 解析成空，null.instantiate() 直接原生访问违例。
++	# 本自检不开局、单实例即可跑：传 mp8uidtest。
++	if args.has("mp8uidtest"):
++		_mp8_uid_selftest()
++
++	# [MP8] 出生点补位钩子
++	_mp8_no_topup = args.has("mp8notopup")
++	_mp8_no_audit = args.has("mp8noaudit")
++	if _mp8_no_topup or _mp8_no_audit:
++		print("[MP8] 排查开关：notopup=%s noaudit=%s" % [str(_mp8_no_topup), str(_mp8_no_audit)])
++	get_tree().node_added.connect(_mp8_on_node_added)
++
++# [MP8] UID 解析自检。逐个检查崩溃小游戏里用到的 uid://，看能不能查到路径、能不能真的载出来。
++# 对照组是立足之本用的 res:// 路径（已验证该游戏能正常跑）。
++func _mp8_uid_selftest() -> void :
++
++	var cases := [
++		["uid://cav2dhye17owt", "猎鸭-鸭子玩家"],
++		["uid://bg7h0g6d2m2xu", "猎鸭-猎人玩家"],
++		["uid://badl26ts540cw", "致命反弹-roomba"],
++		["uid://w6wpt3kvl74p",  "致命反弹-玩家"],
++		["uid://cyhptkj072mxh", "餐桌礼仪-玩家"],
++		["uid://bwixccr50fbc2", "赛前说明-输入标签(本 mod 已改过此脚本)"],
++	]
++
++	print("[MP8-UID] ========== UID 解析自检 ==========")
++
++	for c in cases:
++		var txt: String = c[0]
++		var who: String = c[1]
++
++		var id: int = ResourceUID.text_to_id(txt)
++		var known: bool = ResourceUID.has_id(id)
++		var path: String = ""
++		if known:
++			path = ResourceUID.get_id_path(id)
++
++		var loaded: String = "未尝试"
++		if known:
++			var r = ResourceLoader.load(path)
++			loaded = "OK" if r != null else "载入返回 null"
++		else:
++			var r2 = ResourceLoader.load(txt)
++			loaded = "OK(直接用uid)" if r2 != null else "失败"
++
++		print("[MP8-UID] %-14s 注册=%s 路径=%s 载入=%s  <- %s" % [
++			txt, str(known), path, loaded, who
++		])
++
++	# 对照：立足之本用的是 res:// 直路径，该游戏已验证能跑
++	var ref := "res://minigames/disco_dodge/components/player/disco_dodge_player.tscn"
++	print("[MP8-UID] 对照 res:// 存在=%s 载入=%s" % [
++		str(ResourceLoader.exists(ref)), str(ResourceLoader.load(ref) != null)
++	])
++	print("[MP8-UID] ========== 自检结束 ==========")
++
++
++# [MP8] ================ 出生点运行时补位 ================
++# 各小游戏场景里的出生点容器只摆了 4 个 Marker（duck_hunt 只有 3 个鸭子位）。
++# spawn_players() 用 positions[counter] 取值，既没取模也没有边界检查，超出的
++# 玩家会拿到 null，teleport_rpc 收到 Nil 被中止，人就留在默认位置。
++# 这里在容器进树时把它补足到 MAX_PLAYERS 个，新点位取相邻两个原始点的中点，
++# 保证落在有效场地内。不改任何 .tscn，17 个小游戏共用。
++
++const MP8_SPAWN_CONTAINERS: Array[String] = [
++	"playerspawnpositions",
++	"player spawn positions",
++	"spawnpositions",
++	"playerpositions",
++	"playerspawn",
++	"playerspawnparent",
++	# [MP8] "duckplayerspawnpositions" 已从这里**移除**（2026-08-15，T6b）：
++	# 通用算法取相邻两点的中点，对猎鸭那 3 个点会算出**重合**的出生点——
++	# j=1 时 (-5,+5) 的中点 = 0，与原版 Marker3D 完全重合，实测两对鸭子叠在一起。
++	# 猎鸭改成自己补：duck_hunt.gd 的 _mp8_ensure_duck_spawns()，
++	# 沿 z=104 这排按间距 5 向两侧交替延伸。
++	# [MP8] "workstationspawns" 已从这里**移除**（2026-08-16，T21）：
++	# 枪械工厂那 4 个工位在场地四角，通用算法取相邻两点的中点 = 四条边的中点，
++	# 实测 4 个新位里有 3 个落在实体内部（probe33 量的）：
++	#   mid(0-1) @ (-7.29, 0.00) → 配方指示灯那面墙的碰撞盒 Box 4×4.5×9，距离 0.00
++	#   mid(2-3) @ (10.75, 0.10) → 货盘 0.10 + 墙体碰撞盒 0.34
++	#   mid(3-0) @ ( 1.68,-7.88) → 中央料台 desk left 1.62（工作台半宽 1.18，擦上）
++	# 现在改由 manufacture_gun.gd 的 _mp8_expand_workstations() 按"四角配对"自己摆
++	# （每个原版工位沿墙朝场地中心平移 3.2 米加一张搭档桌）。
++	# 全项目只有 manufacture_gun 用这个容器名（已 grep 确认），摘掉不影响别的小游戏。
++	"spectatepositions",
++]
++
++# [MP8] A/B 开关：排查崩溃时用来隔离"是本 mod 的运行时改动造成的"还是"原版就崩"。
++#   mp8notopup  = 不做出生点补位
++#   mp8noaudit  = 不打侦察日志
++# 两个都是命令行传入，缓存在 _ready() 里（每帧/每节点读 cmdline 太浪费）。
++var _mp8_no_topup: bool = false
++var _mp8_no_audit: bool = false
++
++func _mp8_on_node_added(node: Node) -> void :
++
++	if node is MultiplayerMenuLobbyHandler:
++		_mp8_extend_lobby.call_deferred(node)
++		return
++
++	# [MP8-AUDIT] 只读侦察：小游戏进树时把出生点相关的节点/数组全打出来，不改任何东西
++	if node is Minigame and not _mp8_no_audit:
++		_mp8_audit.call_deferred(node)
++
++	if _mp8_no_topup:
++		return
++
++	# [MP8] T4b：数组式出生点（见下方 _mp8_topup_spawn_arrays 的大段注释）
++	if node is Minigame:
++		_mp8_topup_spawn_arrays.call_deferred(node)
++
++	if not MP8_SPAWN_CONTAINERS.has(String(node.name).to_lower()):
++		return
++
++	_mp8_topup.call_deferred(node)
++
++# 大厅的玩家展示位（3D 模型 + 名牌 + 换装器）是 @export 数组，场景里只填了 4 项。
++# update_player_list() 按 counter 逐个索引，第 5 人就越界，人不会显示。
++# 这里复制最后一个展示位，沿最后两位的间距继续排下去，补到 MAX_PLAYERS 个。
++func _mp8_extend_lobby(h) -> void :
++
++	if not is_instance_valid(h):
++		return
++
++	var n: int = h.players.size()
++
++	print("[MP8] extend_lobby 命中 handler=%s players=%d models=%s" % [
++		str(h.get_path()), n, str(h.get("player_models"))
++	])
++
++	if n < 2 or n >= MAX_PLAYERS:
++		print("[MP8]   跳过（n=%d 不在 2..%d 之间）" % [n, MAX_PLAYERS])
++		return
++
++	if h.customization_assigners.size() < n or h.nametags.size() < n:
++		return
++
++	var parent = h.players[0].get_parent()
++
++	# 原版这 4 个位本来就是对的（美术把真实摆位烘进了 Armature 局部坐标，
++	# 每个位的偏移都不一样，所以千万别去重排它们）。
++	# 做法：把这 4 个位整份复制，再整体平移一段当第二排。
++	# 副本继承完全相同的烘焙偏移，所以第二排的排布和原版一模一样，只是往前挪了。
++	for j in range(MAX_PLAYERS - n):
++
++		var src_slot = h.players[j % n]
++		var src_assigner = h.customization_assigners[j % n]
++		var src_nametag = h.nametags[j % n]
++
++		if not src_slot.is_ancestor_of(src_assigner) or not src_slot.is_ancestor_of(src_nametag):
++			print("[MP8] 展示位 %d 结构异常，跳过" % (j % n))
++			continue
++
++		var rel_a: NodePath = src_slot.get_path_to(src_assigner)
++		var rel_t: NodePath = src_slot.get_path_to(src_nametag)
++
++		var dup = src_slot.duplicate()
++		dup.name = "MP8Slot%d" % (n + j)
++		parent.add_child(dup)
++		dup.position = src_slot.position + MP8_ROW2_OFFSET
++		dup.visible = false
++
++		h.players.append(dup)
++		h.customization_assigners.append(dup.get_node(rel_a))
++		h.nametags.append(dup.get_node(rel_t))
++
++	# 椅子也照搬：把场景里可见的装饰椅子整组复制并平移同样的量，
++	# 第二排的人就落在和原版一样的相对位置上。
++	_mp8_clone_chairs(parent, MP8_ROW2_OFFSET)
++
++	# 第二排更靠近摄像机，稍微拉远一点留出余量
++	var cam = parent.get_parent().get_node_or_null("Camera3D")
++	if cam:
++		var before = cam.position
++		cam.position = Vector3(before.x, before.y * 1.08, before.z * 1.22)
++		print("[MP8] camera %s -> %s" % [str(before), str(cam.position)])
++
++	print("[MP8] lobby slots: %d -> %d（第二排平移 %s）" % [n, h.players.size(), str(MP8_ROW2_OFFSET)])
++
++	# 排完立刻打一次，4 秒后再打一次：
++	# 两次一致 -> 公式生效但视觉判断有误；两次不同 -> 被别的代码覆盖了。
++	_mp8_dump_slots(h, "刚排完")
++	await get_tree().create_timer(4.0).timeout
++	if is_instance_valid(h):
++		_mp8_dump_slots(h, "4秒后")
++
++
++# 第二排相对原版 4 位的平移量。只有这一个数需要调：
++#   z 变大 = 更靠近摄像机（更靠画面下方），x 变大 = 更靠右。
++const MP8_ROW2_OFFSET := Vector3(0.6, 0.0, 5.2)
++
++
++# 把场景里可见的装饰椅子整组复制一份并平移同样的量，
++# 这样第二排的人和椅子的相对关系跟原版完全一致。
++func _mp8_clone_chairs(parent, offset: Vector3) -> void :
++
++	var env = parent.get_parent().get_node_or_null("lobby environment1")
++	if env == null:
++		print("[MP8] 找不到 lobby environment1，跳过椅子")
++		return
++
++	if env.has_node("MP8ChairRow"):
++		return
++
++	var holder := Node3D.new()
++	holder.name = "MP8ChairRow"
++	env.add_child(holder)
++
++	var cloned: int = 0
++	for c in env.get_children():
++		if c == holder:
++			continue
++		if not (c is Node3D) or not c.visible:
++			continue
++		if not String(c.name).to_lower().begins_with("chair"):
++			continue
++		var d = c.duplicate()
++		d.name = "MP8" + String(c.name)
++		holder.add_child(d)
++		d.transform = c.transform
++		d.position = c.position + offset
++		d.visible = true
++		cloned += 1
++
++	print("[MP8] 复制椅子 %d 把，平移 %s" % [cloned, str(offset)])
++
++
++func _mp8_dump_slots(h, tag: String) -> void :
++
++	print("[MP8] ---- 展示位坐标（%s） ----" % tag)
++	for i in h.players.size():
++		var s = h.players[i]
++		if not is_instance_valid(s):
++			print("[MP8]   slot %d <invalid>" % i)
++			continue
++		print("[MP8]   slot %d '%s' pos=%s gpos=%s vis=%s chair=%s" % [
++			i, str(s.name), str(s.position), str(s.global_position),
++			str(s.visible), str(_mp8_find_chair(s))
++		])
++
++
++# 在展示位子树里找椅子网格。找得到 -> 椅子跟着位走；找不到 -> 椅子是场景里的独立装饰。
++func _mp8_find_chair(node: Node) -> String :
++
++	for c in node.get_children():
++		if String(c.name).to_lower().contains("chair"):
++			return String(c.name)
++		var deeper: String = _mp8_find_chair(c)
++		if deeper != "":
++			return deeper
++	return ""
++
++# [MP8-AUDIT] 纯只读侦察，不改任何节点、不改任何数组，只打日志。
++# 目的：一局就看清每个小游戏的出生点到底存在哪、哪些没被 MP8_SPAWN_CONTAINERS 覆盖。
++# 源码里出生点有两种存法：容器节点（get_children 取点）和 @export Array[Node3D]（直接是引用数组），
++# 后者没有"容器"可言，所以这里两种都打。
++func _mp8_audit(mg: Node) -> void :
++
++	if not is_instance_valid(mg):
++		return
++
++	var script_path: String = "?"
++	if mg.get_script():
++		script_path = String(mg.get_script().resource_path)
++
++	print("[MP8-AUDIT] ========== 小游戏 '%s' ==========" % str(mg.name))
++	print("[MP8-AUDIT] script=%s is_server=%s 玩家数=%d" % [
++		script_path, str(multiplayer.is_server()), PlayerManager.player_presences.size()
++	])
++
++	print("[MP8-AUDIT] -- 脚本属性 --")
++	for p in mg.get_property_list():
++
++		if not (int(p.get("usage", 0)) & PROPERTY_USAGE_SCRIPT_VARIABLE):
++			continue
++
++		var pname: String = String(p.get("name", ""))
++		var v = mg.get(pname)
++
++		if v is Array:
++			if v.size() > 0 and v.size() < MAX_PLAYERS:
++				print("[MP8-AUDIT]   [数组] %s 长度=%d" % [pname, v.size()])
++			continue
++
++		if v is Node3D:
++			var ln: String = pname.to_lower()
++			if ln.contains("spawn") or ln.contains("position"):
++				print("[MP8-AUDIT]   [容器] %s -> '%s' 子节点=%d" % [
++					pname, str(v.name), v.get_child_count()
++				])
++
++	print("[MP8-AUDIT] -- 子树里带 spawn/position 的节点 --")
++	_mp8_audit_walk(mg, mg, 0)
++	print("[MP8-AUDIT] ========== 侦察结束 ==========")
++
++
++func _mp8_audit_walk(root: Node, node: Node, depth: int) -> void :
++
++	if depth > 8:
++		return
++
++	for c in node.get_children():
++
++		var ln: String = String(c.name).to_lower()
++		if ln.contains("spawn") or ln.contains("position"):
++
++			print("[MP8-AUDIT]   %s [%s] 子节点=%d" % [
++				str(root.get_path_to(c)), c.get_class(), c.get_child_count()
++			])
++
++			# 把点位坐标也打出来：补位要"按原版间隔平移复制"，
++			# 得先知道原版间隔是多少。静态读 .scn 读不了（二进制+脚本依赖），
++			# 运行时读到的还是真实世界坐标，更准。
++			if c.get_child_count() > 0 and c.get_child_count() <= 12:
++				for gc in c.get_children():
++					if gc is Node3D:
++						print("[MP8-AUDIT]       %-22s pos=%s gpos=%s rot=%s" % [
++							str(gc.name), str(gc.position),
++							str(gc.global_position), str(gc.rotation_degrees)
++						])
++
++			if c is Node3D:
++				print("[MP8-AUDIT]       (容器自身) gpos=%s" % str(c.global_position))
++
++		_mp8_audit_walk(root, c, depth + 1)
++
++
++# [MP8] ============ T4b：数组式出生点的补位 ============
++#
++# 出生点在源码里有**两种存法**，节点名白名单（MP8_SPAWN_CONTAINERS）只覆盖了第一种：
++#
++#   (a) 容器式  `@export var xxx_node: Node3D`        取点用 node.get_children()
++#   (b) 数组式  `@export var xxx: Array[Node3D]`      **直接索引数组**
++#
++# (b) 式压根没有"容器"这个概念 —— 往 `PlayerSpawnPositions` 容器里塞 Marker 完全无效，
++# 因为 spawn_players() 读的是那个烘死了 4 个引用的数组。三个 (b) 式的小游戏
++# （雷区 1 / 逆向行进 2 / 吸烟小憩 4）因此一直没法适配，这就是 HANDOFF 的 P1-C。
++#
++# 属性名 `player_spawn_positions` 是**从反编译源码逐个读出来的确定事实，不是猜的**。
++# green_pea 用同名属性但存的是容器（Node3D），所以这里按**类型**分流：
++# 只有真是 Array 才走这条路，容器仍旧交给已验证过的节点名那条路，互不打架。
++const MP8_SPAWN_ARRAY_PROPS: Array[String] = [
++	"player_spawn_positions",
++]
++
++
++func _mp8_topup_spawn_arrays(mg: Node) -> void :
++
++	if not is_instance_valid(mg):
++		return
++
++	# 小游戏自己管出生点的（逆向行进按履带摆位、猎鸭按鸭子排摆位），这里一律不插手。
++	# 用 Object.get() 取标志位：属性不存在时返回 null，不会报错。
++	if mg.get("mp8_owns_spawns") == true:
++		return
++
++	for pname in MP8_SPAWN_ARRAY_PROPS:
++
++		var arr = mg.get(pname)
++		if not (arr is Array):
++			continue
++		if arr.size() == 0 or arr.size() >= MAX_PLAYERS:
++			continue
++
++		var originals: Array = []
++		for e in arr:
++			if not (e is Node3D):
++				originals.clear()
++				break
++			originals.append(e)
++		if originals.is_empty():
++			continue
++
++		var pts: Array[Vector3] = []
++		for o in originals:
++			pts.append(o.global_position)
++
++		var extra: Array[Vector3] = _mp8_spread_inside(pts, MAX_PLAYERS)
++
++		var holder: Node = originals[0].get_parent()
++		var added := PackedStringArray()
++
++		for p in extra:
++			# 模板取**离新点最近的那个原始点**：位置以外的属性（旋转、缩放、脚本）
++			# 就近继承。吸烟小憩要用 global_rotation，抄错朝向人会背对着栏杆。
++			var tmpl: Node3D = originals[0]
++			var best: float = INF
++			for o in originals:
++				var d: float = o.global_position.distance_to(p)
++				if d < best:
++					best = d
++					tmpl = o
++
++			var dup: Node3D = tmpl.duplicate()
++			dup.name = "MP8Spawn%d" % arr.size()
++			holder.add_child(dup)
++			dup.global_position = p
++			arr.append(dup)
++			added.append("(%.2f, %.2f, %.2f)" % [p.x, p.y, p.z])
++
++		# 自检：把最小间距打出来。两点重合是这类补位最典型的坏法
++		# （通用取中点算法对 3 个点就会算出重合位，猎鸭上栽过），
++		# 光看"4 -> 8 成功"这行日志是看不出来的。
++		var min_d: float = INF
++		for i in arr.size():
++			for j in range(i + 1, arr.size()):
++				min_d = minf(min_d, arr[i].global_position.distance_to(arr[j].global_position))
++
++		print("[MP8] spawn array '%s' (%s): %d -> %d，新增 %s，最小间距 %.2f 米%s" % [
++			pname, str(mg.name), originals.size(), arr.size(),
++			", ".join(added), min_d,
++			"  ⚠️ 太近！" if min_d < 0.8 else ""
++		])
++
++
++# 在原始点的**凸包内**再挑 want-n 个点，使所有点之间的最小间距尽量大。
++#
++# 两条硬约束，都是踩过坑总结出来的：
++#   1. **不动原始点** —— 原版坐标是唯一被背书过"一定在界内"的东西。
++#   2. **新点只能是原始点的凸组合** —— 凸组合必落在凸包内，天然不会跑到场地外面去
++#      （猎鸭第一版按原间距往外扩，实测有人跳出地图）。
++#
++# 做法是最远点插入：候选池 = 每两个原始点之间的 1/8..7/8 等分点，
++# 每轮挑"离已选点集最远"的那个。比"取相邻两点中点"稳得多 ——
++# 后者对 4 个等距共线点会算出**两个完全重合**的新点（实测：逆向行进的
++# mid(1,2) 与 mid(3,0) 相差 0.02 米，两个人叠在一起）。
++func _mp8_spread_inside(originals: Array[Vector3], want: int) -> Array[Vector3] :
++
++	var chosen: Array[Vector3] = originals.duplicate()
++	var result: Array[Vector3] = []
++
++	if originals.size() < 2 or want <= originals.size():
++		return result
++
++	var pool: Array[Vector3] = []
++	for i in originals.size():
++		for j in range(i + 1, originals.size()):
++			for k in range(1, 8):
++				pool.append(originals[i].lerp(originals[j], float(k) / 8.0))
++
++	while chosen.size() < want:
++
++		var best: Vector3 = pool[0]
++		var best_d: float = -1.0
++
++		for c in pool:
++			var d: float = INF
++			for ch in chosen:
++				d = minf(d, c.distance_to(ch))
++			if d > best_d:
++				best_d = d
++				best = c
++
++		chosen.append(best)
++		result.append(best)
++
++	return result
++
++
++func _mp8_topup(container: Node) -> void :
++
++	if not is_instance_valid(container):
++		return
++
++	# 小游戏自己管出生点的，容器这条路也别插手 —— 否则会往容器里塞一堆
++	# **没人读的** Marker（逆向行进实测多出 4 个），日志上还会打出一行
++	# "PlayerSpawnPositions: 4 -> 8" 误导排查。
++	var up: Node = container
++	while up != null:
++		if up is Minigame:
++			if up.get("mp8_owns_spawns") == true:
++				return
++			break
++		up = up.get_parent()
++
++	var originals = container.get_children()
++	var n: int = originals.size()
++
++	if n == 0 or n >= MAX_PLAYERS:
++		return
++
++	for j in range(MAX_PLAYERS - n):
++
++		var a = originals[j % n]
++		var b = originals[(j + 1) % n]
++
++		if not (a is Node3D) or not (b is Node3D):
++			return
++
++		var extra = a.duplicate()
++		extra.name = "MP8Extra%d" % j
++		container.add_child(extra)
++		extra.position = a.position.lerp(b.position, 0.5 if j < n else 0.25)
++
++	print("[MP8] spawn container '%s': %d -> %d" % [container.name, n, container.get_child_count()])
++
+ func is_active() -> bool:
+ 
+ 	if not multiplayer:

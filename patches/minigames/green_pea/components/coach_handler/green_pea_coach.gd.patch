@@ -1,0 +1,52 @@
+diff --git a/minigames/green_pea/components/coach_handler/green_pea_coach.gd b/minigames/green_pea/components/coach_handler/green_pea_coach.gd
+--- a/minigames/green_pea/components/coach_handler/green_pea_coach.gd
++++ b/minigames/green_pea/components/coach_handler/green_pea_coach.gd
+@@ -24,6 +24,20 @@ class_name GreenPeaCoach extends Node3D
+ 
+ signal execution_finished()
+ 
++# [MP8] 座位号 → 用哪个 coach_shoot_position_N 动画。
++# 由 green_pea.gd 的 _mp8_map_animations() 按实际坐标算好写进来（每个端各算一次，
++# 因为 shoot_player 是 call_local 广播，每台机器都要播动画）。
++# 空表 = 没初始化，直接用座位号本身（≤4 人时两者恒等，与原版逐值一致）。
++var mp8_anim_by_seat: Array = []
++
++
++func _mp8_anim_index(seat: int) -> int :
++
++	if seat >= 0 and seat < mp8_anim_by_seat.size():
++		return int(mp8_anim_by_seat[seat])
++
++	return seat
++
+ var is_first_newspaper_sound = true
+ 
+ func _ready() -> void :
+@@ -73,7 +87,11 @@ func shoot_player(seat_position_to_shoot: int):
+ 	anim_coach.play("coach_deagle_ready_up", 0.5)
+ 	await get_tree().create_timer(1.1, false).timeout
+ 
+-	var anim_name = "coach_shoot_position_" + str(seat_position_to_shoot)
++	# [MP8] 全表只有 coach_shoot_position_0..3（probe47 列过），座位 4~7 得借同侧最近那个。
++	# 映射由小游戏在 _mp8_map_animations() 里按实际坐标算好写进来，每个端各算一次。
++	# ⚠️ 不借的话这里会去播一个**不存在的动画**：不会卡死（整段走的是固定 create_timer，
++	#    不是 await animation_finished），但教练不抬枪不瞄准，人凭空就死了。
++	var anim_name = "coach_shoot_position_" + str(_mp8_anim_index(seat_position_to_shoot))
+ 	anim_coach.play(anim_name, 0.2)
+ 	gun_shot_visuals(seat_position_to_shoot)
+ 	await get_tree().create_timer(4, false).timeout
+@@ -102,7 +120,13 @@ func gun_shot_visuals(seat_position_to_shoot: int):
+ 			anim_gun_fire.play("shoot")
+ 			shaker_camera.force_stop_shake()
+ 			shaker_camera.play_shake()
+-			decals_by_seat_index[seat_position_to_shoot].visible = true
++			# [MP8] 上界校验：原版这里是定长 4 项，座位 4~7 直接越界读（坑第 13 条）。
++			# 小游戏那边会把它补到 8；万一补失败，这里宁可不显血也不要报错中断
++			# —— 后面还有 `player.blood_decal_parent.visible = true` 要执行。
++			if seat_position_to_shoot < decals_by_seat_index.size():
++				var dec = decals_by_seat_index[seat_position_to_shoot]
++				if dec != null:
++					dec.visible = true
+ 			player.blood_decal_parent.visible = true
+ 
+ func pause_eating_for_players(position_being_shot: int):

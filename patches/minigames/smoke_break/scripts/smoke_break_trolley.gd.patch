@@ -1,0 +1,118 @@
+diff --git a/minigames/smoke_break/scripts/smoke_break_trolley.gd b/minigames/smoke_break/scripts/smoke_break_trolley.gd
+--- a/minigames/smoke_break/scripts/smoke_break_trolley.gd
++++ b/minigames/smoke_break/scripts/smoke_break_trolley.gd
+@@ -22,6 +22,68 @@ class_name SmokeBreak_Trolley extends Node
+ 
+ var smoke_particle_active_index = -1
+ 
++# [MP8] 哪些座位死的时候要点亮"风扇血迹"。原版是硬编码 `if seat in [1, 2]`，
++# 新座位得按它继承到的死亡动画来判（继承 death_fan 的就算）。
++var _mp8_fan_seats: Array[int] = [1, 2]
++
++
++# [MP8] 由小游戏在 _ready() 里调，把扩好的座位表交过来。
++#
++# 为什么不让推车自己扩：它是小游戏根节点的**子节点**，`_ready()` 比根节点**先**跑
++# （Godot 是子孙先 ready），那时候小游戏还没算出新座位。所以顺序做成显式调用，不靠猜。
++func mp8_extend_seat_arrays(new_rots: Array, seats: Array) -> void :
++
++	# ---- ① 左轮转角：整表换成扩好的（前 4 项与原版逐值相同）----
++	var typed: Array[Vector3] = []
++	for r in new_rots:
++		typed.append(r as Vector3)
++	rot_by_seat_index_array = typed
++
++	# ---- ② 血迹：给新座位各复制一组，整组平移到新座位 ----
++	var made := PackedStringArray()
++	while blood_decals_by_seat_index_array.size() < seats.size():
++
++		var idx: int = blood_decals_by_seat_index_array.size()
++		var seat_pos: Vector3 = (seats[idx] as Node3D).global_position
++
++		# 挑空间上最近的原版座位那一组当模子
++		var src_i: int = 0
++		var bd: float = INF
++		for i in mini(4, seats.size()):
++			var d: float = seat_pos.distance_to((seats[i] as Node3D).global_position)
++			if d < bd and i < blood_decals_by_seat_index_array.size():
++				bd = d
++				src_i = i
++
++		var src: Node3D = blood_decals_by_seat_index_array[src_i]
++		if src == null or not is_instance_valid(src):
++			blood_decals_by_seat_index_array.append(null)
++			continue
++
++		var dup: Node3D = src.duplicate()
++		dup.name = "MP8BloodSeat%d" % idx
++		src.get_parent().add_child(dup)
++		# 整组平移：血迹是这组节点的**子节点**（各自有世界位置），
++		# 挪父节点就整组跟着走，不用知道每块的偏移 —— 大厅排布那条教训。
++		dup.global_position = src.global_position + (
++			seat_pos - (seats[src_i] as Node3D).global_position
++		)
++		dup.visible = false
++		blood_decals_by_seat_index_array.append(dup)
++
++		# 风扇血迹跟着模子走：模子是 1/2 号座位的，新座位也算"朝风扇"
++		if src_i in [1, 2]:
++			_mp8_fan_seats.append(idx)
++
++		made.append("座位%d←抄座位%d" % [idx, src_i])
++
++	print("[MP8] 吸烟小憩·推车：转角表 %d 项 / 血迹 %d 组（新建 %s）/ 烟雾粒子 %d 个（取模复用）/ 风扇座位 %s" % [
++		rot_by_seat_index_array.size(), blood_decals_by_seat_index_array.size(),
++		(" ".join(made) if made.size() > 0 else "无"),
++		particles_smoke.size(), str(_mp8_fan_seats)
++	])
++
++
+ @rpc("any_peer", "call_local", "reliable")
+ func eliminate_players_routine_rpc(player_seats_to_eliminate):
+ 
+@@ -45,6 +107,14 @@ func setup_trolley():
+ func shoot_player(seat: int):
+ 
+ 	smoke_particle_active_index += 1
++
++	# [MP8] 上界校验：转角表就算没扩成，也不能让整条枪毙流程崩掉
++	if seat < 0 or seat >= rot_by_seat_index_array.size():
++		push_warning("[MP8] 吸烟小憩：座位 %d 没有转角（表只有 %d 项），这一枪不转向" % [
++			seat, rot_by_seat_index_array.size()
++		])
++		return
++
+ 	var tweener = get_tree().create_tween().set_ease(Tween.EASE_IN_OUT).set_trans(Tween.TRANS_ELASTIC)
+ 	var rot_destination = rot_by_seat_index_array[seat]
+ 	var rot_duration = 0.3
+@@ -53,7 +123,11 @@ func shoot_player(seat: int):
+ 	anim_revolver_firing.play("fire")
+ 	fire_audio_player.stop()
+ 	fire_audio_player.play(0.0)
+-	particles_smoke[smoke_particle_active_index].emitting = true
++	# [MP8] ⚠️ **必崩项**：原版 `particles_smoke` 只有 4 个，而 index 每开一枪 +1。
++	# 每轮前 3 名得分、其余**全部**枪毙 → 4 人最多 4 发（正好用满，原版卡在边界上），
++	# **8 人最多 8 发，第 5 发就越界**。取模复用 —— 粒子只是枪口烟，重复用看不出来。
++	if particles_smoke.size() > 0:
++		particles_smoke[smoke_particle_active_index % particles_smoke.size()].emitting = true
+ 	shaker_trolley.force_stop_shake()
+ 	shaker_trolley.play_shake()
+ 
+@@ -68,6 +142,15 @@ func shoot_player(seat: int):
+ 
+ 	player_to_shoot.anim_handler.get_eliminated()
+ 	player_to_shoot.anim_handler.show_blood_on_player()
+-	blood_decals_by_seat_index_array[player_to_shoot.active_player_seat_index].visible = true
+-	if player_to_shoot.active_player_seat_index in [1, 2]:
++
++	# [MP8] 血迹同样做上界校验（新座位那几组是运行时复制的，万一没复制成别崩）
++	var si: int = player_to_shoot.active_player_seat_index
++	if si >= 0 and si < blood_decals_by_seat_index_array.size():
++		var bd: Node3D = blood_decals_by_seat_index_array[si]
++		if bd != null and is_instance_valid(bd):
++			bd.visible = true
++
++	# [MP8] 原版是硬编码 `if seat in [1, 2]` —— 那是"朝着风扇坐"的两个座位。
++	# 新座位按它继承到的死亡动画归类，表在 _mp8_fan_seats 里（≤4 人时就是 [1,2]，逐值一致）。
++	if si in _mp8_fan_seats:
+ 		blood_decal_fan.visible = true

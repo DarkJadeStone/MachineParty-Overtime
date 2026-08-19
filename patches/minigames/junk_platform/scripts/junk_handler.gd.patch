@@ -1,0 +1,131 @@
+diff --git a/minigames/junk_platform/scripts/junk_handler.gd b/minigames/junk_platform/scripts/junk_handler.gd
+--- a/minigames/junk_platform/scripts/junk_handler.gd
++++ b/minigames/junk_platform/scripts/junk_handler.gd
+@@ -11,6 +11,32 @@ const junk_scene = preload("uid://c0tipjbyg5ofd")
+ @export var max_junk: int = 40
+ @export var platform_radius: float = 6.0
+ 
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] 2026-08-19：停在平台上不动的残骸要主动回收，否则整局再也不掉石头
++# ═══════════════════════════════════════════════════════════════════════════
++#
++# 原版的回收链路**只有一条**：残骸掉出平台 → 撞进 `junk_catcher` 这个 Area3D
++# → `_on_catcher_body_entered()` → `reset_rpc()` + 塞回 `caught_junk` 池。
++# 平台**没有**回收，压缩机也没有（两边都不碰 reset_rpc / caught_junk）。
++#
++# 于是停在平台上、再也不掉下去的那些残骸**永久退出流通**：
++#   `_on_timer_timeout()` 取实例的顺序是「先掏 caught_junk，池空了才新建，
++#    而新建又卡着 counter < max_junk」——
++#   `counter` 只增不减，一旦 40 个全在平台上躺着，
++#   `junk_instance` 每个 tick 都是 null，**一块石头都不再掉**，这一局就废了。
++#
++# ⚠️ 8 人局比原版严重得多：掉落点是**每人一个**（`add_spawn_point` 每个玩家一次），
++# 一个 tick 就投 8 块，而间隔还从 3.0 秒一路压到 1.0 秒 ——
++# 40 块的池子十几秒就见底。原版 4 人是这个速度的一半，且平台更空、更容易掉下去。
++#
++# 修法：服务器每物理帧给每块**在场且没人拿着**的残骸记「静止了多久」，
++# 超过 mp8_stuck_recycle_time 就走和回收区**完全同一条路**（reset_rpc + 进池），
++# 下一个 tick 它就会被重新投放。池子恢复流通，counter 不用动。
++@export var mp8_stuck_recycle_time: float = 60.0
++# 判「没动」的速度阈值（米/秒）。静止刚体会被 Godot 挂起，速度就是 0；
++# 给一点余量是为了容忍物理抖动。慢慢滚动的（速度高于此值）不算卡住，计时归零。
++@export var mp8_stuck_speed_threshold: float = 0.15
++
+ @export_category("Nodes")
+ @export var junks_node: Node3D
+ @export var timer: Timer
+@@ -25,6 +51,12 @@ var junk_instances: Dictionary[int, JunkCubeRigidbody]
+ var caught_junk: Array[JunkCubeRigidbody]
+ var elapsed: float = 0.0
+ 
++# [MP8] 每块残骸「已经静止了多少秒」，键与 junk_instances 同一套下标。
++# 只有服务器读写（回收判定整个都在服务器侧，客户端拿到的是广播下来的变换）。
++var mp8_idle_time: Dictionary[int, float] = {}
++# 本局主动回收了几块，只为日志
++var mp8_stuck_recycled: int = 0
++
+ func _ready() -> void :
+ 
+ 	if multiplayer.is_server():
+@@ -39,6 +71,11 @@ func _physics_process(_delta: float) -> void :
+ 	if active:
+ 		elapsed += _delta
+ 
++	# [MP8] 2026-08-19：先做卡死回收，再拍变换快照 ——
++	# 顺序有意如此：这一帧被回收掉的残骸 reset_rpc 之后 active 就是 false，
++	# 下面那个快照循环正好会把它跳过，不会再把 UP*999 那个位置广播出去。
++	_mp8_recycle_stuck_junk(_delta)
++
+ 	var data: Dictionary[int, Transform3D]
+ 	for k in junk_instances.keys():
+ 		if junk_instances[k].active:
+@@ -48,6 +85,12 @@ func _physics_process(_delta: float) -> void :
+ 
+ func set_active(_active: bool):
+ 	active = _active
++
++	# [MP8] 开打/停打都把静止计时清干净，免得跨阶段累加（见 _mp8_recycle_stuck_junk）
++	mp8_idle_time.clear()
++	if active:
++		mp8_stuck_recycled = 0
++
+ 	if active:
+ 		timer.start(spawn_interval)
+ 
+@@ -111,3 +154,56 @@ func _on_catcher_body_entered(body):
+ 	if body is JunkCubeRigidbody:
+ 		body.reset_rpc.rpc()
+ 		caught_junk.append(body)
++
++
++# ═══════ [MP8] 2026-08-19：卡在平台上不动的残骸，超时主动回收 ═══════
++#
++# 只在服务器跑（调用点 `_physics_process` 开头就 `is_server()` 早退了）。
++# 理由与整条链路见文件顶部 mp8_stuck_recycle_time 的大段注释。
++func _mp8_recycle_stuck_junk(delta: float) -> void :
++
++	# 不在游玩中就不计时：回合间/结算时残骸静止是正常的，
++	# 不清零的话下一轮一开局就会有一批被误判成"卡了一分钟"。
++	if not active:
++		mp8_idle_time.clear()
++		return
++
++	for k in junk_instances.keys():
++
++		var junk: JunkCubeRigidbody = junk_instances[k]
++
++		if not is_instance_valid(junk):
++			mp8_idle_time.erase(k)
++			continue
++
++		# 已经在池子里（或还没投放）—— reset_rpc 会把 active 置 false。
++		# 这一条同时也让"刚被回收区收走的"自动跳过，不会被重复塞进池子。
++		if not junk.active:
++			mp8_idle_time[k] = 0.0
++			continue
++
++		# 被玩家举在手上不算卡住：那是有人在用它（举着时 freeze=true、速度恒为 0，
++		# 不排除的话举一分钟就会在手里凭空消失）。
++		if junk.held_by:
++			mp8_idle_time[k] = 0.0
++			continue
++
++		# 还在动（掉落中 / 被扔出去 / 慢慢滚）—— 计时归零。
++		if junk.linear_velocity.length() > mp8_stuck_speed_threshold:
++			mp8_idle_time[k] = 0.0
++			continue
++
++		var idle: float = mp8_idle_time.get(k, 0.0) + delta
++
++		if idle < mp8_stuck_recycle_time:
++			mp8_idle_time[k] = idle
++			continue
++
++		# 超时：走**和回收区完全同一条路**，下一个 tick 就会被重新投放。
++		mp8_idle_time[k] = 0.0
++		junk.reset_rpc.rpc()
++		caught_junk.append(junk)
++
++		mp8_stuck_recycled += 1
++		print("[MP8] 残骸平台：#%d 静止超过 %.0f 秒，主动回收（本局第 %d 块，池中 %d）" % [
++			k, mp8_stuck_recycle_time, mp8_stuck_recycled, caught_junk.size()])

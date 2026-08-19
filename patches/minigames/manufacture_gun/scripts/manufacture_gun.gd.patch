@@ -1,0 +1,1719 @@
+diff --git a/minigames/manufacture_gun/scripts/manufacture_gun.gd b/minigames/manufacture_gun/scripts/manufacture_gun.gd
+--- a/minigames/manufacture_gun/scripts/manufacture_gun.gd
++++ b/minigames/manufacture_gun/scripts/manufacture_gun.gd
+@@ -57,9 +57,190 @@ var local_item_sequence: Dictionary
+ 
+ var ach_players_with_gun: Array[int]
+ 
++
++# [MP8] ================ 枪械工厂（ManufactureGun, mp8game=3）8 人适配 ================
++#
++# 场景事实（tools\probe\probe32/33/34/35 只读挂原装 PCK 量的，不是猜的）：
++#
++# 1. **出生点有三个容器，全是脚本里用 $ 硬取的，不是 @export**：
++#      $SpawnPositions          玩家出生点   4 个
++#      $WorkstationSpawns       工作台位     4 个
++#      $ItemSpawner/ItemSpawns  零件生成点   26 个
++#
++# 2. **`empty_desk_array` 运行时真值 = 4 项**（场景确实覆盖了，指向
++#    `empty_desks/desk0..3_empty`，四张空桌与四个工位位置逐值重合）。
++#    `remove_empty_workstation_rpc(counter)` 按 counter 索引 → 5~8 号越界读。
++#    ⚠️ `recipe_indicator_ligths` 是 5 项，但它按**配方步**（0~4）索引，与人数无关，不用动。
++#    全文件按下标访问的点只有 `empty_desk_array[...]` 这一处（已 grep 齐，坑第 13 条）。
++#
++# 3. ⚠️ **通用补位（network_manager 的节点名白名单）算出来的工位有 3 个在实体里**。
++#    `"workstationspawns"` 本来在白名单里，取相邻两点中点得到四条边的中点：
++#      mid(0-1) @ (-7.29, 0.00) → 配方指示灯那面墙的碰撞盒 Box 4×4.5×9，距离 0.00
++#      mid(2-3) @ (10.75, 0.10) → 货盘 0.10 + 墙体碰撞盒 0.34
++#      mid(3-0) @ ( 1.68,-7.88) → 中央料台 desk left 1.62（工作台半宽 1.18，擦上）
++#      mid(1-2) @ ( 1.78, 7.95) → desk trolley 1.10（半深 1.855 → 重叠 0.75）
++#    所以已把 `"workstationspawns"` **从白名单里摘掉**（见 network_manager.gd 的注释），
++#    改由本文件的 `_mp8_expand_workstations()` 按 MP8_LAYOUT_RING 那张坐标表摆。
++#    玩家出生点 `"spawnpositions"` 仍走通用补位 —— 它那 4 个中点实测都在空地上。
++#
++# 4. **零件不够会把局卡死**（8 人适配里最要命的一条）：
++#    场上零件 = ItemSpawns 的 26 个点，一点一个，**全部一次性消耗、不再生**
++#    （`ManufactureGunItem.NonConsumableItems` 是空数组）。每人配方固定是
++#    5 个变体各一个 → 26 个发下去每个变体只有 5~6 个，8 人要 8 个
++#    → **只有 5~6 人造得出枪**。而本局**没有任何超时**（play_state 是空的、
++#    Minigame 基类无计时、game.gd 也没兜底），结束条件只有"活人 ≤ 1"
++#    → 最后两个活人都没枪就**永远打不完**。所以零件必须按人数放大。
++#
++# 5. 相机不用动：8 个工位实测全在视锥内（横竖占比 ≤ 0.75）。
++
++const MP8_MAX_PLAYERS: int = 8
++
++# ❌ **废弃方案：四角配对（沿 x 平移 3.2 米）—— 用户实测否掉，别再走回去。**
++#
++# 症状：「外面一个桌子，里面一个桌子，里面那个桌子的玩家根本进不去」。
++# 根因（probe37 用数字钉死的）：**相机沿 +X 方向看**（相机在 (-17.89, 11.95, 0)，
++# 偏航 -90°），所以**屏幕横向位置 ≈ z ÷ 深度**。沿 x 平移 = 沿视线前后排，
++# 两张桌的 z 相同，屏幕横向只差一个深度比：
++#
++#   | | 屏幕横向位置 | 相邻间距 |
++#   | 原版 4 张 | -0.727 / -0.393 / +0.395 / +0.743 | 0.334 / 0.788 / 0.348 |
++#   | 配对 3.2 米 | 每对只差 **0.039 ~ 0.117** | —— |
++#
++# 而一张桌子自身在屏幕上就有 ±0.18 宽，所以两张**重叠 0.22**，等于一张盖住另一张。
++# 原版能看清纯属每面墙只放 2 张、且摆在两个极端（深度 14.9 vs 29.7，正好差一倍）。
++#
++# **教训（和坑第 21 条同一个形状）**：原版里「同一面墙上只有 2 张桌」把
++# 「屏幕横向 = z/深度」这条约束藏起来了；一旦往同一面墙塞第 3 张，约束立刻显形。
++# 判据：**摆位改动要拿屏幕投影验，不能只验"地上放不放得下"**。probe35 那轮
++# 只验了占地余量，全绿，然后实机一看全叠在一起。
++
++# ---- 现行方案：ring —— 用户 2026-08-16 手绘示意图定的「四周一圈、中间全空」----
++#
++# 用户画的是**屏幕视角**（配方显示板在图的下方中央）。方向换算已校准：
++#   图左→右 = 世界 z 从南到北     图上→下 = 世界 x 从远到近（相机在下方，沿 +X 看）
++# 校准依据：配方板真实位置是世界 x≈-8.2、z∈[-4.5,+4.5]，画在图的下方中央，对上了。
++#
++# 结构（probe37 的场地实况图逐格核对过）：
++#   上方一排 4 张：原版3(z=-8.2) / B(8,-3) / C(8,+3) / 原版2(z=+8.4)
++#   左中 1 张 A(南墙中段)   右中 1 张 D(北墙中段)   下方两角 = 原版0 / 原版1
++#
++# ⚠️ **B/C 摆在 x=+8.0 那条横带，不是贴东墙** —— 用户实机发现
++# 「右上角墙边有个零件刷新点」，实测东墙 x≥10.5 那一片全是零件点（part_011/012/016/025）
++# 加货盘 pallet_001 与墙体碰撞盒 CollisionShape3D2，桌子放不下也不该占。
++# 而 x∈[+6.0,+9.5] 是整片开阔地，从 z=-9.5 到 +9.5 全通，正好摆两张。
++#
++# 角度 90 = 用户说的"反转 90 度"：占地从 2.40(x)×3.80(z) 变成 3.80×2.40，
++# 屏幕上窄 37%，而且能塞进原来放不下的窄位 —— 南墙 x∈[-2,+2] 那段 z≤-9.5
++# 有墙体凸出来，桌子深 3.80 时顶上去，转成 2.40 才过得去。**不只是好看。**
++#
++# 验收数字（probe37）：8 个位置全部「放得下 + 够得着」；
++# 屏幕二维最小间距 **0.251**（原版 4 张是 0.334，上一版四角配对只有 0.112）。
++# 最挤的那一对（原版3 ↔ B）两张桌的屏幕半宽加起来 0.153 < 0.251，**不会重叠**。
++#
++# 备选 solver：probe37 在 978 个合法格里按"屏幕上离已选桌子最远"贪心挑的，
++# 间距更好（0.310）但不对称、且有一张在场地中部。命令行 `mp8gunlayout=solver` 切。
++#
++# ⚠️ 合法性判据以**原版 4 个位置全部判通**为校准基准（校了三轮才对）。
++#
++# ⚠️ 2026-08-19 已把**用户 2026-08-16 22:24 手摆的定稿**烘进这张表
++# （原本只存在于房主机器的 `user://mp8_gun_layout.txt` 里，是这一版 6 人局
++#  "客机路中间有张挡路的桌子"的直接原因 —— 见本文件 `_mp8_broadcast_layout()`）。
++# 烘之前的旧 ring（B/C 摆在 x=+8.0 的开阔地正中，就是那两张挡路的）留档：
++#     [Vector3(-1.50, 0.0, -7.00),  90.0]   # A 南墙中段
++#     [Vector3(-3.00, 0.0,  7.60),   0.0]   # D 北墙中段
++#     [Vector3( 8.00, 0.0, -3.00),  90.0]   # B 远端横带·南  ← 挡路
++#     [Vector3( 8.00, 0.0,  3.00),  90.0]   # C 远端横带·北  ← 挡路
++# 定稿把四张全推到了墙边，中间整片走道空出来。
++const MP8_LAYOUT_RING: Array = [
++	[Vector3(-3.50, 0.0, -10.50), 90.0],   # 新1 南墙边
++	[Vector3(-4.00, 0.0, 10.10), 270.0],   # 新2 北墙边
++	[Vector3(7.03, 0.0, -11.00), 90.0],    # 新3 南墙边·远端
++	[Vector3(11.50, 0.0, 2.50), 0.0],      # 新4 东墙边
++]
++const MP8_LAYOUT_SOLVER: Array = [
++	[Vector3(-1.50, 0.0, -7.00), 90.0],
++	[Vector3(-1.50, 0.0, 8.00), 0.0],
++	[Vector3(3.00, 0.0, 7.00), 90.0],
++	[Vector3(5.50, 0.0, 0.00), 0.0],
++]
++
++# 空桌与工位的位置匹配容差（实测两者 x/z 逐值相同，1 米足够宽松）
++const MP8_DESK_MATCH_TOL: float = 1.0
++
++# 零件撒点：新点 = 某个真实零件点 **朝同高度近邻**迈一小步。
++# 参数是 probe35 扫出来的（步长 × 近邻上限 各 4~5 档全跑过）：
++#   近邻上限 3.5 → 5~8 人全部 **0 个新引入的问题点**，同高度最小间距 0.45 米
++#   近邻上限 4.5 → 1 个； 6.0 → 2 个； 不限 → 3~4 个（点被撒进货盘/墙/料台）
++#   步长这个旋钮对问题点数**没有影响**（0.20~0.65 各档结果一样）
++#     → 说明出事的那几个基点本来就贴着障碍，缩步长救不回来，只能靠近邻上限筛掉。
++const MP8_ITEM_STEP: float = 0.45
++const MP8_ITEM_NEIGHBOUR_CAP: float = 3.5
++const MP8_ITEM_FLOOR_Y: float = 1.0
++
++# ---- [MP8] 桌位手调（用户 2026-08-16 定：坐标交给用户自己转，只动新增的 4 张）----
++#
++# 为什么要这个：布局已经被推翻两次（通用补位 → 四角配对 → ring），每一轮都是
++# agent 猜坐标 → 打包 → 用户实机看 → 推翻。旋钮交给用户，这个来回就没了。
++#
++# 存盘文件放 user://，也就是 %APPDATA%\Godot\app_userdata\Machine Party\。
++# ⚠️ 8 个实例**共用同一个 user:// 目录**（坑第 15 条）—— 这次这个特性是好事：
++# 存一份，8 个实例下次开局读到的是同一份，天然不会出现各机布局不一致。
++const MP8_LAYOUT_FILE: String = "user://mp8_gun_layout.txt"
++
++const MP8_EDIT_STEPS: Array[float] = [1.0, 0.5, 0.1]
++const MP8_EDIT_YAW_STEP: float = 15.0
++
++# 两张桌中心距的**安全下限**，probe36 实测的三个盒子推出来的（别改小）：
++#   玩家 InteractArea = 圆柱半径 1.00，挂在身前约 1 米
++#   工作台 InteractArea = Box 2.00 × 3.60（半深 1.80，半对角 2.06）
++# 站在自己桌前时手伸出去那个圈的圆心离本桌中心约 1.8 米，圈半径 1.0，
++# 另一张桌的感应盒又能伸出 1.8~2.06 → 1.8 + 1.0 + 2.06 ≈ 4.86。
++# 小于这个数就会出现"用 A 桌时 B 桌也在 interacts_in_range 里"。
++# 原版那个 `return` 在场时，后果是**这个人什么都干不了**；
++# 换成 `continue`（见 manufacture_gun_player.gd 的补丁）后只剩物理不重叠的要求，
++# 但这条线仍然当**黄灯**留着：贴这么近本来也不好看。
++const MP8_MIN_DESK_GAP: float = 4.9
++
++# 摆出生点时"这块地站得下人吗"的查询高度：只查腰以上一段（y≈0.68~2.08）。
++# ⚠️ 别贴地：贴地会把地板碰撞体本身查进来，于是**场地里到处都判占用、
++# 墙外面反而判空**，人就被摆到墙外去了（2026-08-16 用户实测踩过）。
++# 这个高度带和 probe35/37 校了三轮定下来的"站位只看腰以上 y 0.75~2.0"是同一条。
++const MP8_SPOT_PROBE_Y: float = 1.375
++# 候选方向的扫描步数：0°, ±15°, ±30°, ±45°, ±60°, ±75° —— **最多 ±75°，扫不出去**。
++# 超过 ±90° 就是背对场地中心 = 往墙外挪，那正是上面那个坑。
++const MP8_SPOT_SWEEP: int = 11
++
++var mp8_player_count: int = 0
++var _mp8_no_expand: bool = false
++var _mp8_layout: String = "ring"
++# 教程高亮框（PlayerMarker/bound box workspace indicator*）：原版 4 个 + 复制的
++var _mp8_ws_boxes: Array[MeshInstance3D] = []
++
++# ---- 手调模式的运行时状态 ----
++var _mp8_edit_on: bool = false          # 传 mp8gunedit 才开，默认全关
++var _mp8_edit_sel: int = 0              # 当前选中第几张新桌（0~3）
++var _mp8_edit_step_i: int = 1           # 步长档位，默认 0.5 米
++var _mp8_edit_panel: Label = null
++var _mp8_edit_canvas: CanvasLayer = null
++# 每张新桌的全部家当，**建的时候就把引用记下来**，不靠事后按位置认。
++# 一项 = { "marker": Node3D, "desk": Node3D, "box": MeshInstance3D,
++#          "ws": Node3D（工作台实体，开局后才有）, "tag": Label3D }
++var _mp8_slots: Array = []
++# 当前生效的新桌坐标表 [[Vector3, yaw], ...]，来源可能是文件也可能是内置常量
++var _mp8_layout_live: Array = []
++var _mp8_layout_src: String = "内置 ring"
++# 物理空间（摆出生点时问"这块地站得下人吗"用），在 _mp8_place_spawns() 里取一次
++var _mp8_space: PhysicsDirectSpaceState3D = null
++
++
+ func _ready() -> void :
+ 	super._ready()
+ 
++	# [MP8] 场地扩建必须跑在 initialize() 之前，而且**每台机器都要跑**：
++	# 空桌和教程高亮框都是各机本地的场景节点，不走网络同步。
++	# initialize() 只在服务器上跑，所以这段绝不能放进去。
++	_mp8_setup_field()
++
+ 	for c in item_sequence_preview_node_parent.get_children():
+ 		sequence_preview_nodes.append(c)
+ 
+@@ -90,6 +271,1282 @@ func _ready() -> void :
+ 		await get_tree().create_timer(1.0).timeout
+ 		minigame_ready.emit(1)
+ 
++
++# [MP8] 先把**运行时真值**打出来再动它（坑第 3 条：@export 的真实值以场景为准，
++# 脚本里的默认值是骗人的，本项目已因此翻车三次）。
++func _mp8_setup_field() -> void :
++
++	var args := Array(OS.get_cmdline_args())
++	_mp8_no_expand = args.has("mp8noexpand")
++	mp8_player_count = PlayerManager.player_presences.size()
++
++	var lay: String = _mp8_arg("mp8gunlayout=")
++	if lay == "ring" or lay == "solver":
++		_mp8_layout = lay
++	elif lay != "":
++		push_warning("[MP8] 枪械工厂：mp8gunlayout=%s 不认识，用默认 ring" % lay)
++
++	# [MP8] 手调模式：只有显式传 mp8gunedit 才开。**故意不跟着 -debug-tools 走** ——
++	# 它要抢一批按键，挂在 -debug-tools 上会让每次普通测试都莫名其妙地被抢键。
++	_mp8_edit_on = args.has("mp8gunedit")
++
++	# 生效顺序：存盘文件 > mp8gunlayout= > 内置 ring。mp8gunnofile 可以无视文件。
++	_mp8_build_live_layout(args.has("mp8gunnofile"))
++
++	print("[MP8] 枪械工厂：运行时真值 —— empty_desk_array %d 项 / recipe_indicator_ligths %d 项 / 工位 %d 个 / 玩家出生点 %d 个 / 零件点 %d 个；本局 %d 人" % [
++		empty_desk_array.size(),
++		recipe_indicator_ligths.size(),
++		_mp8_child_count("WorkstationSpawns"),
++		_mp8_child_count("SpawnPositions"),
++		_mp8_child_count("ItemSpawner/ItemSpawns"),
++		mp8_player_count,
++	])
++
++	# [MP8] 右上角"本局枪被削弱了"提示。放在早退之前 —— 削枪是跟着人数走的，
++	# 哪怕 mp8noexpand 不扩场地，枪照样会被削，提示就不能少。
++	_mp8_gun_hud()
++
++	if _mp8_no_expand:
++		print("[MP8] 枪械工厂：mp8noexpand，场地一个字不改（纯原版对照组，⚠️ 必须配 4 人）")
++		return
++
++	if mp8_player_count <= 4:
++		print("[MP8] 枪械工厂：%d 人，用原版 4 个工位，一个字不改" % mp8_player_count)
++		if _mp8_edit_on:
++			push_warning("[MP8] 枪械工厂：本局只有 %d 人，没有新增桌子可调，手调模式不启动" % mp8_player_count)
++		return
++
++	_mp8_expand_workstations(clampi(mp8_player_count, 5, MP8_MAX_PLAYERS))
++
++	if _mp8_edit_on:
++		_mp8_edit_begin()
++
++
++func _mp8_child_count(path: String) -> int :
++	var n: Node = get_node_or_null(path)
++	return (n.get_child_count() if n != null else -1)
++
++
++# [MP8] 右上角常驻一行「枪械已削弱 · <程度>」，蓝色（用户 2026-08-16 要的）。
++#
++# 照猎鸭那条已定的规矩：**只说方向和程度，不显示具体数值**
++# （用户 2026-08-15：数值是设计者的事，玩家只需要知道方向）。蓝 = 削弱，也沿用猎鸭的配色。
++#
++# 这是**每台机器一份的屏幕提示，不是每个玩家节点一份**：挂在小游戏根节点上建一次就行。
++# ⚠️ 猎鸭那边把 HUD 挂在玩家身上，结果每台机器的节点树里 8 个玩家各建一个 Label、
++# 右上角叠成一团，还得判 `network_id == multiplayer.get_unique_id()` 才治好。
++# 这里从一开始就建在小游戏上，天然没有那个问题。
++#
++# 程度按系数分档（不是按人数写死），这样 `mp8gunpower=` 临时调值时标签也跟着对：
++#   ≥1.0 不显示 | ≥0.875 略微 | ≥0.825 小幅 | ≥0.70 中等 | 其余 大幅
++# 对应默认表：5 人 0.90=略微、6 人 0.85=小幅、7 人 0.80=中等、8 人 0.60=大幅。
++func _mp8_gun_hud() -> void :
++
++	var m: float = _mp8_gun_power()
++	if m >= 1.0:
++		return          # 没削弱就什么都不显示（≤4 人 = 原版，屏幕上一个像素都不多）
++
++	var level: String
++	if m >= 0.875:
++		level = "略微"
++	elif m >= 0.825:
++		level = "小幅"
++	elif m >= 0.70:
++		level = "中等"
++	else:
++		level = "大幅"
++
++	# 用户 2026-08-16 定：**一律中文**（不跟语言设置走），
++	# 程度词嵌在「已」和「削弱」中间 —— 「枪械已大幅削弱」，不是「大幅 · 枪械已削弱」。
++	var txt: String = "枪械已%s削弱" % level
++
++	var layer := CanvasLayer.new()
++	layer.name = "MP8GunNerfHud"
++	layer.layer = 100
++	add_child(layer)
++
++	var lbl := Label.new()
++	lbl.set_anchors_preset(Control.PRESET_TOP_RIGHT)
++	lbl.offset_left = -640.0
++	lbl.offset_top = 14.0
++	lbl.offset_right = -18.0
++	lbl.offset_bottom = 54.0
++	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
++	lbl.text = txt
++
++	# ⚠️ 必须显式指定游戏自己的字体：默认主题字体**字距是坏的**，
++	# 实测会把 "P3  id 104…" 挤成 "P36idc104…"。猎鸭、残骸平台都栽过，这是第三次。
++	var f = load("res://fonts/Terminal F4.ttf")
++	if f != null:
++		lbl.add_theme_font_override("font", f)
++	lbl.add_theme_font_size_override("font_size", 26)
++	lbl.add_theme_color_override("font_color", Color(0.42, 0.71, 1.0))   # 蓝 = 削弱
++	lbl.add_theme_color_override("font_outline_color", Color.BLACK)
++	lbl.add_theme_constant_override("outline_size", 6)
++	lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
++	layer.add_child(lbl)
++
++	print("[MP8] 枪械工厂：右上角提示「%s」（系数 ×%.2f，本局 %d 人）" % [txt, m, mp8_player_count])
++
++
++# [MP8] 本局的"枪力系数"。表在 ManufactureGunPlayer 里（那儿才是用它的地方）。
++# 命令行 `mp8gunpower=<系数>` 可临时覆盖，不用重新编译 —— 调手感时用。
++func _mp8_gun_power() -> float :
++
++	var forced: String = _mp8_arg("mp8gunpower=")
++	if forced.is_valid_float():
++		var f: float = clampf(float(forced), 0.05, 4.0)
++		print("[MP8] 枪械工厂：命令行强制枪力 ×%.2f（本局 %d 人）" % [f, mp8_player_count])
++		return f
++
++	# 表里没有的人数（≤4，或者万一超过 8）一律 1.0 = 原版
++	return float(ManufactureGunPlayer.MP8_GUN_POWER_BY_COUNT.get(mp8_player_count, 1.0))
++
++
++# [MP8] 按 MP8_LAYOUT_* 表补工位。每个新位都是**整组复制原版 0 号那一组**
++# （工位标记 + 它那张空桌 + 它那个教程高亮框），再整组搬到目标位置、整组转到目标角度。
++# 四份原件是同一个预制件（空桌网格都是 2.36×2.14×3.71、高亮框都是 2.36×2.11×3.88，
++# probe33 量过），所以拿哪一份当模子都一样，用 0 号最省事也最确定。
++#
++# ⚠️ 为什么**不搬玩家出生点**：出生点交给 network_manager 的通用补位
++# （它那 4 个中点实测都在空地上）。自己搬过一版，把出生点跟工位一起平移，
++# 实测有 2 个落进实体（(-1.32,-5.15) 在中央料台的道具里、
++# (-1.32,+5.33) 直接在料台碰撞盒里）。代价是 5~8 号玩家离自己工位远一些，
++# 日志里会把每个人的距离打出来。
++func _mp8_expand_workstations(want: int) -> void :
++
++	var ws: Node3D = get_node_or_null("WorkstationSpawns") as Node3D
++	if ws == null:
++		push_warning("[MP8] 枪械工厂：找不到 WorkstationSpawns，工位没扩")
++		return
++
++	var originals: Array[Node3D] = []
++	for c in ws.get_children():
++		if c is Node3D:
++			originals.append(c)
++
++	if originals.is_empty():
++		push_warning("[MP8] 枪械工厂：一个工位都没有，扩不了")
++		return
++	if originals.size() >= want:
++		return
++
++	var desks: Node3D = get_node_or_null("empty_desks") as Node3D
++	_mp8_collect_workspace_boxes()
++
++	var layout: Array = _mp8_layout_live
++	var src: Node3D = originals[0]
++	var src_desk: Node3D = (_mp8_nearest_child(desks, src.global_position) if desks != null else null)
++	var src_box: MeshInstance3D = _mp8_nearest_box(src.global_position)
++
++	var added := PackedStringArray()
++
++	for i in layout.size():
++
++		if ws.get_child_count() >= want:
++			break
++
++		var target: Vector3 = layout[i][0]
++		var yaw: float = layout[i][1]
++
++		# ---- 工位标记 ----
++		var dup: Node3D = src.duplicate()
++		dup.name = "MP8Workstation%d" % i
++		ws.add_child(dup)
++		dup.global_position = Vector3(target.x, src.global_position.y, target.z)
++		dup.rotation_degrees = Vector3(0.0, yaw, 0.0)
++
++		# ---- 那张空桌 ----
++		var desk_note: String = "无空桌"
++		var d2: Node3D = null
++		if src_desk != null:
++			d2 = _mp8_clone_to(src_desk, target, yaw, "MP8%d" % i)
++			if d2 != null:
++				empty_desk_array.append(d2)
++				desk_note = String(src_desk.name)
++
++		# ---- 那个教程高亮框 ----
++		var b2: MeshInstance3D = null
++		if src_box != null:
++			var b = _mp8_clone_to(src_box, target, yaw, "MP8%d" % i)
++			if b is MeshInstance3D:
++				b2 = b
++				_mp8_ws_boxes.append(b2)
++
++		# [MP8] 手调模式要一次挪动这一整组家当，**建的时候就把引用记下来**。
++		# 不用事后按位置认：位置正是待会儿要被改的东西，拿它当钥匙会越挪越错
++		# （残骸平台"编号不可信、位置才可信"那条的反面 —— 位置会变时，引用才可信）。
++		_mp8_slots.append({
++			"marker": dup, "desk": d2, "box": b2, "ws": null, "tag": null,
++		})
++
++		added.append("新%d(%.2f,%.2f)转%.0f° 空桌 %s" % [
++			i, target.x, target.z, yaw, desk_note
++		])
++
++	print("[MP8] 枪械工厂：工位 %d → %d（摆法 %s）—— %s" % [
++		originals.size(), ws.get_child_count(), _mp8_layout_src, " | ".join(added)
++	])
++	print("[MP8] 枪械工厂：empty_desk_array %d → %d 项；教程高亮框 %d 个" % [
++		originals.size(), empty_desk_array.size(), _mp8_ws_boxes.size()
++	])
++
++	_mp8_check_slots(ws)
++
++
++# 整组复制里的一件：搬到目标水平位置、转到目标角度，**保留它自己的 y**
++# （空桌在 -0.117、高亮框在 +1.9 左右，这些组内偏移不能动）。
++func _mp8_clone_to(src: Node3D, target: Vector3, yaw: float, suffix: String) -> Node3D :
++
++	var parent: Node = src.get_parent()
++	if parent == null:
++		return null
++
++	var dup: Node3D = src.duplicate()
++	dup.name = "%s_%s" % [String(src.name), suffix]
++	parent.add_child(dup)
++	dup.global_position = Vector3(target.x, src.global_position.y, target.z)
++	dup.global_rotation_degrees = Vector3(0.0, yaw, 0.0)
++	return dup
++
++
++# 自检：每个工位必须恰好配到一张空桌，而且两张桌子不能抢同一张。
++# （照残骸平台翻转配对那两条自检的写法：不满足就打 ❌，不用靠肉眼看画面。）
++func _mp8_check_slots(ws: Node3D) -> void :
++
++	var used: Array[int] = []
++	var bad := 0
++	var parts := PackedStringArray()
++
++	for c in ws.get_children():
++		if not (c is Node3D):
++			continue
++		var best := -1
++		var bd: float = INF
++		for k in empty_desk_array.size():
++			var d: Node3D = empty_desk_array[k]
++			if d == null or not is_instance_valid(d):
++				continue
++			var dd: float = _mp8_flat(d.global_position, (c as Node3D).global_position)
++			if dd < bd:
++				bd = dd
++				best = k
++		if best < 0 or bd > MP8_DESK_MATCH_TOL:
++			bad += 1
++			parts.append("%s→无桌(最近 %.2f)❌" % [String(c.name), bd])
++		elif used.has(best):
++			bad += 1
++			parts.append("%s→桌%d 抢占❌" % [String(c.name), best])
++		else:
++			used.append(best)
++			parts.append("%s→桌%d(%.2f)" % [String(c.name), best, bd])
++
++	print("[MP8-WIRE] 枪械工厂：工位↔空桌配对 %s —— %s" % [
++		("✓ 一一对应" if bad == 0 else "❌ %d 处不对" % bad), ", ".join(parts)
++	])
++	if bad > 0:
++		push_warning("[MP8] 枪械工厂：工位与空桌没能一一对应，空桌可能不会消失")
++
++
++func _mp8_collect_workspace_boxes() -> void :
++
++	_mp8_ws_boxes = []
++	var marker: Node = get_node_or_null("PlayerMarker")
++	if marker == null:
++		return
++	var boxes = marker.get("bounds_workspaces")
++	if not (boxes is Array):
++		return
++	for b in (boxes as Array):
++		if b is MeshInstance3D:
++			_mp8_ws_boxes.append(b)
++
++
++func _mp8_nearest_child(parent: Node, pos: Vector3) -> Node3D :
++	var best: Node3D = null
++	var bd: float = INF
++	for c in parent.get_children():
++		if not (c is Node3D):
++			continue
++		var d: float = _mp8_flat((c as Node3D).global_position, pos)
++		if d < bd:
++			bd = d
++			best = c
++	return (best if bd <= MP8_DESK_MATCH_TOL else null)
++
++
++func _mp8_nearest_box(pos: Vector3) -> MeshInstance3D :
++	var best: MeshInstance3D = null
++	var bd: float = INF
++	for b in _mp8_ws_boxes:
++		if not is_instance_valid(b):
++			continue
++		var d: float = _mp8_flat(b.global_position, pos)
++		if d < bd:
++			bd = d
++			best = b
++	return (best if bd <= MP8_DESK_MATCH_TOL * 3.0 else null)
++
++
++func _mp8_flat(a: Vector3, b: Vector3) -> float :
++	return Vector2(a.x - b.x, a.z - b.z).length()
++
++
++func _mp8_arg(prefix: String) -> String :
++	for a in OS.get_cmdline_args():
++		if String(a).begins_with(prefix):
++			return String(a).substr(prefix.length())
++	return ""
++
++
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] 桌位手调 —— 用户自己在游戏里把新增的 4 张桌子推到想要的位置
++# ═══════════════════════════════════════════════════════════════════════════
++#
++# 只动**新增的 4 张**（用户 2026-08-16 定）。原版那 4 张一个字节不动，
++# 所以 4 人局与原版逐值一致这条永远成立，probe37 的合法性判据也还有校准基准。
++#
++# 三个部分：
++#   ① 存盘文件 user://mp8_gun_layout.txt —— 开局时读，覆盖内置 ring 表
++#   ② 局内按键 —— 选桌 / 推桌 / 转桌 / 存盘，走 RPC 让 8 个窗口同步
++#   ③ 屏幕上的读数 —— 把这个项目付过学费的两条判据实时显示出来：
++#        坑第 25 条：摆位要看**屏幕投影间距**，不是地上放不放得下
++#        probe36  ：两张桌挨太近，交互会互相打架（见 MP8_MIN_DESK_GAP）
++
++
++# 生效顺序：存盘文件 > mp8gunlayout= > 内置 ring。
++func _mp8_build_live_layout(ignore_file: bool) -> void :
++
++	var from_file: Array = ([] if ignore_file else _mp8_parse_layout_file())
++
++	if not from_file.is_empty():
++		_mp8_layout_live = from_file
++		_mp8_layout_src = "存盘文件 %s" % MP8_LAYOUT_FILE
++		print("[MP8] 枪械工厂：读到手调布局 —— %s" % _mp8_layout_desc())
++		return
++
++	# ⚠️ const 数组在 Godot 4 是只读的，内层那个 [Vector3, float] 也是只读，
++	# 所以必须**逐项重建**，不能 duplicate()（浅拷贝，内层还是只读）。
++	var base: Array = (MP8_LAYOUT_SOLVER if _mp8_layout == "solver" else MP8_LAYOUT_RING)
++	_mp8_layout_live = []
++	for r in base:
++		_mp8_layout_live.append([r[0], float(r[1])])
++	_mp8_layout_src = "内置 %s" % _mp8_layout
++
++
++func _mp8_layout_desc() -> String :
++	var parts := PackedStringArray()
++	for i in _mp8_layout_live.size():
++		var p: Vector3 = _mp8_layout_live[i][0]
++		parts.append("新%d(%.2f,%.2f)@%.0f°" % [i + 1, p.x, p.z, _mp8_layout_live[i][1]])
++	return " ".join(parts)
++
++
++# 文件格式（一行一张桌：x, z, 转角度数），`#` 开头是注释。
++# 故意做成人能直接用记事本改的样子 —— 不想开游戏时也能改。
++func _mp8_parse_layout_file() -> Array :
++
++	if not FileAccess.file_exists(MP8_LAYOUT_FILE):
++		return []
++
++	var f := FileAccess.open(MP8_LAYOUT_FILE, FileAccess.READ)
++	if f == null:
++		push_warning("[MP8] 枪械工厂：打不开 %s（%d），用内置布局" % [
++			MP8_LAYOUT_FILE, FileAccess.get_open_error()
++		])
++		return []
++
++	var rows: Array = []
++	var line_no: int = 0
++
++	while not f.eof_reached():
++		var line: String = f.get_line().strip_edges()
++		line_no += 1
++		if line.is_empty() or line.begins_with("#"):
++			continue
++
++		var cols: PackedStringArray = line.split(",", false)
++		if cols.size() < 3:
++			push_warning("[MP8] 枪械工厂：布局文件第 %d 行不是 3 个数，跳过：%s" % [line_no, line])
++			continue
++
++		var x: String = cols[0].strip_edges()
++		var z: String = cols[1].strip_edges()
++		var a: String = cols[2].strip_edges()
++		if not (x.is_valid_float() and z.is_valid_float() and a.is_valid_float()):
++			push_warning("[MP8] 枪械工厂：布局文件第 %d 行有非数字，跳过：%s" % [line_no, line])
++			continue
++
++		rows.append([Vector3(float(x), 0.0, float(z)), float(a)])
++
++	f.close()
++
++	# 少于 4 行就拿内置表把后面补齐，多了截断 —— 免得用户少写一行整局崩掉
++	if rows.is_empty():
++		return []
++	while rows.size() < MP8_LAYOUT_RING.size():
++		var r = MP8_LAYOUT_RING[rows.size()]
++		rows.append([r[0], float(r[1])])
++		push_warning("[MP8] 枪械工厂：布局文件只有 %d 行，第 %d 张用内置值补上" % [
++			rows.size() - 1, rows.size()
++		])
++	rows.resize(MP8_LAYOUT_RING.size())
++	return rows
++
++
++func _mp8_save_layout_file() -> bool :
++
++	var f := FileAccess.open(MP8_LAYOUT_FILE, FileAccess.WRITE)
++	if f == null:
++		push_warning("[MP8] 枪械工厂：写不了 %s（错误 %d）" % [
++			MP8_LAYOUT_FILE, FileAccess.get_open_error()
++		])
++		return false
++
++	f.store_line("# 枪械工厂（mp8game=3）8 人布局 —— 新增的那 4 张桌子")
++	f.store_line("# 原版 4 张不在这个文件里，它们一个字节没动。")
++	f.store_line("# 每行 = x, z, 转角度数。可以直接用记事本改，也可以在游戏里按 0 存盘覆盖。")
++	f.store_line("# 删掉这个文件就回到内置 ring 布局。")
++	f.store_line("# 存于 %s" % Time.get_datetime_string_from_system())
++	f.store_line("")
++	for r in _mp8_layout_live:
++		var p: Vector3 = r[0]
++		f.store_line("%.2f, %.2f, %.0f" % [p.x, p.z, float(r[1])])
++	f.close()
++
++	# 顺带把可以直接贴回 MP8_LAYOUT_RING 的写法打进日志 ——
++	# 定稿之后要把它烘进常量，省得下一个 agent 再反推一次坐标。
++	var snippet := PackedStringArray()
++	for r in _mp8_layout_live:
++		var p: Vector3 = r[0]
++		snippet.append("\t[Vector3(%.2f, 0.0, %.2f), %.1f]," % [p.x, p.z, float(r[1])])
++	print("[MP8] 枪械工厂：布局已存盘 → %s" % ProjectSettings.globalize_path(MP8_LAYOUT_FILE))
++	print("[MP8] 枪械工厂：定稿后可直接贴进 MP8_LAYOUT_RING —— \n%s" % "\n".join(snippet))
++	return true
++
++
++func _mp8_edit_layer() -> CanvasLayer :
++	if _mp8_edit_canvas == null:
++		_mp8_edit_canvas = CanvasLayer.new()
++		_mp8_edit_canvas.layer = 100
++		add_child(_mp8_edit_canvas)
++	return _mp8_edit_canvas
++
++
++# ⚠️ 必须显式指定游戏自己的字体：默认主题字体**字距是坏的**，
++# 实测会把 "P3  id 104..." 显示成 "P36idc104..."。猎鸭和残骸平台都栽过。
++func _mp8_style_label(lbl: Label, color: Color) -> void :
++	var f = load("res://fonts/Terminal F4.ttf")
++	if f != null:
++		lbl.add_theme_font_override("font", f)
++	lbl.add_theme_font_size_override("font_size", 22)
++	lbl.add_theme_color_override("font_color", color)
++	lbl.add_theme_color_override("font_outline_color", Color.BLACK)
++	lbl.add_theme_constant_override("outline_size", 6)
++	lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
++
++
++func _mp8_edit_begin() -> void :
++
++	if _mp8_slots.is_empty():
++		push_warning("[MP8] 枪械工厂：没有新增桌子，手调模式不启动")
++		_mp8_edit_on = false
++		return
++
++	# 屏幕左下角的面板
++	var lbl := Label.new()
++	lbl.name = "MP8GunEditPanel"
++	lbl.set_anchors_preset(Control.PRESET_BOTTOM_LEFT)
++	lbl.offset_left = 16.0
++	lbl.offset_top = -150.0
++	lbl.offset_right = 900.0
++	lbl.offset_bottom = -8.0
++	_mp8_style_label(lbl, Color(0.6, 0.95, 1.0))
++	_mp8_edit_layer().add_child(lbl)
++	_mp8_edit_panel = lbl
++
++	# 每张可调的桌子头顶挂个号码牌，否则 8 张桌子里根本认不出"我在调哪张"
++	for i in _mp8_slots.size():
++		var rec: Dictionary = _mp8_slots[i]
++		var marker = rec.get("marker")
++		if marker == null or not is_instance_valid(marker):
++			continue
++		var tag := Label3D.new()
++		tag.name = "MP8EditTag"
++		tag.billboard = BaseMaterial3D.BILLBOARD_ENABLED
++		tag.font_size = 200
++		tag.outline_size = 40
++		tag.outline_modulate = Color.BLACK
++		tag.no_depth_test = true       # 被桌子挡住也要看得见，否则转到背面就找不着了
++		var f = load("res://fonts/Terminal F4.ttf")
++		if f != null:
++			tag.font = f
++		marker.add_child(tag)
++		tag.position = Vector3(0.0, 4.0, 0.0)
++		rec["tag"] = tag
++
++	_mp8_edit_check_keys()
++	_mp8_edit_refresh()
++
++	print("[MP8] 枪械工厂：桌位手调模式已开 —— 可调 %d 张新桌，当前布局来源：%s" % [
++		_mp8_slots.size(), _mp8_layout_src
++	])
++
++
++# [MP8] 按键撞车自检。
++# 这个项目的规矩是"别拿脚本字面量当真值"，按键也一样：与其赌 I/J/K/L 没被占，
++# 不如开局把 InputMap 里真实绑定过的键查一遍，撞了就报出来。
++func _mp8_edit_check_keys() -> void :
++
++	var mine: Dictionary = {
++		KEY_1: "选1", KEY_2: "选2", KEY_3: "选3", KEY_4: "选4",
++		KEY_I: "远", KEY_K: "近", KEY_J: "左", KEY_L: "右",
++		KEY_U: "左转", KEY_O: "右转",
++		KEY_5: "步长", KEY_0: "存盘", KEY_9: "复位", KEY_8: "打报告",
++	}
++	var clash := PackedStringArray()
++
++	for action in InputMap.get_actions():
++		for ev in InputMap.action_get_events(action):
++			var k := ev as InputEventKey
++			if k == null:
++				continue
++			for code in [k.keycode, k.physical_keycode]:
++				if code != 0 and mine.has(code):
++					clash.append("%s(%s)↔动作 %s" % [
++						OS.get_keycode_string(code), mine[code], String(action)
++					])
++
++	if clash.is_empty():
++		print("[MP8] 枪械工厂：手调按键与游戏 InputMap 无冲突（查了 %d 个动作）" % InputMap.get_actions().size())
++	else:
++		push_warning("[MP8] 枪械工厂：手调按键和游戏动作撞车 —— %s" % ", ".join(clash))
++		print("[MP8] 枪械工厂：⚠️ 按键撞车 —— %s" % ", ".join(clash))
++
++
++func _unhandled_key_input(event: InputEvent) -> void :
++
++	if not _mp8_edit_on or _mp8_slots.is_empty():
++		return
++	var key := event as InputEventKey
++	if key == null or not key.pressed or key.echo:
++		return
++
++	var step: float = MP8_EDIT_STEPS[_mp8_edit_step_i]
++
++	match key.keycode:
++		KEY_1, KEY_2, KEY_3, KEY_4:
++			var want: int = key.keycode - KEY_1
++			if want >= _mp8_slots.size():
++				return
++			_mp8_edit_sel = want
++			_mp8_edit_refresh()
++
++		KEY_I, KEY_K, KEY_J, KEY_L:
++			# 按**屏幕方向**推，不是世界坐标轴。相机沿 +X 看，屏幕横向≈z、纵向≈x，
++			# 但这里不写死：直接从当前相机的基向量算，相机哪天改了也不会反向。
++			var dir: Vector2 = _mp8_screen_axis(key.keycode)
++			if dir == Vector2.ZERO:
++				return
++			var cur: Vector3 = _mp8_layout_live[_mp8_edit_sel][0]
++			var np := Vector3(cur.x + dir.y * step, 0.0, cur.z + dir.x * step)
++			mp8_gun_move_rpc.rpc(_mp8_edit_sel, np, float(_mp8_layout_live[_mp8_edit_sel][1]))
++
++		KEY_U, KEY_O:
++			var d: float = (- MP8_EDIT_YAW_STEP if key.keycode == KEY_U else MP8_EDIT_YAW_STEP)
++			var yaw: float = fposmod(float(_mp8_layout_live[_mp8_edit_sel][1]) + d, 360.0)
++			mp8_gun_move_rpc.rpc(_mp8_edit_sel, _mp8_layout_live[_mp8_edit_sel][0], yaw)
++
++		KEY_5:
++			_mp8_edit_step_i = (_mp8_edit_step_i + 1) % MP8_EDIT_STEPS.size()
++			_mp8_edit_refresh()
++
++		KEY_0:
++			var ok: bool = _mp8_save_layout_file()
++			_mp8_edit_refresh()
++			if _mp8_edit_panel != null:
++				_mp8_edit_panel.text = ("【已存盘】下次开局自动用这套坐标\n" if ok
++					else "【存盘失败】看日志\n") + _mp8_edit_panel.text
++
++		KEY_9:
++			# 回内置表：逐张广播回去，8 个窗口一起复位
++			var base: Array = (MP8_LAYOUT_SOLVER if _mp8_layout == "solver" else MP8_LAYOUT_RING)
++			for i in mini(base.size(), _mp8_slots.size()):
++				mp8_gun_move_rpc.rpc(i, base[i][0], float(base[i][1]))
++			print("[MP8] 枪械工厂：布局已复位成内置 %s（存盘文件没删，想彻底回退请删掉它）" % _mp8_layout)
++
++		KEY_8:
++			_mp8_edit_report()
++
++		_:
++			return
++
++	get_viewport().set_input_as_handled()
++
++
++# 屏幕方向 → 世界水平方向。返回 Vector2(dz, dx)：x 分量给世界 z，y 分量给世界 x。
++func _mp8_screen_axis(code: int) -> Vector2 :
++
++	var cam: Camera3D = get_viewport().get_camera_3d()
++	if cam == null:
++		return Vector2.ZERO
++
++	# 相机右手方向 / 前方向，都压平到水平面（俯角不该让"往上推"变成往天上飞）
++	var right: Vector3 = cam.global_transform.basis.x
++	var fwd: Vector3 = - cam.global_transform.basis.z
++	var r2 := Vector2(right.z, right.x)
++	var f2 := Vector2(fwd.z, fwd.x)
++	if r2.length() < 0.001 or f2.length() < 0.001:
++		return Vector2.ZERO
++	r2 = r2.normalized()
++	f2 = f2.normalized()
++
++	match code:
++		KEY_L: return r2
++		KEY_J: return - r2
++		KEY_I: return f2
++		KEY_K: return - f2
++	return Vector2.ZERO
++
++
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] 布局以房主为准广播（2026-08-19 修，用户 6 人真人局报的）
++# ═══════════════════════════════════════════════════════════════════════════
++#
++# **症状**：房主视角里场地很干净，客机视角里路中间杵着一张桌子，还有碰撞体积。
++#
++# **根因不是几何，是"各机各读各的存盘文件"**：
++# `_mp8_setup_field()` 挂在 `_ready()`，每台机器都跑（空桌/高亮框是各机本地节点，
++# 本来就必须每台自己摆）；而它调的 `_mp8_build_live_layout()` 会去读
++# `user://mp8_gun_layout.txt`。那个文件是用户手调时按 `0` 存的，
++# **只存在于房主那台机器上** —— 房主读到定稿（四张桌全在墙边），
++# 客机读不到、回退内置 ring（B/C 摆在 x=+8.0 的开阔地正中，正是那两张挡路的）。
++# 两边场地从开局第一帧起就是两套，日志各自都是干净的。
++#
++# **做法**：`initialize()` 只在服务器上跑 —— 而且是在 `all_players_loaded()`
++# 之后才被 game.gd 调的（`_client_minigame_loaded_rpc` → `all_players_loaded`
++# → `minigame_ready` → `_on_minigame_ready` → `initialize`），
++# 也就是说这时**每台客机的本小游戏节点都已经在树上了**，RPC 一定收得到。
++# 房主把自己那份 `_mp8_layout_live` 逐张广播出去，各机本地摆自己的家当。
++#
++# 复用既有的 `mp8_gun_move_rpc` —— 手调模式已经验证过它能一次挪动一整组
++# （工位标记 + 空桌 + 教程高亮框 + 工作台实体），而且是绝对坐标、可重复调用。
++#
++# ⚠️ 先快照再发：`mp8_gun_move_rpc` 是 `call_local`，`.rpc()` 当场就会回改
++# `_mp8_layout_live[slot]`，边遍历边改自己会踩到。
++# ⚠️ 这条**不替代**把定稿烘进 `MP8_LAYOUT_RING`（上面已烘）：广播治的是
++# "两边不一致"，烘常量治的是"没有文件的那一端默认值就该是定稿"。两条都要。
++func _mp8_broadcast_layout() -> void :
++
++	if not multiplayer.is_server():
++		return
++	if GameManager.local_game:
++		return                      # 单机分屏没有客机，也不该发 RPC
++	if _mp8_no_expand or mp8_player_count <= 4:
++		return                      # 场地没扩过，没有新增桌子可广播
++	if _mp8_slots.is_empty():
++		push_warning("[MP8] 枪械工厂：房主这边一个新增工位都没有，布局没广播")
++		return
++
++	var rows: Array = []
++	for r in _mp8_layout_live:
++		rows.append([r[0], float(r[1])])
++
++	var n: int = mini(_mp8_slots.size(), rows.size())
++	for i in n:
++		mp8_gun_move_rpc.rpc(i, rows[i][0], float(rows[i][1]))
++
++	print("[MP8] 枪械工厂：布局以房主为准广播 %d 张（房主来源=%s）—— %s" % [
++		n, _mp8_layout_src, _mp8_layout_desc()
++	])
++
++
++# [MP8] any_peer + call_local：谁按的键谁发起，8 台机器一起挪。
++# ⚠️ 必须每台机器都挪：空桌和教程高亮框是**各机本地的场景节点**，不走网络同步
++# （和 _mp8_setup_field 每台都要跑是同一个理由）。
++@rpc("any_peer", "call_local", "reliable")
++func mp8_gun_move_rpc(slot: int, pos: Vector3, yaw: float) -> void :
++
++	if slot < 0 or slot >= _mp8_slots.size():
++		# 房主广播过来、本机却没有这个工位 = 本机场地压根没扩（人数读少了 / 打错包）。
++		# 静默丢掉的话，画面上就是"客机比房主少一张桌"，一样是不一致 —— 让它出声。
++		push_warning("[MP8] 枪械工厂：收到第 %d 号工位的布局，但本机只有 %d 个新增工位，丢弃" % [
++			slot + 1, _mp8_slots.size()
++		])
++		return
++
++	_mp8_layout_live[slot] = [Vector3(pos.x, 0.0, pos.z), yaw]
++
++	var rec: Dictionary = _mp8_slots[slot]
++	var marker = rec.get("marker")
++	if marker == null or not is_instance_valid(marker):
++		return
++
++	# 工作台实体是开局后才生成的，第一次要用时按"旧位置最近"认一次，之后一直用这个引用。
++	var ws_node = rec.get("ws")
++	if (ws_node == null or not is_instance_valid(ws_node)) and workstations_node_parent != null:
++		ws_node = _mp8_nearest_child(workstations_node_parent, (marker as Node3D).global_position)
++		rec["ws"] = ws_node
++
++	# 工位标记的**局部** rotation_degrees 才是 spawn_workstations() 读的那个值
++	# （它读 c.global_position + c.rotation_degrees），所以这里跟建的时候写法保持一致。
++	(marker as Node3D).global_position = Vector3(pos.x, (marker as Node3D).global_position.y, pos.z)
++	(marker as Node3D).rotation_degrees = Vector3(0.0, yaw, 0.0)
++
++	for k in ["desk", "box"]:
++		_mp8_place_at(rec.get(k), pos, yaw)
++	_mp8_place_at(ws_node, pos, yaw)
++
++	_mp8_edit_refresh()
++
++
++# 搬一件家当：只改水平位置和偏航，**保留它自己的 y**
++# （空桌在 -0.117、高亮框在 +1.9，这些组内高度差不能动）。
++func _mp8_place_at(n, pos: Vector3, yaw: float) -> void :
++	if n == null or not is_instance_valid(n) or not (n is Node3D):
++		return
++	var n3: Node3D = n
++	n3.global_position = Vector3(pos.x, n3.global_position.y, pos.z)
++	n3.global_rotation_degrees = Vector3(0.0, yaw, 0.0)
++
++
++# 全部 8 个工位的水平位置（原版 4 个在前、新增的在后，和 WorkstationSpawns 子节点同序）
++func _mp8_desk_points() -> Array[Vector3] :
++	var out: Array[Vector3] = []
++	var ws: Node3D = get_node_or_null("WorkstationSpawns") as Node3D
++	if ws == null:
++		return out
++	for c in ws.get_children():
++		if c is Node3D:
++			out.append((c as Node3D).global_position)
++	return out
++
++
++# 离第 i 个工位最近的另一个工位有多远（世界水平距离）
++func _mp8_nearest_gap(pts: Array[Vector3], i: int) -> float :
++	var best: float = INF
++	for j in pts.size():
++		if j == i:
++			continue
++		best = minf(best, _mp8_flat(pts[i], pts[j]))
++	return best
++
++
++# [MP8] 坑第 25 条的判据：摆位好不好，要看**屏幕投影**，不是地上放不放得下。
++#
++# 返回 [全部 8 张的屏幕最小间距, 原版 4 张的屏幕最小间距]。
++# ⚠️ 及格线**不写死 0.334**，而是拿原版那 4 张在**同一块屏幕、同一帧**算出来的值当基准
++# —— 分辨率、宽高比、fov 全都自动抵消掉，这才是"以原版为校准基准"的正确做法。
++func _mp8_screen_gaps() -> Array :
++
++	var cam: Camera3D = get_viewport().get_camera_3d()
++	var pts: Array[Vector3] = _mp8_desk_points()
++	if cam == null or pts.size() < 2:
++		return [-1.0, -1.0]
++
++	var size: Vector2 = get_viewport().get_visible_rect().size
++	if size.x <= 0.0 or size.y <= 0.0:
++		return [-1.0, -1.0]
++
++	var ndc: Array[Vector2] = []
++	var ok: Array[bool] = []
++	for p in pts:
++		if cam.is_position_behind(p):
++			ndc.append(Vector2.ZERO)
++			ok.append(false)
++			continue
++		var s: Vector2 = cam.unproject_position(p)
++		ndc.append(Vector2(s.x / size.x * 2.0 - 1.0, s.y / size.y * 2.0 - 1.0))
++		ok.append(true)
++
++	var all_min: float = INF
++	var orig_min: float = INF
++	for i in ndc.size():
++		for j in range(i + 1, ndc.size()):
++			if not (ok[i] and ok[j]):
++				continue
++			var d: float = ndc[i].distance_to(ndc[j])
++			all_min = minf(all_min, d)
++			if i < 4 and j < 4:
++				orig_min = minf(orig_min, d)
++
++	return [
++		(-1.0 if is_inf(all_min) else all_min),
++		(-1.0 if is_inf(orig_min) else orig_min),
++	]
++
++
++func _mp8_edit_refresh() -> void :
++
++	for i in _mp8_slots.size():
++		var tag = (_mp8_slots[i] as Dictionary).get("tag")
++		if tag == null or not is_instance_valid(tag):
++			continue
++		var sel: bool = (i == _mp8_edit_sel)
++		(tag as Label3D).text = ("▼ %d ▼" % (i + 1)) if sel else str(i + 1)
++		(tag as Label3D).modulate = (Color(1.0, 0.85, 0.2) if sel else Color(0.55, 0.75, 0.85))
++
++	if _mp8_edit_panel == null:
++		return
++
++	var cur: Vector3 = _mp8_layout_live[_mp8_edit_sel][0]
++	var yaw: float = float(_mp8_layout_live[_mp8_edit_sel][1])
++	var pts: Array[Vector3] = _mp8_desk_points()
++	var gap: float = (_mp8_nearest_gap(pts, 4 + _mp8_edit_sel) if pts.size() > 4 + _mp8_edit_sel else -1.0)
++	var sg: Array = _mp8_screen_gaps()
++
++	var gap_txt: String = "—"
++	if gap >= 0.0:
++		gap_txt = "%.2f 米 %s" % [gap, ("✓" if gap >= MP8_MIN_DESK_GAP else "⚠ 低于 %.1f" % MP8_MIN_DESK_GAP)]
++
++	var scr_txt: String = "—"
++	if sg[0] >= 0.0 and sg[1] >= 0.0:
++		scr_txt = "%.3f（原版 4 张 %.3f）%s" % [
++			sg[0], sg[1], ("✓" if sg[0] >= sg[1] * 0.75 else "⚠ 会挤在一起")
++		]
++
++	_mp8_edit_panel.text = "\n".join([
++		"【桌位手调】选中第 %d 张新桌   步长 %.1f 米   来源 %s" % [
++			_mp8_edit_sel + 1, MP8_EDIT_STEPS[_mp8_edit_step_i], _mp8_layout_src],
++		"位置 x=%.2f  z=%.2f   转角 %.0f°" % [cur.x, cur.z, yaw],
++		"离最近的桌子 %s      屏幕最小间距 %s" % [gap_txt, scr_txt],
++		"1~4 选桌   I/K 远近   J/L 左右   U/O 转   5 步长   0 存盘   9 复位   8 打报告",
++	])
++
++
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] 出生点跟着工位走（2026-08-16 用户手摆完桌子后补的）
++# ═══════════════════════════════════════════════════════════════════════════
++#
++# 原版的规则，是从 probe32 量出来的**事实**，不是设计出来的：
++#
++#   | 原版 | 工位 | 出生点 | 距离 | 出生点 yaw |
++#   | 1 | (-7.04,-7.59) | (-4.52,-5.15) | 3.51 | 90°  |
++#   | 2 | (-7.54,+7.53) | (-4.52,+5.33) | 3.73 | 90°  |
++#   | 3 | (+11.10,+8.38)| (+7.50,+8.00) | 3.62 | -90° |
++#   | 4 | (+10.39,-8.17)| (+6.97,-8.00) | 3.43 | -90° |
++#
++#   ① 出生点**逐个对齐自己的工位**（下标 i ↔ 下标 i），距离 3.4~3.7 米
++#   ② 站在工位**朝场地中心的那一侧**（四张桌都在角上，开阔面朝里）
++#   ③ **脸朝着自己那张桌子**（yaw 全部对得上）
++#
++# 之前那版没做这个，5~8 号走 network_manager 的通用补位（四条边的中点），
++# 结果 P3 要跑 11.7 米才到自己桌子，而原版是 3.4~3.7。
++#
++# ⚠️ **上一轮试过"让出生点跟工位一起平移"，实测有 2 个落进实体**
++# （(-1.32,-5.15) 在中央料台的道具里、(-1.32,+5.33) 直接在料台碰撞盒里）。
++# 所以这次**不硬算偏移，而是搜索 + 物理实测**：绕着桌子转一圈找一个真站得下的地方。
++#
++# **只动新增的 4 个出生点**，原版那 4 个一个字节不碰 —— 它们本来就是对的，
++# 而且它们还要当"判据校准基准"用（见 _mp8_calibrate_spot_test）。
++func _mp8_place_spawns() -> void :
++
++	if _mp8_no_expand or mp8_player_count <= 4 or _mp8_slots.is_empty():
++		return
++
++	var sp: Node3D = get_node_or_null("SpawnPositions") as Node3D
++	var ws: Node3D = get_node_or_null("WorkstationSpawns") as Node3D
++	if sp == null or ws == null:
++		push_warning("[MP8] 枪械工厂：找不到 SpawnPositions / WorkstationSpawns，出生点没跟工位走")
++		return
++
++	# ⚠️ 物理空间从**场景里的 Node3D** 取，不要用 get_viewport().world_3d ——
++	# 后者在视口没有自己的 World3D 时会返回 null。Node3D.get_world_3d() 拿的
++	# 就是这个节点实际注册进去的那个世界，定义上不会错。
++	_mp8_space = sp.get_world_3d().direct_space_state
++	if _mp8_space == null:
++		push_warning("[MP8] 枪械工厂：拿不到物理空间，出生点退回通用补位（不动它）")
++		return
++
++	# 先拿原版 4 个出生点把"站得下"这个判据校一遍。
++	# 判不通就是判据错了，不是位置错了（probe37 那三轮校准的教训）。
++	var tol: float = _mp8_calibrate_spot_test(sp)
++
++	var desks: Array[Vector3] = _mp8_desk_points()
++	var n_orig: int = desks.size() - _mp8_slots.size()   # 原版工位数（正常是 4）
++	var report := PackedStringArray()
++
++	for i in range(n_orig, desks.size()):
++
++		# 对应的出生点节点：不够就自己补（正常情况下 network_manager 的通用补位
++		# 已经把它补到 8 个了，这里只是覆盖位置；补不齐时兜底自己建）
++		var marker: Node3D = null
++		if i < sp.get_child_count():
++			marker = sp.get_child(i) as Node3D
++		if marker == null:
++			marker = Marker3D.new()
++			marker.name = "MP8Spawn%d" % (i - n_orig)
++			sp.add_child(marker)
++
++		var found: Array = _mp8_find_spawn_spot(desks, i, tol)
++		var pos: Vector3 = found[0]
++		var note: String = found[1]
++
++		marker.global_position = Vector3(pos.x, 0.0, pos.z)
++		# 脸朝自己那张桌子。
++		# Godot 里 yaw=θ 的前方是 -Z 轴 = (-sinθ, 0, -cosθ)，要它指向 (dx,dz)
++		# 就得 sinθ=-dx、cosθ=-dz → θ = atan2(-dx, -dz)。
++		# 拿原版四个出生点验过：3/4 号桌几乎正对 +X，算出 -95.9°/-87.2°，
++		# 与原版的 -90° 差 5.9°/2.8°；1/2 号桌是斜对着的，原版取了整数 90°，
++		# 我们这里精确指向桌子（比原版的四舍五入更准，且只作用在新增的 4 个上）。
++		var look := Vector2(desks[i].x - pos.x, desks[i].z - pos.z)
++		if look.length() > 0.01:
++			marker.global_rotation_degrees = Vector3(
++				0.0, rad_to_deg(atan2(- look.x, - look.y)), 0.0
++			)
++
++		report.append("新%d 工位(%.2f,%.2f)→出生点(%.2f,%.2f) 距 %.2f米 %s" % [
++			i - n_orig + 1, desks[i].x, desks[i].z, pos.x, pos.z,
++			_mp8_flat(pos, desks[i]), note
++		])
++
++	print("[MP8] 枪械工厂：出生点跟工位走 —— %s" % " | ".join(report))
++
++
++# 拿原版 4 个出生点校准"这块地站得下人吗"这个判据。
++# 返回允许的碰撞容差：原版出生点如果自己就贴着点东西，判据必须放宽到能让它通过，
++# 否则会出现"原版位置判不通"——那是判据错了。
++func _mp8_calibrate_spot_test(sp: Node3D) -> float :
++
++	var fails := PackedStringArray()
++	var n: int = mini(4, sp.get_child_count())
++
++	for i in n:
++		var c: Node3D = sp.get_child(i) as Node3D
++		if c == null:
++			continue
++		if not _mp8_spot_free(c.global_position, 0.0):
++			fails.append("原版出生点%d(%.2f,%.2f)" % [i + 1, c.global_position.x, c.global_position.z])
++
++	if fails.is_empty():
++		print("[MP8] 枪械工厂：站位判据校准通过 —— 原版 4 个出生点全部判通（探测高度 y=%.3f）" % MP8_SPOT_PROBE_Y)
++		return 0.0
++
++	# 原版位置判不通 → 判据太严。先缩一点查询体积再试一遍。
++	var still := PackedStringArray()
++	for i in n:
++		var c2: Node3D = sp.get_child(i) as Node3D
++		if c2 != null and not _mp8_spot_free(c2.global_position, 0.25):
++			still.append("原版%d" % (i + 1))
++
++	if still.is_empty():
++		push_warning("[MP8] 枪械工厂：站位判据把原版出生点判成了占用（%s），放宽 0.25 米后通过" % ", ".join(fails))
++		print("[MP8] 枪械工厂：⚠️ 站位判据偏严（%s 判不通），放宽 0.25 米后继续" % ", ".join(fails))
++		return 0.25
++
++	# 🩸 放宽了还判不通 = **判据本身是坏的**，不是位置不好。
++	# 这时候绝不能让它继续参与选点 —— 一个恒为 false 的"空地判据"会把
++	# **地图外面**（唯一查不到碰撞的地方）选出来，用户实测就是这么被摆到墙外的。
++	# 直接把物理查询关掉，退回纯几何（朝场地中心 3.5 米），那个结果一定在界内。
++	_mp8_space = null
++	push_warning("[MP8] 枪械工厂：站位判据放宽后仍把原版出生点判成占用（%s）—— 判据坏了，已关掉物理查询，改用纯几何摆位" % ", ".join(still))
++	print("[MP8] 枪械工厂：❌ 站位判据坏了（原版 %s 放宽后仍判不通），关掉物理查询改纯几何 —— 请检查 MP8_SPOT_PROBE_Y" % ", ".join(still))
++	return 0.25
++
++
++# 这块地站得下一个人吗。
++#
++# 🩸 第一版用玩家那个 Capsule 半径 0.7 / **高 5.0、放在 y=2.5**（= 玩家自己的碰撞体），
++# 结果 **y 范围是 [0, 5]，底面正好压在地板碰撞体上** → 场地里**到处都判占用**，
++# 而**墙外面没有地板反而判空** → 四个人全被摆到墙外去了（用户实测）。
++#
++# 改成只查**腰以上那一段**：球半径 0.7 放在 y=1.375，即 y∈[0.675, 2.075]。
++# 这正是 probe35/37 那三轮校准最后定下来的判据（"站位只看腰以上 y 0.75~2.0"），
++# 理由也一样：配方指示灯带只有 0.65 米高，不挡人站，但会让贴地的查询全判死。
++#
++# **教训：这个"空"的判据只能用来否决，不能用来选方向** —— 地图外面永远最空。
++# 方向由几何定死（只朝场地里，见 _mp8_find_spawn_spot 的 ±75° 限制）。
++func _mp8_spot_free(p: Vector3, shrink: float) -> bool :
++
++	if _mp8_space == null:
++		return true      # 查不了就别拦，宁可摆了让人看，也不要静默少生成一个人
++
++	var shape := SphereShape3D.new()
++	shape.radius = maxf(0.2, 0.7 - shrink)
++
++	var q := PhysicsShapeQueryParameters3D.new()
++	q.shape = shape
++	# 玩家的 Dropcast / Wallcast 用的就是 mask 3（层 1|2 = 场地几何），照抄
++	q.collision_mask = 3
++	q.transform = Transform3D(Basis(), Vector3(p.x, MP8_SPOT_PROBE_Y, p.z))
++
++	return _mp8_space.intersect_shape(q, 1).is_empty()
++
++
++# 绕着第 i 张桌子找一个站得下的出生点。
++# 起始方向 = 朝场地中心（原版四张桌都是这么摆的），然后左右交替扫一圈；
++# 半径按原版那 3.4~3.7 米为主，找不到再退让。
++func _mp8_find_spawn_spot(desks: Array[Vector3], i: int, tol: float) -> Array :
++
++	var here: Vector3 = desks[i]
++	var base := Vector2(-here.x, -here.z)          # 朝场地中心
++	if base.length() < 0.01:
++		base = Vector2(1.0, 0.0)
++	base = base.normalized()
++	var here_r: float = Vector2(here.x, here.z).length()
++
++	for r in [3.5, 3.1, 4.0, 2.7, 4.6]:
++		for k in MP8_SPOT_SWEEP:
++			# 0°, -15°, +15°, -30°, +30° ... 先试正对中心，再左右交替扫开
++			# （变量别叫 sign —— 那是 GDScript 内置函数名）
++			var side: float = (1.0 if (k % 2) == 0 else -1.0)
++			var ang: float = deg_to_rad(float((k + 1) / 2) * 15.0) * side
++			var d: Vector2 = base.rotated(ang)
++			var cand := Vector3(here.x + d.x * r, 0.0, here.z + d.y * r)
++
++			# ⚠️ **硬约束：只能往场地里挪，绝不能往外。**
++			# 用户实测「四个人全复活在墙外面」就是没有这条 —— 碰撞查询把
++			# **地图外面**判成了最空的地方，扫到 ±180° 就一头扎出去了。
++			# 猎鸭那次「往外扩，有人跳出地图」是同一个教训：
++			# **原版给的范围是唯一被背书过"一定在界内"的，往外一步都不要迈。**
++			# 判据：候选点离场地中心必须比它那张桌子更近（±75° 已经保证方向朝里，
++			# 这条再兜一层，半径档位取到 4.6 时也不会绕出去）。
++			if Vector2(cand.x, cand.z).length() >= here_r:
++				continue
++
++			if not _mp8_spot_free(cand, tol):
++				continue
++			if not _mp8_clear_of_other_desks(desks, i, cand):
++				continue
++			return [cand, ("正对中心" if k == 0 else "偏 %.0f°" % rad_to_deg(ang))]
++
++	# 一圈都没找着：退回"朝中心 3.5 米"硬摆，并明说这个点没验过。
++	# 宁可站得别扭，也不能少生成一个人（少一个人 = 这一局可能永远结束不了）。
++	var fb := Vector3(here.x + base.x * 3.5, 0.0, here.z + base.y * 3.5)
++	push_warning("[MP8] 枪械工厂：工位(%.2f,%.2f) 周围没找到站得下的出生点，硬摆在朝中心 3.5 米处" % [
++		here.x, here.z
++	])
++	return [fb, "⚠️没找到空位，硬摆"]
++
++
++# [MP8] 开局后查一遍：有没有人被卡在静态碰撞体里（动不了）。
++#
++# 为什么会卡：`initialize()` 的顺序是 **spawn_players() → spawn_workstations()**，
++# 工作台是**人站好之后**才 add_child 进场的静态体（碰撞盒 2.40×3.80）。
++# 站得太近，桌子就长在人身上了。用户 2026-08-16 实测报过「P4 卡死在原地动不了」。
++#
++# ⚠️ **必须等一帧物理**：刚 add_child 的碰撞体那一帧还没进物理空间，
++# 立刻查会全判"没事"（和摆出生点时踩的是同一个坑）。
++func _mp8_unstick_players() -> void :
++
++	if not multiplayer.is_server():
++		return
++
++	await get_tree().physics_frame
++	await get_tree().physics_frame
++
++	var sp: Node3D = get_node_or_null("SpawnPositions") as Node3D
++	if sp == null:
++		return
++	_mp8_space = sp.get_world_3d().direct_space_state
++	if _mp8_space == null:
++		return
++
++	var desks: Array[Vector3] = _mp8_desk_points()
++	var rows := PackedStringArray()
++
++	for id in active_players.keys():
++
++		var p = active_players[id]
++		if p == null or not is_instance_valid(p):
++			continue
++
++		var here: Vector3 = (p as Node3D).global_position
++		var nm: String = String(p.player_presence.network_name)
++
++		# 离最近的工作台多远（桌子半对角 2.25 + 人半径 0.7 ≈ 2.95 是危险线）
++		var nd: float = INF
++		for d in desks:
++			nd = minf(nd, _mp8_flat(here, d))
++
++		if _mp8_spot_free(here, 0.0):
++			rows.append("%s(%.1f,%.1f) 最近桌 %.2f米 ✓" % [nm, here.x, here.z, nd])
++			continue
++
++		# 卡住了：从当前位置朝场地中心方向找一个站得下的地方，把人挪过去
++		var fixed := Vector3.INF
++		var base := Vector2(-here.x, -here.z)
++		if base.length() < 0.01:
++			base = Vector2(1.0, 0.0)
++		base = base.normalized()
++
++		for r in [1.0, 1.6, 2.2, 3.0]:
++			for k in 24:
++				var side: float = (1.0 if (k % 2) == 0 else -1.0)
++				var ang: float = deg_to_rad(float((k + 1) / 2) * 15.0) * side
++				var d2: Vector2 = base.rotated(ang)
++				var cand := Vector3(here.x + d2.x * r, here.y, here.z + d2.y * r)
++				if _mp8_spot_free(cand, 0.0):
++					fixed = cand
++					break
++			if fixed != Vector3.INF:
++				break
++
++		if fixed == Vector3.INF:
++			rows.append("%s(%.1f,%.1f) 最近桌 %.2f米 ❌卡住且救不出来" % [nm, here.x, here.z, nd])
++			push_warning("[MP8] 枪械工厂：%s 卡在实体里，周围 3 米内没有能站的地方" % nm)
++			continue
++
++		p.teleport_rpc.rpc(fixed, (p as Node3D).global_rotation)
++		rows.append("%s(%.1f,%.1f) 最近桌 %.2f米 ⚠️卡住→挪到(%.1f,%.1f)" % [
++			nm, here.x, here.z, nd, fixed.x, fixed.z
++		])
++		push_warning("[MP8] 枪械工厂：%s 生成在实体里（最近的桌 %.2f 米），已挪到 (%.2f, %.2f)" % [
++			nm, nd, fixed.x, fixed.z
++		])
++
++	print("[MP8] 枪械工厂：开局卡人自检 —— %s" % " | ".join(rows))
++
++
++# 别把人生在**别人**桌子的怀里：离其它工位至少 2.5 米。
++# （2.5 是工作台碰撞盒半对角 2.25 再加一点余量 —— 站进别人桌子里，
++#   交互还会互相打架，见坑第 26 条。）
++func _mp8_clear_of_other_desks(desks: Array[Vector3], i: int, cand: Vector3) -> bool :
++	for j in desks.size():
++		if j == i:
++			continue
++		if _mp8_flat(cand, desks[j]) < 2.5:
++			return false
++	return true
++
++
++# 把当前 8 张桌的完整数字打进日志，方便事后核对（挂机截图看不清屏幕上的小字）
++func _mp8_edit_report() -> void :
++
++	var pts: Array[Vector3] = _mp8_desk_points()
++	var sg: Array = _mp8_screen_gaps()
++	var rows := PackedStringArray()
++
++	for i in pts.size():
++		var tag: String = ("原版%d" % (i + 1)) if i < 4 else ("新%d" % (i - 3))
++		rows.append("%s(%.2f,%.2f) 最近邻 %.2f米" % [tag, pts[i].x, pts[i].z, _mp8_nearest_gap(pts, i)])
++
++	print("[MP8] 枪械工厂布局报告：%s" % " | ".join(rows))
++	print("[MP8] 枪械工厂布局报告：屏幕最小间距 全部 %.3f / 原版4张 %.3f；当前表 %s" % [
++		sg[0], sg[1], _mp8_layout_desc()
++	])
++
++
++# [MP8] 零件撒点：按人数把总数放大，保持"每人 6.5 个"这个原版份额。
++#   4 人 → 26（与原版逐字节一致）  5 → 33  6 → 39  7 → 46  8 → 52
++# 命令行 mp8gunitems=<n> 可临时覆盖，不用重新编译。
++#
++# 新点怎么生成（probe35 离线验过 5~8 人全部 0 个新引入的问题点）：
++#   候选 = 某个真实零件点 + 朝**同高度、距离 ≤ 3.5 米**的近邻方向 × min(0.45, d/3)
++#   选点 = 最远点插入（每轮挑离已选点最远的那个）
++#
++# 为什么方向必须指向另一个真实零件点：那个方向上确实摆着一件合法零件，
++# 所以这一小步是往"零件能待的区域"里走。
++#   ✗ 试过"朝本组形心偏 0.45 米、每圈按黄金角转"—— 转出来的方向没有任何背书，
++#     part_016 那个点直接被转进了 x=12.4 的墙碰撞体里。
++#   ✗ 也不能取"两点之间的等分点"：地面那 11 个点跨了 20 米，连线横穿中央料台，
++#     等分点掉进桌子底下，玩家永远拿不到。
++#   ✗ 最远点插入这步也不能省 —— 不做的话最小间距会掉到 0.34 米（原版 1.015），
++#     两件零件叠在一起（逆向行进那次两人叠一起的同一个毛病）。
++#
++# ⚠️ 一个没做成的事，明说：本来想"新增零件偏向外围地面撒，把 8 个人从中央料台
++# 旁边分开"。实测**做不到** —— 地面那 11 个点太稀疏，3.5 米内只有 2 对
++# （017↔018 距 1.49，015↔019 距 2.24），安全候选只有 4 个。放宽近邻上限
++# 就会把点撒进货盘和墙里。所以 8 人 52 个的实际分布是
++# **中央料台 28 / 其它台面 9 / 地面 15**（原版 10 / 5 / 11），比原版更集中在料台上。
++# 真觉得挤要另想办法（比如让物理查询挑点，或手摆一批外围点），不是调这两个常数能解决的。
++func _mp8_item_positions(base: Array[Vector3]) -> Array[Vector3] :
++
++	if _mp8_no_expand or base.is_empty():
++		return base
++
++	var p: int = maxi(mp8_player_count, 1)
++	var want: int = int(round(float(base.size()) * float(p) / 4.0))
++
++	var ov: String = _mp8_arg("mp8gunitems=")
++	if ov != "":
++		want = maxi(base.size(), int(ov))
++
++	if want <= base.size():
++		print("[MP8] 枪械工厂：零件 %d 个（%d 人，与原版一致）" % [base.size(), p])
++		return base
++
++	var lowi: Array[int] = []
++	var highi: Array[int] = []
++	for i in base.size():
++		if base[i].y < MP8_ITEM_FLOOR_Y:
++			lowi.append(i)
++		else:
++			highi.append(i)
++
++	var out: Array[Vector3] = base.duplicate()
++	var need: int = want - base.size()
++
++	var got: Array[Vector3] = _mp8_item_pick(base, lowi, need)
++	out.append_array(got)
++	need -= got.size()
++
++	var got2: Array[Vector3] = _mp8_item_pick(base, highi, need)
++	out.append_array(got2)
++
++	print("[MP8] 枪械工厂：零件 %d → %d 个（%d 人；地面组 +%d / 台面组 +%d）%s" % [
++		base.size(), out.size(), p, got.size(), got2.size(),
++		("" if out.size() >= want else "  ⚠️ 候选不够，只凑到 %d 个" % out.size())
++	])
++
++	if out.size() < want:
++		push_warning("[MP8] 枪械工厂：零件只凑到 %d 个（要 %d 个），可能有人造不出枪" % [
++			out.size(), want
++		])
++
++	return out
++
++
++func _mp8_item_pick(base: Array[Vector3], grp: Array[int], need: int) -> Array[Vector3] :
++
++	var out: Array[Vector3] = []
++	if need <= 0 or grp.size() < 2:
++		return out
++
++	# 候选池
++	var pool: Array[Vector3] = []
++	for i in grp:
++		var lst: Array = []
++		for j in grp:
++			if j == i:
++				continue
++			var d: float = base[i].distance_to(base[j])
++			if d <= MP8_ITEM_NEIGHBOUR_CAP:
++				lst.append([d, j])
++		lst.sort_custom(func(a, b): return a[0] < b[0])
++		for e in lst:
++			var d2: float = e[0]
++			var j2: int = e[1]
++			var dir := Vector2(base[j2].x - base[i].x, base[j2].z - base[i].z)
++			if dir.length() < 0.001:
++				continue
++			dir = dir.normalized()
++			pool.append(base[i] + Vector3(dir.x, 0.0, dir.y) * minf(MP8_ITEM_STEP, d2 / 3.0))
++
++	# 最远点插入
++	var chosen: Array[Vector3] = []
++	for i in grp:
++		chosen.append(base[i])
++
++	while out.size() < need and not pool.is_empty():
++		var best: int = -1
++		var best_d: float = -1.0
++		for k in pool.size():
++			var d3: float = INF
++			for c in chosen:
++				d3 = minf(d3, pool[k].distance_to(c))
++			if d3 > best_d:
++				best_d = d3
++				best = k
++		if best < 0:
++			break
++		chosen.append(pool[best])
++		out.append(pool[best])
++		pool.remove_at(best)
++
++	return out
++
++
+ func fade_in_ambience():
+ 	for speaker_controller in ambience_speaker_controllers:
+ 		speaker_controller.speaker.volume_linear = 0
+@@ -99,10 +1556,26 @@ func fade_in_ambience():
+ func initialize(_round_number: int, _total_rounds: int, _scores: Dictionary = {}):
+ 	super.initialize(_round_number, _total_rounds, _scores)
+ 
++	# [MP8] 布局以**房主为准**广播一次。必须在 _mp8_place_spawns() 之前 ——
++	# 出生点是按工位算的，工位得先落到最终位置。详见 _mp8_broadcast_layout()。
++	_mp8_broadcast_layout()
++
++	# [MP8] 出生点必须在 spawn_players() **之前**摆好 —— 它就是读 $SpawnPositions 发人的。
++	# 放在 initialize() 而不是 _ready()，是因为要做物理查询：_ready() 时场景刚进树，
++	# 碰撞体还没进物理空间，查出来是空的（会得到"到处都能站"的假结论）。
++	_mp8_place_spawns()
++
+ 	spawn_players()
+ 	spawn_workstations()
+ 	spawn_items()
+ 
++	# [MP8] 工作台是**玩家生成之后**才实例化的静态碰撞体（2.40×3.80 的盒子）。
++	# 谁要是站得离某张桌太近，桌子就会**凭空长在他身上**，人被卡在静态体里、动不了。
++	# 用户 2026-08-16 实测报过「P4 卡死在原地动不了」。这里查一遍并把人推出来。
++	# 内部有 await（要等物理帧，新加的碰撞体那一帧还没进物理空间），
++	# 不 await 调用它 —— 让它自己跑，不挡 initialize 往下走。
++	_mp8_unstick_players()
++
+ 	state_machine.transition_to_rpc.rpc(&"Round", {"round": _round_number, "total": _total_rounds})
+ 
+ func initialize_debug_specifics():
+@@ -150,14 +1623,27 @@ func spawn_players():
+ 
+ 		var player_presence: PlayerPresence = PlayerManager.player_presences[key]
+ 
++		# [MP8] 上界校验：出生点补位没跑成的话宁可少生成一个人，也不要拿 null 去 teleport
++		if counter >= spawn_positions.size():
++			push_warning("[MP8] 枪械工厂：只有 %d 个玩家出生点，第 %d 个人没位置" % [
++				spawn_positions.size(), counter + 1
++			])
++			break
++
+ 		var player_character = player_scene.instantiate()
+ 		players_node_parent.add_child(player_character, true)
+ 
+ 		player_character.set_player_presence.rpc(player_presence.network_id)
+ 		player_character.set_manager_from_path_rpc.rpc(self.get_path())
++
++		# [MP8] 人数越多枪越弱。**计分公式一个字不改**（用户 2026-08-16 定案），
++		# 摁的是造成分数爆炸的源头：原版这把枪冷却 3 秒、杀伤球半径 6 米覆盖到 13.5 米，
++		# 而且球里的人**全死**、每杀一个开枪者 +1 分。详见 manufacture_gun_player.gd 顶部。
++		# ≤4 人时系数 = 1.0，与原版逐值一致。
++		player_character.mp8_set_gun_power_rpc.rpc(_mp8_gun_power())
+ 		player_character.teleport_rpc.rpc(
+-			spawn_positions[counter].global_position, 
+-			spawn_positions[counter].global_rotation, 
++			spawn_positions[counter].global_position,
++			spawn_positions[counter].global_rotation,
+ 		)
+ 
+ 		player_characters[player_presence.network_id] = player_character
+@@ -176,11 +1662,22 @@ func spawn_workstations():
+ 		spawn_positions.append(c.global_position)
+ 		spawn_rotations.append(c.rotation_degrees)
+ 
++	# [MP8] 只读日志：每个玩家离自己工位多远。5~8 号走的是通用补位的出生点，
++	# 不像原版那样紧挨着自己的工位（见 _mp8_expand_workstations 的注释）。
++	var pair := PackedStringArray()
++
+ 	var counter: int = 0
+ 	for player in active_players.values():
+ 
+ 		var player_presence: PlayerPresence = player.player_presence
+ 
++		# [MP8] 上界校验（mp8noexpand + 5 人以上会走到这儿）
++		if counter >= spawn_positions.size():
++			push_warning("[MP8] 枪械工厂：只有 %d 个工位，第 %d 个人没工作台" % [
++				spawn_positions.size(), counter + 1
++			])
++			break
++
+ 		var workstation_instance = workstation_scene.instantiate()
+ 		workstations_node_parent.add_child(workstation_instance, true)
+ 
+@@ -190,9 +1687,18 @@ func spawn_workstations():
+ 		workstation_instance.teleport_rpc_with_rot.rpc(spawn_positions[counter], spawn_rotations[counter])
+ 		workstation_instance.item_assembled.connect(_on_item_assembled)
+ 
+-		remove_empty_workstation_rpc.rpc(counter)
++		# [MP8] 原版是 remove_empty_workstation_rpc.rpc(counter) —— 按下标索引
++		# 只有 4 项的 empty_desk_array，第 5 个工位就越界。改成**传位置**，
++		# 各机自己找最近的那张空桌。位置才可信，而且顺序怎么变都不会错人。
++		remove_empty_workstation_rpc.rpc(spawn_positions[counter])
+ 		workstations.append(workstation_instance)
+ 
++		pair.append("%s 工位(%.1f,%.1f) 距出生点 %.1f 米" % [
++			String(player_presence.network_name),
++			spawn_positions[counter].x, spawn_positions[counter].z,
++			_mp8_flat(spawn_positions[counter], player.global_position)
++		])
++
+ 		if GameManager.local_game:
+ 			local_setup_workstation(player_presence.network_id)
+ 		else:
+@@ -200,6 +1706,8 @@ func spawn_workstations():
+ 
+ 		counter += 1
+ 
++	print("[MP8] 枪械工厂：%d 个工作台就位 —— %s" % [counter, " | ".join(pair)])
++
+ func local_setup_workstation(network_id: int):
+ 
+ 
+@@ -222,6 +1730,12 @@ func spawn_items():
+ 	var spawn_positions: Array[Vector3]
+ 	for c in $ItemSpawner / ItemSpawns.get_children():
+ 		spawn_positions.append(c.global_position)
++
++	# [MP8] 零件按人数放大（见 _mp8_item_positions 的大段注释）。
++	# 不加这一步的话 8 人局里只有 5~6 个人造得出枪，剩下的人全程赤手空拳，
++	# 而且最后两个活人都没枪时这一小局**永远结束不了**。
++	spawn_positions = _mp8_item_positions(spawn_positions)
++
+ 	spawn_positions.shuffle()
+ 
+ 	var variations = ManufactureGunItem.Variation.values().duplicate()
+@@ -258,6 +1772,9 @@ func check_game_end():
+ 			player.finished_rpc.rpc()
+ 			break
+ 
++	# [MP8] 只读日志，**一分钱都不改**（按用户定的工作顺序：适配验收完才轮到得分）
++	_mp8_log_scores()
++
+ 	player_scores_finalized.emit(player_scores)
+ 
+ 	await get_tree().create_timer(2.0).timeout
+@@ -267,6 +1784,30 @@ func check_game_end():
+ 	set_effects_visibility_rpc.rpc(false)
+ 
+ 
++# [MP8] 只读日志：结算时把名次 / 玩家名 / 得分打出来，纯为事后核对，只在服务器侧跑。
++# 枪械工厂是 B 累加族，三处 +1（造出枪 / 击杀 / 最后幸存），起手 0 分。
++func _mp8_log_scores() -> void :
++
++	if not multiplayer.is_server():
++		return
++
++	var rows: Array = []
++	for id in player_scores.keys():
++		var nm: String = "id%d" % id
++		if PlayerManager.player_presences.has(id):
++			nm = String(PlayerManager.player_presences[id].network_name)
++		rows.append({"name": nm, "score": player_scores[id], "gun": ach_players_with_gun.has(id)})
++	rows.sort_custom(func(a, b): return a["score"] > b["score"])
++
++	var parts := PackedStringArray()
++	for i in rows.size():
++		parts.append("第%d名 %s %d分%s" % [
++			i + 1, rows[i]["name"], rows[i]["score"],
++			("(造出枪)" if rows[i]["gun"] else "(没造出枪)")
++		])
++	print("[MP8] 枪械工厂结算（%d 人在场）：%s" % [mp8_player_count, " / ".join(parts)])
++
++
+ @rpc("authority", "call_local", "reliable")
+ func set_tutorial_variables(current_minigame_identifier, custom_game, minigame_round):
+ 	Globals.current_minigame_identifier = current_minigame_identifier
+@@ -280,10 +1821,44 @@ func spawned_workstation_rpc():
+ 		if w.player_presence.network_id == multiplayer.get_unique_id():
+ 			workstation = w
+ 			workstation.set_sequence_preview_node(item_sequence_preview_node_parent)
++			_mp8_point_tutorial_at(w)
+ 			request_item_sequence_rpc.rpc_id(1, multiplayer.get_unique_id())
+ 			return
+ 
+ 
++# [MP8] 第 1 轮那 10 秒教程会高亮"你的工作台"，用的是
++# `marker.bounds_workspaces[按象限算的下标]`（player_marker_state.gd:84-92，
++# 判据是 `p.global_position.x > 1` / `z > 1` 四个象限）。
++# 只有 4 个象限 → 5~8 号玩家必然被指到别人的桌子上。不越界，但指错。
++#
++# 修法不是去改那段象限判断 —— player_marker_state.gd 是 15 个小游戏共用的。
++# 而是**把本机的 bounds_workspaces 四项全换成"本机玩家自己那个框"**：
++# 这样无论象限算出 0~3 哪个下标，指的都是对的那张桌子。
++# ≤4 人时整段不跑（_mp8_ws_boxes 是空的），与原版逐像素一致。
++func _mp8_point_tutorial_at(own_workstation: Node3D) -> void :
++
++	if mp8_player_count <= 4 or _mp8_ws_boxes.is_empty():
++		return
++
++	var marker: Node = get_node_or_null("PlayerMarker")
++	if marker == null:
++		return
++
++	var box: MeshInstance3D = _mp8_nearest_box(own_workstation.global_position)
++	if box == null:
++		push_warning("[MP8] 枪械工厂：找不到本机工位对应的教程高亮框，教程会指错桌子")
++		return
++
++	var typed: Array[MeshInstance3D] = []
++	for _i in 4:
++		typed.append(box)
++	marker.set("bounds_workspaces", typed)
++
++	print("[MP8] 枪械工厂：教程高亮框锁定为 %s（本机工位 %.1f,%.1f）" % [
++		String(box.name), own_workstation.global_position.x, own_workstation.global_position.z
++	])
++
++
+ @rpc("any_peer", "call_local", "reliable")
+ func request_item_sequence_rpc(network_id: int):
+ 	if multiplayer.is_server():
+@@ -311,9 +1886,31 @@ func receive_item_sequence_rpc(sequence: Array):
+ 
+ 
+ 
++# [MP8] 原版签名是 `(index: int)`，直接 `empty_desk_array[index].queue_free()` ——
++# 数组只有 4 项而 index 会走到 7，5~8 号工位越界读 → 报错 + RPC 中断。
++# 改成**按位置认**：谁离这个工位最近就撤谁。
++# 4 人局时工位与空桌的 x/z 逐值相同，匹配是精确的，行为与原版一致。
+ @rpc("any_peer", "call_local", "reliable")
+-func remove_empty_workstation_rpc(index: int):
+-	empty_desk_array[index].queue_free()
++func remove_empty_workstation_rpc(slot_position: Vector3):
++
++	var best: int = -1
++	var bd: float = INF
++
++	for k in empty_desk_array.size():
++		var d: Node3D = empty_desk_array[k]
++		if d == null or not is_instance_valid(d):
++			continue
++		var dd: float = _mp8_flat(d.global_position, slot_position)
++		if dd < bd:
++			bd = dd
++			best = k
++
++	if best < 0 or bd > MP8_DESK_MATCH_TOL:
++		# 这个工位本来就没有空桌（mp8noexpand 下的新工位），不是错误，静默跳过
++		return
++
++	empty_desk_array[best].queue_free()
++	empty_desk_array[best] = null
+ 
+ 
+ 

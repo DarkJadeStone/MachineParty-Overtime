@@ -1,0 +1,260 @@
+diff --git a/minigames/intermission_new/components/intermission_score_screen.gd b/minigames/intermission_new/components/intermission_score_screen.gd
+--- a/minigames/intermission_new/components/intermission_score_screen.gd
++++ b/minigames/intermission_new/components/intermission_score_screen.gd
+@@ -1,6 +1,9 @@
+ class_name Intermission_ScoreScreen extends Node
+ 
+-const rank_y_positions: Array[float] = [0.84, 0.325, -0.19, -0.705]
++# [MP8] 原版是 const。Godot 4 的常量数组是**只读**的，运行时 append 会直接报错，
++# 而 8 人要用 8 个位置，所以必须改成 var。
++# 读它的地方（本文件 + user_container_order_manager.gd）都是当属性读，改 var 不影响。
++var rank_y_positions: Array[float] = [0.84, 0.325, -0.19, -0.705]
+ 
+ @export_category("components")
+ @export var intermission_manager: IntermissionManager
+@@ -51,6 +54,218 @@ func _ready() -> void :
+ 	for child in binary_cells_parent.get_children():
+ 		binary_cells.append(child)
+ 
++	_mp8_shot_armed = Array(OS.get_cmdline_args()).has("mp8shot")
++
++	# [MP8] 计分板扩位。**必须 deferred**，理由见 _mp8_extend()。
++	if not Array(OS.get_cmdline_args()).has("mp8noscore"):
++		_mp8_extend.call_deferred()
++
++
++# [MP8] 每局结算的 3D 计分板本来只有 4 条，8 人时后 4 名根本不显示。
++#
++# 为什么必须 call_deferred：
++#   Intermission_UserContainer._ready() 会做
++#       for child in get_parent().get_children(): user_container_array.append(child)
++#   （每条自己收集所有兄弟，用来做"和上一名换位"的动画）。
++#   本脚本挂在 `intermission score screen` 上，是 `users list` 的**兄弟**且排在前面，
++#   所以本脚本的 _ready() 比那 4 条的 _ready() **先**跑。
++#   这时候复制节点，原件的收集还没发生，各条拿到的名单会残缺不全。
++#   延后一帧，等 4 条都收集完再动手，最后再统一把 8 条的名单覆盖成完整的一份。
++#
++# 排版：和赛前说明屏同一套思路——**缩小塞进原来的地盘，不动周围任何元素**。
++# 这块板上下都是满的（上面是 SIMULATION CONCLUDED 抬头，下面紧跟二进制面板），
++# 原版 4 条占 y 0.84 ~ -0.705（间距 0.515）。
++func _mp8_extend() -> void :
++
++	var target: int = NetworkManager.MAX_PLAYERS
++	var n: int = user_container_array.size()
++	if n == 0 or n >= target:
++		return
++
++	var src: Intermission_UserContainer = user_container_array[0]
++	if not is_instance_valid(src):
++		return
++	var parent: Node = src.get_parent()
++	if parent == null:
++		return
++
++	var s: float = MP8_ROW_SCALE
++	var step: float = MP8_ROW_STEP
++	for a in OS.get_cmdline_args():
++		var t: String = String(a)
++		if t.begins_with("mp8srow="):
++			var parts: PackedStringArray = t.substr(8).split(",")
++			if parts.size() >= 1 and parts[0] != "":
++				s = float(parts[0])
++			if parts.size() >= 2 and parts[1] != "":
++				step = float(parts[1])
++
++	# 分数滚动时长：原版 4 条是 2.0 / 2.5 / 3.0 / 3.5，逐条递增。
++	# 8 条要是照着 +0.5 续下去会变成 5.5，而总时长 = 最长的 ×1.5×1.5，
++	# 整块结算屏会拖长一倍。所以改成**把 8 条铺在原来的 [首,末] 区间里**，
++	# 最长值不变 → 结算节奏和原版完全一致。
++	var lerp_first: float = src.lerp_duration_score
++	var lerp_last: float = user_container_array[n - 1].lerp_duration_score
++
++	for i in range(n, target):
++		var dup: Intermission_UserContainer = src.duplicate()
++		dup.name = "MP8UserInfo%d" % (i + 1)
++		_mp8_reresolve_children(src, dup)
++		dup.container_id = i
++		dup.visible = false
++		parent.add_child(dup)
++		user_container_array.append(dup)
++
++	# 排成几列（mp8scols=<列数>,<列间距>）。
++	# 1 列 = 8 条竖着排；2 列 = 左边 1~4、右边 5~8。
++	var cols: int = MP8_COLS
++	var col_gap: float = MP8_COL_GAP
++	for a in OS.get_cmdline_args():
++		var t: String = String(a)
++		if t.begins_with("mp8scols="):
++			var cp: PackedStringArray = t.substr(9).split(",")
++			if cp.size() >= 1 and cp[0] != "":
++				cols = maxi(int(cp[0]), 1)
++			if cp.size() >= 2 and cp[1] != "":
++				col_gap = float(cp[1])
++	var per_col: int = int(ceil(float(target) / float(cols)))
++
++	# y 表：第一条位置不动，其余按新间距往下排；分列时每列都从头开始排
++	var base_y: float = rank_y_positions[0] if rank_y_positions.size() > 0 else 0.84
++	rank_y_positions.clear()
++	_mp8_rank_x_offsets.clear()
++	for i in target:
++		rank_y_positions.append(base_y - float(i % per_col) * step)
++		_mp8_rank_x_offsets.append(float(i / per_col) * col_gap)
++
++	# 等比缩放是**朝各自原点收**的，而一条的原点在分数和名字之间，
++	# 左边那截（名次数字、两个方块接口）会整体往右缩，
++	# 于是整块名单离开原位、和左边那个大号总分之间裂开一道空隙。
++	# 把最左边那个子件缩掉的量补回去，让名单的左边缘保持在原来的位置。
++	var left_x: float = 0.0
++	for child in src.get_children():
++		if child is Node3D:
++			left_x = minf(left_x, (child as Node3D).position.x)
++	var x_shift: float = left_x * (1.0 - s)
++
++	_mp8_base_x = src.position.x + x_shift
++
++	# 名次 → 槽位 x 的绝对表，换位动画要用（见 user_container_order_manager.gd）
++	mp8_rank_x_positions.clear()
++	for i in target:
++		mp8_rank_x_positions.append(_mp8_base_x + _mp8_rank_x_offsets[i])
++
++	for i in target:
++		var uc: Intermission_UserContainer = user_container_array[i]
++		uc.scale = Vector3.ONE * s
++		uc.position.x = _mp8_base_x + _mp8_rank_x_offsets[i]
++		uc.position.y = rank_y_positions[i]
++		uc.lerp_duration_score = lerpf(lerp_first, lerp_last, float(i) / float(target - 1))
++
++	# ⚠️ 按下标【写】的数组，不补就是越界写（上次会话的 0xc0000005 就是这么来的）：
++	#   sort_user_containers_by_score():  score_container_nodes[rank_position_counter] = uc
++	score_container_nodes = user_container_array.duplicate()
++
++	# 每条自己那份"所有兄弟"的名单，统一覆盖成完整的 8 条。
++	# 用 duplicate() 各给一份，避免 8 条共用同一个 Array 对象。
++	for uc in user_container_array:
++		uc.user_container_array = user_container_array.duplicate()
++
++	print("[MP8] 3D 计分板：玩家条 %d->%d, 缩放 %.2f, 间距 %.4f, %d 列(间距 %.2f)\n        y表 %s\n        x表 %s" % [
++		n, user_container_array.size(), s, step, cols, col_gap,
++		str(rank_y_positions), str(mp8_rank_x_positions)
++	])
++
++
++# [MP8] duplicate() **不会**重映射指向自己子节点的 @export 引用——
++# 复制出来的那条会继续指着**原件**的 Label3D，于是 8 条全在往同一行写字。
++# 解法照 network_manager.gd 的 _mp8_extend_lobby()：
++# 先用 src.get_path_to() 取相对路径，再在副本上 get_node() 重新解析。
++func _mp8_reresolve_children(src: Intermission_UserContainer, dup: Intermission_UserContainer) -> void :
++
++	if is_instance_valid(src.anim_connector):
++		dup.anim_connector = dup.get_node(src.get_path_to(src.anim_connector))
++	if is_instance_valid(src.label_rank):
++		dup.label_rank = dup.get_node(src.get_path_to(src.label_rank))
++	if is_instance_valid(src.label_score):
++		dup.label_score = dup.get_node(src.get_path_to(src.label_score))
++	if is_instance_valid(src.label_name):
++		dup.label_name = dup.get_node(src.get_path_to(src.label_name))
++	if is_instance_valid(src.speaker_connector):
++		dup.speaker_connector = dup.get_node(src.get_path_to(src.speaker_connector))
++
++	var ops: Array[GeometryInstance3D] = []
++	for op in src.opacity_visuals:
++		if is_instance_valid(op):
++			var re = dup.get_node_or_null(src.get_path_to(op))
++			if re != null:
++				ops.append(re)
++	dup.opacity_visuals = ops
++
++	# score_screen / container_order_swapper 指向的是**外部**共享节点，
++	# 复制过来的引用本来就对，不用重解析。
++
++
++# [MP8] 自截图。和赛前说明屏那张的抓法不一样：
++# 赛前说明屏是画进 SubViewport 的 2D UI，抓那个 SubViewport 就行；
++# **这块计分板是摆在中场休息房间里的真 3D 物件**，只能抓整个游戏窗口。
++#
++# 为什么是一串时间点而不是一张：第一版挂在 score_screen_finished 上，
++# 结果那个信号一发，服务器立刻就去安排下一局、把计分板 hide 掉了，
++# 截到的是一整屏绿色噪点（转场遮罩）。计分板的时间线是：
++#   0.6s 行逐条出现 → 2.2s 二进制板 → 2.7s 分数开始滚 → 约 8s 滚完 → 约 10.6s 收屏
++# 所以干脆按固定时间点连拍几张，事后挑一张对的，一次跑完就够看。
++const MP8_SHOT_TIMES: Array[float] = [4.0, 7.0, 10.0]
++
++var _mp8_shot_armed: bool = false
++
++# [MP8] 玩家条排版参数。命令行 mp8srow=<缩放>,<间距> / mp8scols=<列数>,<列间距> 可临时覆盖。
++# 原版 4 条：间距 0.515，占 y 0.84 ~ -0.705。
++# 分两列之后每列只有 4 条，纵向不再挤，行距用回原版的 0.515。
++# 横向是新的瓶颈：一条（名字 7 字符）在缩放 1.0 下约占 420px，板子可用宽约 490px，
++# 所以两列 + 间隙要压在缩放 0.55 上下。
++const MP8_ROW_SCALE: float = 0.48
++const MP8_ROW_STEP: float = 0.515
++const MP8_COLS: int = 2
++const MP8_COL_GAP: float = 3.5
++
++# 每个名次的槽位 x（**绝对值**，不是偏移）。
++# user_container_order_manager.gd 换位时要读它，所以是公开的、名字带 mp8 前缀。
++var mp8_rank_x_positions: Array[float] = []
++
++var _mp8_rank_x_offsets: Array[float] = []
++var _mp8_base_x: float = 0.0
++
++
++# [MP8] 按名次把一条摆到位。
++# 原版只设 y（`user_container.position.y = rank_y_positions[i]`），因为一列时 x 永远不变；
++# 分列之后 x 也成了名次的函数，必须一起设，否则换列的那几条会留在原来那一列的 x 上。
++func _mp8_place(uc: Node3D, i: int) -> void :
++	if i < rank_y_positions.size():
++		uc.position.y = rank_y_positions[i]
++	if i < _mp8_rank_x_offsets.size():
++		uc.position.x = _mp8_base_x + _mp8_rank_x_offsets[i]
++
++
++func _mp8_shot_timeline() -> void :
++
++	if not _mp8_shot_armed:
++		return
++
++	var tag: int = multiplayer.get_unique_id() if multiplayer.has_multiplayer_peer() else 0
++	var waited: float = 0.0
++
++	for t in MP8_SHOT_TIMES:
++		await get_tree().create_timer(t - waited, false).timeout
++		waited = t
++		if not is_inside_tree():
++			return
++		await RenderingServer.frame_post_draw
++		var img: Image = get_viewport().get_texture().get_image()
++		if img != null:
++			img.save_png("user://mp8_score_%d_t%d.png" % [tag, int(t)])
++			print("[MP8] mp8shot：已存 user://mp8_score_%d_t%d.png" % [tag, int(t)])
++
+ func _physics_process(delta: float) -> void :
+ 
+ 	lerp_total_score(delta)
+@@ -66,7 +281,7 @@ func reset_user_containers(
+ 		user_container.set_user_container_as_empty()
+ 		user_container.user_network_id = -2
+ 		user_container.user_rank_value = -1
+-		user_container.position.y = rank_y_positions[i]
++		_mp8_place(user_container, i)  # [MP8] 原版是只设 y
+ 		user_container.container_active = false
+ 
+ 	var player_by_score_array: Array
+@@ -83,7 +298,7 @@ func reset_user_containers(
+ 
+ 	for i in user_container_array.size():
+ 		var user_container = user_container_array[i]
+-		user_container.position.y = rank_y_positions[i]
++		_mp8_place(user_container, i)  # [MP8] 原版是只设 y
+ 		if i < player_by_score_array.size():
+ 			var user_score = player_by_score_array[i]["score"]
+ 			var user_name = intermission_manager.get_user_name_from_network_id(player_by_score_array[i]["network_id"])
+@@ -159,6 +374,8 @@ func setup(
+ 	reset_user_containers(_total_score_by_network_id, _game_score_by_network_id)
+ 	stopping_music = _stopping_music
+ 
++	_mp8_shot_timeline()  # [MP8] 从这里开始计时连拍
++
+ 	active_total_score_by_network_id = _total_score_by_network_id
+ 	active_game_score_by_network_id = _game_score_by_network_id
+ 

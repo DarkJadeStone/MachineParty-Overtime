@@ -1,0 +1,173 @@
+diff --git a/minigames/manufacture_gun/components/player/scripts/manufacture_gun_player.gd b/minigames/manufacture_gun/components/player/scripts/manufacture_gun_player.gd
+--- a/minigames/manufacture_gun/components/player/scripts/manufacture_gun_player.gd
++++ b/minigames/manufacture_gun/components/player/scripts/manufacture_gun_player.gd
+@@ -51,6 +51,44 @@ var interacts_in_range: Array
+ var held_item_variation: ManufactureGunItem.Variation = ManufactureGunItem.Variation.None
+ var held_item_reference: ManufactureGunItem
+ 
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] 人数越多，枪越弱（用户 2026-08-16 定）
++# ═══════════════════════════════════════════════════════════════════════════
++#
++# **计分公式一个字不改**（用户定案：保持原版）。改的是造成分数爆炸的**源头**：
++# 这把枪在 8 人局里太强。
++#
++# 原版真值（probe40 从场景读的，不是脚本字面量）：
++#   shoot_cooldown = 3.00 秒
++#   杀伤球 = 半径 6.00，中心在枪口前 7.48 米 → **覆盖 1.5~13.5 米**
++# 而且 `handle_gun()` 是 `for body in overlapping_bodies` —— **球里的人全死**，
++# 每杀一个开枪者 +1 分。4 人时几乎碰不到一枪多杀，8 人挤得近了就成常态。
++#
++# 系数表按**总人数**索引（照猎鸭那张表的做法；≤4 人一律 1.0 = 原版逐值不变）：
++const MP8_GUN_POWER_BY_COUNT: Dictionary = {
++	5: 0.9,
++	6: 0.85,
++	7: 0.8,
++	8: 0.6,
++}
++#
++# 系数怎么作用（⚠️ 方向别搞反 —— 猎鸭那次就是没换算就调，白改一轮）：
++#   射速 ×m  ⇒  **冷却 ÷ m**（冷却变长 = 打得慢）：8 人 3.00 → 5.00 秒
++#   范围 ×m  ⇒  半径**和前向偏移一起**缩：8 人 半径 6.0→3.6、覆盖 1.5~13.5 → 0.9~8.1
++#
++# ⚠️ **偏移必须跟着缩**：只缩半径的话球心还在 7.48 米外，近身会多出一块
++# 「站在你脸上反而打不到」的死区（0~3.9 米），那不是削弱，是变成了怪东西。
++#
++# 实现上**不碰 SphereShape3D 资源**：形状是所有玩家实例共享的，改它会互相串、
++# 而且资源会跨局缓存（T19 那个"一局比一局跑得更远"的坑）。
++# 改成缩 Area3D 节点自己的 `position` + `scale`：
++#   总偏移 = position.z×m + m×子节点偏移 = m × 原总偏移  ✅
++#   球半径 = 6.0 × m（节点 scale 作用在形状上，球是均匀缩放，Godot 支持）  ✅
++var mp8_gun_power: float = 1.0
++var _mp8_cd_base: float = -1.0
++var _mp8_area_base_pos: Vector3 = Vector3.INF
++var _mp8_gun_logged: bool = false
++
+ var variation_meshes: Array[MeshInstance3D]
+ 
+ var ach_active: bool = true
+@@ -164,8 +202,17 @@ func handle_interaction(_delta: float):
+ 			for i in interacts_in_range:
+ 				if i is ManufactureGunWorkstation:
+ 
++					# [MP8] 原版这里是 `return` —— 只要范围内出现**别人的**工作台，整个函数
++					# 立刻退出，连自己的桌子和地上的零件都一起用不了（人看着正常，就是啥也干不了）。
++					# 原版 4 张桌相距 14~18 米，两张永远不会同时进范围，这个 bug 一辈子不显形；
++					# 8 人把桌子摆近之后立刻显形。**坑第 21 条那个形状：原版把约束藏起来了。**
++					# 实测半径（probe36）：玩家 InteractArea 圆柱半径 1.0、挂在身前约 1 米；
++					# 工作台 InteractArea Box 2.00×3.60（半深 1.80）
++					# → 两张桌中心距小于约 4.9 米就会同时进范围。
++					# 改成 continue = 接着找自己那张。≤4 人时范围内永远只有一张桌，
++					# 这个分支一次都执行不到，**与原版逐行等价**。
+ 					if i.player_presence.network_id != player_presence.network_id:
+-						return
++						continue
+ 
+ 					if i.can_interact:
+ 						if held_item_variation == i.item_sequence[i.current_item_sequence_index]:
+@@ -192,8 +239,10 @@ func handle_interaction(_delta: float):
+ 
+ 			if i is ManufactureGunWorkstation:
+ 
++				# [MP8] 同上，原版是 `return`。这一条更狠：站在别人桌子旁边时，
++				# **连地上的零件都捡不起来**（拾取就在同一个循环的 elif 分支里）。
+ 				if i.player_presence.network_id != player_presence.network_id:
+-					return
++					continue
+ 
+ 				if i.has_gun and held_item_variation == ManufactureGunItem.Variation.None:
+ 
+@@ -377,6 +426,15 @@ func loose_hat_rpc():
+ @rpc("any_peer", "call_local", "reliable")
+ func gun_reloaded_rpc():
+ 	anim_indicator.play("reloaded")
++
++	# ═══════ [MP8] 2026-08-19 修：内层音效只由服务器发起 ═══════
++	# 外层 `gun_reloaded_rpc` 是 call_local 广播，8 个端都会跑到这里。
++	# 不加 guard 的话 8 个端各广播一次换弹音，而 `play_positional_rpc`
++	# 是**从 32 路池里取空闲槽**的 —— 8 份就是 8 个声部叠着响，不是重启一个。
++	# 同一份改动见本文件 set_has_gun_rpc / kill_rpc。
++	if not multiplayer.is_server():
++		return
++
+ 	SoundManager.play_positional_rpc.rpc(
+ 		"manufacture_gun_reload", 
+ 		global_position, 
+@@ -392,7 +450,12 @@ func set_has_gun_rpc(_has_gun: bool):
+ 	has_gun = _has_gun
+ 
+ 	gun_picked_up.emit()
+-	play_pickup_gun_sound()
++
++	# [MP8] 2026-08-19：拾枪音只由服务器发起（理由同 gun_reloaded_rpc）。
++	# `play_pickup_gun_sound()` 内部是 `play_positional_rpc.rpc()` 广播，
++	# 在这个 call_local 处理器里不设防 = 8 个声部叠着响。
++	if multiplayer.is_server():
++		play_pickup_gun_sound()
+ 
+ @rpc("any_peer", "call_local", "reliable")
+ func gun_shot_rpc():
+@@ -451,7 +514,11 @@ func kill_rpc(_killer_network_id: int):
+ 		try_drop_item()
+ 
+ 	anim_handler.got_shot()
+-	play_death_sound()
++
++	# [MP8] 2026-08-19：死亡音只由服务器发起（理由同 gun_reloaded_rpc）。
++	if multiplayer.is_server():
++		play_death_sound()
++
+ 	loose_hat_rpc()
+ 
+ 	var blood_decal: Node3D = blood_decal_instance.instantiate()
+@@ -514,6 +581,50 @@ func teleport_rpc(_position: Vector3, _rotation: Vector3):
+ 	visuals.global_rotation = _rotation
+ 
+ 
++# [MP8] 服务器在 spawn_players() 里按总人数广播一次。
++# **每台机器都要收**：开枪判定 `gun_shot_area.get_overlapping_bodies()` 和
++# `shoot_cooldown_timer` 都是在**开枪那个人自己的机器**上算的，
++# 只在服务器改的话，客户端玩家手里还是原版那把强枪。
++@rpc("any_peer", "call_local", "reliable")
++func mp8_set_gun_power_rpc(m: float) -> void :
++
++	mp8_gun_power = m
++	_mp8_apply_gun_power()
++
++
++func _mp8_apply_gun_power() -> void :
++
++	# 基准值只记一次，之后一律"基准 × 系数"。
++	# 不记基准的话反复调用会**连乘**（残骸平台落石倍率那个坑，按两次 5 倍变 25 倍）。
++	if _mp8_cd_base < 0.0:
++		_mp8_cd_base = shoot_cooldown
++	if _mp8_area_base_pos == Vector3.INF and gun_shot_area != null:
++		_mp8_area_base_pos = gun_shot_area.position
++
++	var m: float = maxf(0.05, mp8_gun_power)
++
++	# 射速 ×m ⇒ 冷却 ÷m（冷却变长 = 打得慢）
++	shoot_cooldown = _mp8_cd_base / m
++
++	# 范围 ×m：缩 Area3D 自己的位置与缩放，**不碰共享的 SphereShape3D 资源**
++	if gun_shot_area != null:
++		gun_shot_area.position = _mp8_area_base_pos * m
++		gun_shot_area.scale = Vector3.ONE * m
++
++	# 只打一次，8 个实例 × 8 个玩家节点会把日志刷爆
++	if not _mp8_gun_logged:
++		_mp8_gun_logged = true
++		var r: float = 0.0
++		if gun_shot_area != null:
++			for c in gun_shot_area.get_children():
++				if c is CollisionShape3D and (c as CollisionShape3D).shape is SphereShape3D:
++					r = ((c as CollisionShape3D).shape as SphereShape3D).radius * m
++		print("[MP8] 枪械工厂：枪力 ×%.2f —— 冷却 %.2f→%.2f 秒（%.1f→%.1f 发/分）、杀伤半径 %.2f、球心前移 %.2f 米" % [
++			m, _mp8_cd_base, shoot_cooldown, 60.0 / _mp8_cd_base, 60.0 / shoot_cooldown,
++			r, absf(gun_shot_area.position.z) if gun_shot_area != null else 0.0
++		])
++
++
+ func _on_interactable_entered(area: Area3D):
+ 
+ 	if area.owner is ManufactureGunPlayer:

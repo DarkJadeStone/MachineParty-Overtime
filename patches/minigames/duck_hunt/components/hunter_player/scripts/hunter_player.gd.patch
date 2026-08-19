@@ -1,0 +1,515 @@
+diff --git a/minigames/duck_hunt/components/hunter_player/scripts/hunter_player.gd b/minigames/duck_hunt/components/hunter_player/scripts/hunter_player.gd
+--- a/minigames/duck_hunt/components/hunter_player/scripts/hunter_player.gd
++++ b/minigames/duck_hunt/components/hunter_player/scripts/hunter_player.gd
+@@ -18,19 +18,365 @@ class_name DuckHuntHunterPlayer
+ @export var hand_meshes: Array[MeshInstance3D]
+ @export var laser_mesh: MeshInstance3D
+ 
+-@export var magazine_capacity_by_duck_count: Dictionary[int, int] = {
+-	0: 7, 
+-	1: 7, 
+-	2: 8, 
+-	3: 10, 
++# [MP8] 原版这两张表**按鸭子数**索引，5~8 人时表达不了想要的强弱：
++# 5 人和 6 人都是 4 只鸭，一个要加强猎人、一个要削弱，同一个键给不出两个值。
++# 所以索引改成**总人数**（用户 2026-08-14 拍板的四条之一）。
++#
++# 顺带修掉原版一个现存 bug：原来查表用 `.get(duck_count, 7)` / `.get(duck_count, 0.95)`，
++# **缺键就回落到全表最弱的那档**。5~8 人（4~6 只鸭）时全部缺键，
++# 于是猎人拿着最差的枪去打最多的鸭，方向正好反了。
++# 现在改成把人数**夹到表的键范围内**再查，不会再落到兜底值。
++#
++# ⚠️ 原名 `reload_speed_by_duck_count` 骗人：它其实是 cycle_time
++#    （打完一枪到能再打的间隔，值越小越快）。真正的换弹写死在 3.8-0.95=2.85 秒，不受此表控制。
++#
++# 五档表（用户定稿 2026-08-14）：
++#   人数  鸭:猎   弹夹  间隔    说明
++#   ≤4   3:1     10   0.80   原版基准
++#   5    4:1     12   0.70   猎人最亏 → 加强
++#   6    4:2      7   1.00   鸭子最亏 → 削弱
++#   7    5:2      8   0.80   仅削弱弹夹
++#   8    6:2     10   0.80   比值回到基准，性能不变
++@export var magazine_capacity_by_player_count: Dictionary[int, int] = {
++	4: 10,
++	5: 12,
++	6: 7,
++	7: 8,
++	8: 10,
+ }
+-@export var reload_speed_by_duck_count: Dictionary[int, float] = {
+-	0: 0.95, 
+-	1: 0.95, 
+-	2: 0.9, 
+-	3: 0.8, 
++# ⚠️ 表里是 cycle_time，**不等于两枪之间的间隔**：
++#    实际间隔 = 0.5 秒（原版写死）+ cycle_time。
++#    所以想要"5 人档射速是基准的 1.3 倍"，得先算总间隔再反推 cycle：
++#      5 人档原总间隔 1.20 秒 → ÷1.3 = 0.923 秒 → cycle = 0.923 - 0.5 = 0.42
++@export var cycle_time_by_player_count: Dictionary[int, float] = {
++	4: 0.80,   # 总间隔 1.30 秒（基准）
++	5: 0.42,   # 总间隔 0.92 秒 = 原 5 人档(1.20)的 1.3 倍射速（用户 2026-08-15 定）
++	6: 1.00,   # 总间隔 1.50 秒
++	7: 0.80,   # 总间隔 1.30 秒
++	8: 0.80,   # 总间隔 1.30 秒
+ }
+ 
++# [MP8] setup_rpc 传进来的总人数（0 = 没传，退回按鸭子数推）
++var mp8_player_count: int = 0
++
++
++# [MP8] ===== 腰射扩散（不开镜打不准）=====
++#
++# 原版无论开不开镜都是从 laser_raycast 打一条绝对精准的射线，
++# 所以"抬手就打"和"架镜瞄准"命中率一样，镜子只是看得清楚而已。
++# 这里给**不开镜**的射击加一个圆锥内的随机偏移。
++#
++# 为什么这个角度是个好机制：偏差是**角度**，落点误差随距离线性放大。
++# 2° 在 125 米外约偏 4.4 米（鸭子约 1 米宽 → 基本打不中），
++# 在 20 米内只偏 0.7 米（还能打中）。
++# 于是自然形成"远距离必须架镜、近距离可以抬手打"，不需要额外写规则。
++#
++# zoom_fov_index：0 = 不开镜（FOV 75），1/2 = 开镜，只有 0 吃扩散。
++# 2026-08-15 用户判定 2° 太小，加到 8°：
++#   8° 时中位偏移 125米→12.4米、40米→4.0米、20米→2.0米、10米→1.0米
++#   ——也就是**不开镜基本就别想打中**，10 米内才勉强有戏。
++#   （各候选值的对照表见 tools\probe\probe18.gd，改完跑一次就能看）
++@export var mp8_hipfire_spread_deg: float = 8.0
++
++var _mp8_spread_saved_rotation: Vector3 = Vector3.ZERO
++var _mp8_spread_applied: bool = false
++
++
++# [MP8] ===== 射速调试热键（数字键 1 / 2 / 3）=====
++#
++# 为什么"改了射速没感觉"：**两枪之间的间隔不只有 cycle_time**，
++# 而是 `0.5 秒（写死）+ cycle_time`，弹夹打空时还要再加 2.85 秒换弹。
++# 所以 0.80 → 0.70 只是把 1.30 秒变成 1.20 秒，**只快了 8%**，手感上基本察觉不到。
++#
++# 因此这个调试倍率作用在**整个间隔**上（那 0.5 秒也一起缩放），
++# 按 2 就是实打实的两倍射速，好让人分辨得出来。
++#   1 = 原速   2 = 2 倍射速（间隔 ×0.5）   3 = 半速（间隔 ×2）
++#
++# 只在带 `-debug-tools` 或 `mp8ratekeys` 时生效，发布版按不出来。
++var _mp8_rate_scale: float = 1.0
++var _mp8_rate_keys: bool = false
++var _mp8_rate_label: Label = null
++var _mp8_id_label: RichTextLabel = null  # 两行两色，必须富文本
++var _mp8_debug_canvas: CanvasLayer = null
++
++# [MP8] 本猎人是第几个 / 共几个（右上角显示"左/右"用）
++var mp8_hunter_index: int = -1
++var mp8_hunter_total: int = 1
++
++
++func _mp8_init_rate_keys() -> void :
++	# [MP8] 2026-08-15 用户要求关掉调试键：现在**只认显式的 mp8ratekeys**，
++	# 不再跟着 -debug-tools 一起打开（测试台默认带 -debug-tools，那样等于常开）。
++	_mp8_rate_keys = Array(OS.get_cmdline_args()).has("mp8ratekeys")
++
++
++func _mp8_handle_rate_key(event: InputEvent) -> void :
++
++	if not _mp8_rate_keys:
++		return
++	if not (event is InputEventKey):
++		return
++	var key: InputEventKey = event
++	if not key.pressed or key.echo:
++		return
++
++	var scale: float = -1.0
++	match key.keycode:
++		KEY_1:
++			scale = 1.0
++		KEY_2:
++			scale = 0.5
++		KEY_3:
++			scale = 2.0
++	if scale < 0.0:
++		return
++
++	_mp8_rate_scale = scale
++
++	var base: float = 0.5 + _mp8_effective_cycle()
++	var label: String = "原速" if is_equal_approx(scale, 1.0) else (
++		"2 倍射速" if scale < 1.0 else "半速"
++	)
++	var msg: String = "[射速调试] %s  两枪间隔 %.2f 秒 (%d 人档 cycle=%.2f)" % [
++		label, base * scale, _mp8_tier(), _mp8_effective_cycle()
++	]
++	print("[MP8] " + msg)
++	_mp8_show_rate_hint(msg)
++
++
++# [MP8] 调试用的覆盖层，射速提示和玩家 id 共用一个
++func _mp8_debug_layer() -> CanvasLayer:
++	if _mp8_debug_canvas == null:
++		_mp8_debug_canvas = CanvasLayer.new()
++		_mp8_debug_canvas.layer = 100
++		add_child(_mp8_debug_canvas)
++	return _mp8_debug_canvas
++
++
++# [MP8] 给调试用的 Label 套上游戏自己的字体。
++# ⚠️ 不套的话用的是默认主题字体，**字距是坏的**：实测字全挤在一起叠成一团
++# （"P3  id 104..." 会显示成 "P36idc104..."），空格换成半角也没用。
++# 游戏自己那些 Label 都显式指定了 Terminal F4，照做即可。
++func _mp8_style_debug_label(lbl: Label, color: Color) -> void :
++
++	var f = load("res://fonts/Terminal F4.ttf")
++	if f != null:
++		lbl.add_theme_font_override("font", f)
++	lbl.add_theme_font_size_override("font_size", 26)
++	lbl.add_theme_color_override("font_color", color)
++	lbl.add_theme_color_override("font_outline_color", Color.BLACK)
++	lbl.add_theme_constant_override("outline_size", 6)
++	lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
++
++
++# [MP8] 右上角常驻显示本局猎人的强弱状态（弹夹 / 射速）。
++#
++# 这块 HUD 一开始是调试用的"我是谁"（玩家名 + id + 左右），
++# 排查音效那次就是靠它把变量隔离出来的（用户提的）。
++# 排查完之后按用户要求换成玩家真正需要的信息：**弹夹和射速各自是强化还是削弱**，
++# **不显示具体数值**（数值是设计者的事，玩家只需要知道方向），颜色沿用角色揭示屏那套：
++#   增强 = 红   削弱 = 蓝   无效果 = 绿
++#
++# 现在是给玩家看的信息，所以**不再限定 -debug-tools**，正式游玩也显示。
++func _mp8_show_id_hud() -> void :
++
++	if player_presence == null:
++		return
++
++	# ⚠️ **两个猎人的节点在每台机器上都存在**（多人同步的是全部玩家）。
++	# 不加这个判断的话，每块屏幕右上角会叠着两个 Label（自己那个和另一个猎人那个），
++	# 实测两个窗口显示的是同一个人的 id——因为后建的那个盖住了先建的。
++	# 这是第一人称 HUD，只该在**自己控制的那个猎人**的屏幕上出现。
++	if not GameManager.local_game:
++		if player_presence.network_id != multiplayer.get_unique_id():
++			return
++
++	if _mp8_id_label == null:
++		# 两行要用两种颜色，普通 Label 做不到（一个 Label 只能一种字色），所以用富文本
++		var lbl := RichTextLabel.new()
++		lbl.bbcode_enabled = true
++		lbl.scroll_active = false
++		lbl.fit_content = true
++		lbl.set_anchors_preset(Control.PRESET_TOP_RIGHT)
++		lbl.offset_left = -420.0
++		lbl.offset_top = 12.0
++		lbl.offset_right = -16.0
++		lbl.offset_bottom = 120.0
++		var f = load("res://fonts/Terminal F4.ttf")
++		if f != null:
++			lbl.add_theme_font_override("normal_font", f)
++		lbl.add_theme_font_size_override("normal_font_size", 26)
++		lbl.add_theme_color_override("font_outline_color", Color.BLACK)
++		lbl.add_theme_constant_override("outline_size", 6)
++		lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
++		_mp8_debug_layer().add_child(lbl)
++		_mp8_id_label = lbl
++
++	var zh: bool = TranslationServer.get_locale().to_upper().begins_with("ZH")
++	var tier: int = _mp8_tier()
++
++	# 和基准档（4 人档）比：弹夹越大越强；间隔越小越强（cycle 是间隔，不是射速）
++	var base_mag: int = magazine_capacity_by_player_count.get(4, 10)
++	var base_cycle: float = cycle_time_by_player_count.get(4, 0.80)
++	var mag: int = _mp8_effective_magazine()
++	var cyc: float = _mp8_effective_cycle()
++
++	_mp8_id_label.text = "[right]%s\n%s[/right]" % [
++		_mp8_buff_line("弹夹" if zh else "MAG", _mp8_sign(float(mag - base_mag)), zh),
++		_mp8_buff_line("射速" if zh else "RATE", _mp8_sign(base_cycle - cyc), zh),
++	]
++
++
++# [MP8] 取符号：正=增强，负=削弱，0=无效果。浮点比较留一点容差，避免 0.7999 被判成削弱。
++func _mp8_sign(v: float) -> int:
++	if v > 0.001:
++		return 1
++	if v < -0.001:
++		return -1
++	return 0
++
++
++# [MP8] 一行"某项 + 强/弱/常规"，颜色沿用角色揭示屏：增强红、削弱蓝、无效果绿。
++# **不显示具体数值**（用户要求）。
++func _mp8_buff_line(what: String, direction: int, zh: bool) -> String:
++
++	var color: String = "#4dff6a"
++	var word: String = "无效果" if zh else "NORMAL"
++	if direction > 0:
++		color = "#ff2d2d"
++		word = "增强" if zh else "BUFFED"
++	elif direction < 0:
++		color = "#3fa9ff"
++		word = "削弱" if zh else "NERFED"
++
++	return "[color=%s]%s %s[/color]" % [color, what, word]
++
++
++func _mp8_show_rate_hint(text: String) -> void :
++
++	if _mp8_rate_label == null:
++		var lbl := Label.new()
++		lbl.set_anchors_preset(Control.PRESET_TOP_WIDE)
++		lbl.offset_top = 40.0
++		lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
++		_mp8_style_debug_label(lbl, Color(1.0, 0.85, 0.2))
++		_mp8_debug_layer().add_child(lbl)
++		_mp8_rate_label = lbl
++
++	_mp8_rate_label.text = text
++	_mp8_rate_label.modulate.a = 1.0
++	var t := create_tween()
++	t.tween_interval(2.0)
++	t.tween_property(_mp8_rate_label, "modulate:a", 0.0, 0.6)
++
++
++# [MP8] 让一段动画正好铺满给定的时间窗：速度 = 动画本身长度 / 可用时间。
++# 拿不到动画长度就退回 1.0（原速），不至于把动画搞坏。
++# 夹在 [0.25, 4.0]：再快就糊成一团、再慢就像卡住了，超出这个范围宁可不同步。
++func _mp8_anim_speed_for(anim_name: StringName, window: float) -> float:
++
++	if window <= 0.0 or anim_rig == null:
++		return 1.0
++	if not anim_rig.has_animation(anim_name):
++		return 1.0
++
++	var anim: Animation = anim_rig.get_animation(anim_name)
++	if anim == null or anim.length <= 0.0:
++		return 1.0
++
++	return clampf(anim.length / window, 0.25, 4.0)
++
++
++func _mp8_hipfire_spread_deg() -> float:
++	for a in OS.get_cmdline_args():
++		var t: String = String(a)
++		if t.begins_with("mp8spread="):
++			return float(t.substr(10))
++	return mp8_hipfire_spread_deg
++
++
++func _mp8_apply_hipfire_spread() -> void :
++
++	_mp8_spread_applied = false
++
++	if laser_raycast == null:
++		return
++	if zoom_fov_index > 0:   # 开镜 = 精准，原样不动
++		return
++
++	var spread: float = deg_to_rad(_mp8_hipfire_spread_deg())
++	if spread <= 0.0:
++		return
++
++	_mp8_spread_saved_rotation = laser_raycast.rotation
++	_mp8_spread_applied = true
++
++	# 在圆锥内**按面积均匀**取一个方向：半径用 sqrt(randf()) 而不是 randf()，
++	# 否则落点会往中心堆积，实际扩散比设定值小。
++	var angle: float = randf() * TAU
++	var radius: float = sqrt(randf()) * spread
++	laser_raycast.rotation.x += sin(angle) * radius
++	laser_raycast.rotation.y += cos(angle) * radius
++
++	# ⚠️ RayCast3D 的碰撞结果是上一帧物理算好的，转完必须手动重算，
++	# 否则 is_colliding()/get_collider() 拿到的还是没偏之前的旧结果，扩散完全不生效。
++	laser_raycast.force_raycast_update()
++
++
++func _mp8_clear_hipfire_spread() -> void :
++
++	if not _mp8_spread_applied:
++		return
++	_mp8_spread_applied = false
++	laser_raycast.rotation = _mp8_spread_saved_rotation
++	laser_raycast.force_raycast_update()
++
++
++# [MP8] ===== 独狼回合 =====
++#
++# 7 人是奇数：前 3 个小回合各抽走 2 个猎人，**最后一个回合只剩 1 个人当猎人，却要面对 6 只鸭**
++# （猎人是"每人轮流当一次"，抽干为止）。而五档表是按"7 人 = 5鸭:2猎"配的，
++# 那个倒霉蛋会一个人拿着被削弱的枪打 6 只鸭，和五档表的设计意图直接冲突。
++#
++# 用户 2026-08-15 定：这种回合按"1 猎"单独给参数，在 5 人档基础上再强化。
++#
++# **强化幅度的依据**（以 5 人档 4鸭:1猎、弹夹 12、间隔 0.92 秒为基准）：
++#   独狼是 6鸭:1猎，压力正好 1.5 倍 → 按比值线性放大：弹夹 ×1.5 = 18，间隔 ÷1.5 = 0.61。
++#   验算"含换弹的持续输出"（换弹固定 2.85 秒不变）：
++#     5 人档  ：12×0.92 + 2.85 = 13.89 秒打 12 发 → 0.864 发/秒 ÷ 4 鸭 = 0.216
++#     独狼    ：18×0.61 + 2.85 = 13.83 秒打 18 发 → 1.302 发/秒 ÷ 6 鸭 = 0.217
++#   **每只鸭分摊到的火力压制只差 0.4%**，即线性放大恰好落在"与 5 人档每鸭火力持平"上。
++@export var mp8_lone_hunter_magazine: int = 18
++@export var mp8_lone_hunter_cycle: float = 0.11
++
++
++# 本回合是不是"本该两猎却只有一个"的独狼局
++func _mp8_is_lone_hunter() -> bool:
++	return mp8_hunter_total == 1 and mp8_player_count >= 6
++
++
++# [MP8] 把人数夹进表的键范围再查，避免缺键落到兜底值
++func _mp8_tier() -> int:
++	var n: int = mp8_player_count
++	if n <= 0:
++		n = duck_count + 1  # 没传人数时的退路：鸭子数 + 1 个猎人
++	return clampi(n, 4, 8)
++
++
++# [MP8] 本回合实际生效的弹夹 / 射击间隔（独狼回合走单独那套）。
++# set_active_rpc、shoot() 的循环等待、右上角 HUD 三处都必须走这两个函数，
++# 否则会出现"显示的强弱和实际打起来的手感对不上"。
++func _mp8_effective_magazine() -> int:
++	if _mp8_is_lone_hunter():
++		return mp8_lone_hunter_magazine
++	return magazine_capacity_by_player_count.get(_mp8_tier(), 10)
++
++
++func _mp8_effective_cycle() -> float:
++	if _mp8_is_lone_hunter():
++		return mp8_lone_hunter_cycle
++	return cycle_time_by_player_count.get(_mp8_tier(), 0.80)
++
+ @export_category("Zoom")
+ @export var zoom_fovs: Array[float] = [
+ 	75.0, 
+@@ -158,6 +504,11 @@ func _input(event: InputEvent) -> void :
+ 	if PauseMenu.active:
+ 		return
+ 
++	# [MP8] 射速调试热键。放在 using_joystick 判断之前，手柄玩家也能用键盘按。
++	# 只对自己控制的那个猎人生效，别人的实例不受影响。
++	if GameManager.local_game or multiplayer.get_unique_id() == get_multiplayer_authority():
++		_mp8_handle_rate_key(event)
++
+ 	if player_presence.using_joystick:
+ 		return
+ 
+@@ -330,6 +681,8 @@ func shoot():
+ 
+ 	laser_scale_node.visible = false
+ 
++	_mp8_apply_hipfire_spread()  # [MP8] 腰射扩散：不开镜就打不准
++
+ 	if laser_raycast.is_colliding():
+ 		var collider = laser_raycast.get_collider()
+ 		if collider is DuckHuntHitbox:
+@@ -373,6 +726,8 @@ func shoot():
+ 				true
+ 			)
+ 
++	_mp8_clear_hipfire_spread()  # [MP8] 判定完立刻把准星摆回去，别影响激光和下一帧
++
+ 	recoil_progress = 0.0
+ 	var t = create_tween()
+ 	t.tween_property(
+@@ -386,25 +741,37 @@ func shoot():
+ 	look_recoil.x += 0.025 * (-1 + (randf() * 2))
+ 
+ 	play_shoot_sound_rpc.rpc()
++	# [MP8] ⚠️ 拉栓音效**保持原版位置**（开枪这一瞬间就响）。
++	# 我一度把它挪到 0.5 秒后和拉栓动画一起触发，理由是"动作和声音对不上"，
++	# **结果实测更糟**（用户 2026-08-15：原来右边猎人是完全正常的，挪完反而不正常了）——
++	# 射速加快之后间隔只有 0.92 秒，挪到 0.5 秒处的拉栓声会和下一枪撞在一起。
++	# 教训：**原版是对的就别动它**，"看起来不合理"不等于听起来不对。
+ 	if num_of_current_rounds_in_magazine != 1:
+ 		if GameManager.local_game or (multiplayer.get_unique_id() == get_multiplayer_authority()):
+ 			speaker_rack_rifle.play()
+ 
+-	await get_tree().create_timer(0.5).timeout
++	await get_tree().create_timer(0.5 * _mp8_rate_scale).timeout  # [MP8] 调试倍率
+ 	if unzoom_after_shot:
+ 		zoom_fov_index = 0
+ 		update_zoom()
+ 
+ 	num_of_current_rounds_in_magazine -= 1
+ 
++	var cycle_time = _mp8_effective_cycle()  # [MP8] 按总人数查，独狼回合走单独那套
++	var cycle_window: float = cycle_time * _mp8_rate_scale             # [MP8] 调试倍率
++
+ 	if num_of_current_rounds_in_magazine == 0:
+ 		await reload()
+ 	else:
+-		anim_rig.play("rifle_pull_bolt_overwrite")
+-
+-
+-	var cycle_time = reload_speed_by_duck_count.get(duck_count, 0.95)
+-	await get_tree().create_timer(cycle_time).timeout
++		# [MP8] 拉栓动画要跟着射速走。原版是定速播的，而射击间隔现在是可变的
++		# （五档表按人数给不同 cycle_time，调试热键还能再乘一个倍率），
++		# 定速播就会两头不对：射速快时上一发的栓还没拉完就打下一枪，
++		# 射速慢时栓早早拉完在那干等。
++		anim_rig.play("rifle_pull_bolt_overwrite", -1, _mp8_anim_speed_for(
++			&"rifle_pull_bolt_overwrite", cycle_window
++		))
++
++	await get_tree().create_timer(cycle_window).timeout
+ 	if return_to_zoom_after_shot:
+ 		zoom_fov_index = zoom_index
+ 		update_zoom(zoom_index > 0)
+@@ -414,6 +781,9 @@ func reload():
+ 	if GameManager.local_game or (multiplayer.get_unique_id() == get_multiplayer_authority()):
+ 		play_reload_sound_rpc.rpc()
+ 	can_shoot = false
++
++	# [MP8] ⚠️ 换弹保持原版原样，**任何改动都不要作用到换弹和它的动画上**
++	# （2026-08-15 用户明确要求）。射速倍率、五档表都不碰这里。
+ 	anim_rig.play("rifle_reload_main_overwrite")
+ 	num_of_current_rounds_in_magazine = magazine_capacity
+ 	await get_tree().create_timer(3.8 - 0.95, false).timeout
+@@ -483,6 +853,15 @@ func initialize_hunter_rpc(initial_delay: float):
+ 	if not GameManager.local_game:
+ 		if multiplayer.get_unique_id() != get_multiplayer_authority(): return
+ 
++	# [MP8] 排查用：这个函数负责装备步枪的动画和音效，只在自己那台机器上跑。
++	# 如果第二个猎人这行没打出来，说明 RPC 根本没到（节点复制竞态），
++	# 那就不只是没音效，连步枪都不会装备。
++	if Array(OS.get_cmdline_args()).has("-debug-tools"):
++		print("[MP8] 猎人初始化：本机=%d 枪主=%d 延迟=%.1f" % [
++			multiplayer.get_unique_id() if multiplayer.has_multiplayer_peer() else 0,
++			player_presence.network_id if player_presence else -1, initial_delay
++		])
++
+ 	await get_tree().create_timer(initial_delay, false).timeout
+ 	anim_sensitivity_prompt.play("show")
+ 	await get_tree().create_timer(4, false).timeout
+@@ -530,10 +909,13 @@ func cleanup_rpc():
+ func set_active_rpc(_active: bool) -> void :
+ 	active = _active
+ 
+-	magazine_capacity = magazine_capacity_by_duck_count.get(
+-		duck_count, 7
+-	)
++	# [MP8] 改按总人数查（见文件头那张五档表）；独狼回合走单独那套
++	magazine_capacity = _mp8_effective_magazine()
+ 	num_of_current_rounds_in_magazine = magazine_capacity
++	print("[MP8] 猎人调参：%d 人档%s → 弹夹 %d, 射击间隔 %.2f" % [
++		_mp8_tier(), "（独狼回合）" if _mp8_is_lone_hunter() else "",
++		magazine_capacity, _mp8_effective_cycle()
++	])
+ 
+ @rpc("any_peer", "call_local", "reliable")
+ func set_player_presence(network_id: int) -> void :
+@@ -618,9 +1000,17 @@ func set_player_presence(network_id: int) -> void :
+ 		set_physics_process(false)
+ 
+ @rpc("any_peer", "call_local", "reliable")
+-func setup_rpc(_position: Vector3, _duck_count: int):
++func setup_rpc(
++	_position: Vector3, _duck_count: int, _player_count: int = 0,
++	_hunter_index: int = -1, _hunter_total: int = 1
++):
+ 	global_position = _position
+ 	duck_count = _duck_count
++	mp8_player_count = _player_count  # [MP8] 调参改按总人数，0 = 老调用方没传
++	mp8_hunter_index = _hunter_index
++	mp8_hunter_total = _hunter_total
++	_mp8_init_rate_keys()
++	_mp8_show_id_hud.call_deferred()  # 右上角显示玩家 id（只在 -debug-tools 时）
+ 
+ 
+ 

@@ -1,0 +1,73 @@
+diff --git a/minigames/smoke_break/states/round_end_state.gd b/minigames/smoke_break/states/round_end_state.gd
+--- a/minigames/smoke_break/states/round_end_state.gd
++++ b/minigames/smoke_break/states/round_end_state.gd
+@@ -23,13 +23,62 @@ func enter(_msg: Dictionary = {}) -> void :
+ 	await get_tree().create_timer(1, false).timeout
+ 	var losers = owner.active_players.duplicate()
+ 
+-	var score_counter: int = 3
+-	for player in owner.finished_players:
+-		if score_counter <= 0:
+-			break
+-		owner.player_scores[player.player_presence.network_id] += 1
+-		losers.erase(player)
+-		score_counter -= 1
++	# ═══════════════════════════════════════════════════════════════════════
++	# [MP8] 名次制算分（用户 2026-08-17 定：名次制 + 第一个抽完的额外 +1）
++	# ═══════════════════════════════════════════════════════════════════════
++	#
++	# **原版机制**（核对过代码）：只有两处给分 ——
++	#   `smoke_break.gd:143` `if finished_players.is_empty(): +1`  第一个抽完的 +1
++	#   本文件原来的 `score_counter = 3`                            前 3 名各 +1
++	# 于是第 1 名 +2、第 2/3 名 +1、其余 0。默认歌单 2 轮 → 整个小游戏 **0~4 分**。
++	#
++	# **8 人下的毛病**：
++	#   ① 它是全场最不值钱的小游戏 —— 0~4，而立足之本 0~24、残骸平台 0~21、雷区 0~18；
++	#   ② "前 3 名得分"**不随人数放大**：4 人时 75% 的人能得分，8 人只剩 37.5%，
++	#      **5 个人颗粒无收还要挨枪**。这是纯人数副作用，不是设计意图；
++	#   ③ 第 4 名和第 8 名同分（都是 0），名次信息大部分丢了。
++	#
++	# **改法**（项目既定做法：用小游戏自己已有的顺序数组下标当分数）。
++	# `finished_players` 是按抽完顺序真 append 的，现成可用：
++	#   没抽完（被枪毙）      → **0 分**（都没通过检测，一视同仁）
++	#   第 j 个抽完（j 从 0） → **N - j** 分（N = 本局人数）
++	#   第一个抽完的再 **+1**（保留原版那个彩头，用户点名要的）
++	# 8 人全抽完 → 9 / 7 / 6 / 5 / 4 / 3 / 2 / 1，第一名和第二名之间的 2 分差
++	# 就是那个彩头。2 轮 → 0~18，和雷区同档，**不需要额外系数**。
++	#
++	# ⚠️ **整表覆盖**（先归零再赋值），不是在原版增量上加 ——
++	# `smoke_break.gd` 里那个"第一个抽完 +1"是边打边加的，
++	# 留着会和这里的彩头重复计一次。覆盖掉最省心，那一行不用动。
++	#
++	# ⚠️ **谁挨枪一个字没改**：`losers` = `active_players`，而抽完的人在
++	# `_on_player_finished` 里已经从 `active_players` 里 erase 了，
++	# 所以原版那句 `losers.erase(player)` 本来就是**空操作** ——
++	# 没抽完的照样全部枪毙，与原版逐值一致。
++	var mp8_total: int = owner.player_scores.size()
++	for id in owner.player_scores.keys():
++		owner.player_scores[id] = 0
++
++	var mp8_rows := PackedStringArray()
++	for j in owner.finished_players.size():
++		var p = owner.finished_players[j]
++		if p == null or not is_instance_valid(p):
++			continue
++		var pid: int = p.player_presence.network_id
++		if not owner.player_scores.has(pid):
++			continue
++		var s: int = mp8_total - j
++		if j == 0:
++			s += 1
++		owner.player_scores[pid] = s
++		mp8_rows.append("第%d个抽完 %s %d分%s" % [
++			j + 1, String(p.player_presence.network_name), s,
++			("(首位彩头+1)" if j == 0 else "")
++		])
++
++	print("[MP8] 吸烟小憩结算（%d 人 / 抽完 %d / 被枪毙 %d）：%s" % [
++		mp8_total, owner.finished_players.size(), losers.size(),
++		(" | ".join(mp8_rows) if mp8_rows.size() > 0 else "一个都没抽完，全员 0 分")
++	])
+ 
+ 	owner.player_scores_finalized.emit(owner.player_scores)
+ 

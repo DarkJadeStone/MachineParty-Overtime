@@ -1,0 +1,786 @@
+diff --git a/minigames/exploding_collar_race/scripts/exploding_collar_race.gd b/minigames/exploding_collar_race/scripts/exploding_collar_race.gd
+--- a/minigames/exploding_collar_race/scripts/exploding_collar_race.gd
++++ b/minigames/exploding_collar_race/scripts/exploding_collar_race.gd
+@@ -52,9 +52,131 @@ var shaker_intensity: float = 0.0
+ var in_shaker_proximity: Array
+ var camera_player: ExplodingCollarRacePlayer
+ 
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] 雷区 8 人适配 —— 出生点由用户自己摆（用户 2026-08-16 定）
++# ═══════════════════════════════════════════════════════════════════════════
++#
++# **这个小游戏的 8 人适配几乎只有出生点一件事**，其余全是天然可扩的（侦察结论，probe44）：
++#   · 地雷是 `PoissonDiscSampling` 在多边形上按 `mine_distance` **程序生成**
++#     → 数量随面积走、与人数无关，一个字不用改；
++#   · 全文件**没有**按玩家下标索引的定长数组（只有出生点数组一处，坑第 13 条 grep 过）；
++#   · 收割机只有一台、结束条件是 `active_players.is_empty()` → 与人数无关。
++#
++# ⚠️ 场地实测边界（别摆出去）：
++#   地雷生成变换是 `Vector3(-8.0 + p.x, 0, -10.0 - p.y)`，p∈[0,16]×[0,80]
++#   → **雷区占 x∈[-8,+8]、z∈[-90,-10]**。出生点在 z≈+2~+7，也就是雷区**开始之前**。
++#   · z 太小（< -10）= 直接生在雷区里；
++#   · z 太大（≥ +10）= 撞上 `CameraTarget/KillArea`（落后就死的那块），**一生下来就没**。
++#   所以夹在 MP8_SPAWN_BOX 里，见下。
++#
++# 相机在 (0, 14, 8)、yaw 0、pitch -58°，**朝 -Z 看** → **屏幕左右 = 世界 x**、
++# 屏幕上下 = 世界 z（往上 = 往终点方向）。手调时方向是从相机基向量实时算的，不写死。
++#
++# 原版 4 个出生点（probe44 量的真值）：
++#   0 (-4.910, 1.947)   1 ( 1.443, 1.742)   2 (-4.793, 7.494)   3 ( 3.542, 7.364)
++# 默认 8 人布局 = **原版 4 个一个字节不动** + 在各自那一排的跨度内插 4 个。
++const MP8_MAX_PLAYERS: int = 8
++const MP8_SPAWN_FILE: String = "user://mp8_mine_spawns.txt"
++
++# ---- 场地横向拉宽（用户 2026-08-16：「雷区和车子同步拉宽 1.2 倍」）----
++#
++# ⚠️ **只拉雷区是不行的**，这条走廊是严丝合缝的（probe45 量的）：
++#   左墙内侧面 x=-8.06 / 右墙内侧面 x=+7.99（`Colliders/Walls`，1 米厚 ×105 长）
++#   地雷区 x∈[-8,+8] —— **正好贴着两面墙**
++#   收割机 KillArea Box 17 宽、x∈[-8.5,+8.5] —— 比走廊略宽，所以绕不过去
++#   起点门洞（`StaticBody3D` 那几块）缺口 x∈[-9.04,+7.52]
++# 只把地雷多边形拉宽 = 地雷撒进墙里、人还是被夹在 16 米内、收割机旁边露出空档。
++# 所以**整条走廊一起缩放**：美术、墙、门洞、终点/中点判定区、收割机。
++#
++# 这几个顶层节点**不缩放**，因为它们要么是世界坐标要么会把人拉变形：
++#   `Players`（人会被拉扁）、`Mines`（地雷按世界坐标撒）、`player spawn positions`、
++#   `CameraTarget`（相机架）、`light parent`（缩灯会把聚光锥拉歪）。
++const MP8_WIDE_DEFAULT: float = 1.2
++
++# 🩸 **能直接缩节点的，只有"里面全是网格或 BoxShape3D"的**。
++#
++# Godot **不支持对 SphereShape3D / CapsuleShape3D / CylinderShape3D 做非均匀缩放** ——
++# 缩了碰撞体就算坏。第一版把 `StaticBody3D` 和 `Harvester` 整个 scale.x=1.2，
++# 而它们底下正好有：`StaticBody3D/CollisionShape3D8|9` 两根**圆柱**（两块牌子的杆）、
++# `Harvester/CollisionShape3D` 一个**球**(r=0.5)。
++# 用户实测症状：**挨到 danger 牌子就卡死原地**。就是这个。
++const MP8_WIDE_SCALE_NODES: Array[String] = [
++	"Geometry",                        # 纯网格，没有碰撞体
++	"Colliders",                       # 两侧墙是 Box + 地面是 WorldBoundary（平面，缩了无影响）
++	"Interactive",                     # 终点区/中点区都是 Box（终点要跟货车走，货车在 Geometry 里）
++	"Harvester/KillArea",              # Box
++	"Harvester/BehindKillArea",        # Box
++	"Harvester/mine clearing machine1",# 车子的纯网格
++]
++# 这些**只平移不缩放**：里面有圆柱/球，缩了会把碰撞算坏。
++# 门洞那几块虽然是 Box，但和圆柱同在 `StaticBody3D` 下，一起走平移这条路更省事，
++# 而且它们本来就有 19.39 米宽，只要把位置外移，门洞缺口自然跟着变宽。
++const MP8_WIDE_MOVE_PARENTS: Array[String] = ["StaticBody3D"]
++
++# danger 牌子在起点区右侧（碰撞杆 x≈4.17、z≈2.65），拉宽后离出生点更近。
++# 用户 2026-08-16 要求把它再往右挪开。命令行 `mp8minesign=<米>` 可调。
++const MP8_SIGN_SHIFT_DEFAULT: float = 3.0
++const MP8_SIGN_COLLIDER: String = "StaticBody3D/CollisionShape3D8"
++const MP8_SIGN_VISUAL: String = "Geometry/collar race level mesh3/sand minefield/sign pole"
++
++var _mp8_wide: float = 1.0
++# 夹取范围：x 留 0.5 米墙距；z 下界不进雷区，上界离 KillArea(z=+10) 留 1 米
++const MP8_SPAWN_BOX_MIN := Vector2(-7.5, -8.0)
++const MP8_SPAWN_BOX_MAX := Vector2(7.5, 9.0)
++const MP8_EDIT_STEPS: Array[float] = [1.0, 0.5, 0.1]
++
++# ⚠️ 让 network_manager 的通用补位**让开**：出生点从这里起由本小游戏自己管。
++# 声明处就设 true，不放 _ready() —— 通用补位可能比 _ready() 先跑，晚了拦不住。
++var mp8_owns_spawns: bool = true
++
++# ---- 名次制算分（用户 2026-08-16 定）----
++#
++# **原版机制**（核对过代码，不是抄文档）：起手 0 分，四个加分点 ——
++#   跑过中点 +1（每人一次）/ 抵达终点 +1 / **第一个**到再 +1 / 满血抵达再 +1
++#   单轮上限 4 分，默认歌单 3 轮 → 0~12 分。
++#   ⚠️ 旧文档写"上限 3"是错的，漏了中点那一分。
++#
++# **8 人下的毛病**：第 2 名和第 8 名完全同分，只有第 1 名多 1 分 ——
++# 7 个人分不出先后，这正是 B 累加族的通病。而且打 3 轮才 0~12，
++# 比只打 2 轮的 A 名次族（0~16）还不值钱。
++#
++# **改法**（项目既定做法：用小游戏自己已有的顺序数组下标当分数，
++# 不在汇总处对整数计数排名）。雷区**现成就有两个按顺序 append 的真数组**：
++#   `finished_players` —— 抵达终点的先后（原版就在按序 append）
++#   `_mp8_dead_order`  —— 爆炸出局的先后（本 mod 新记，唯一新增的机制）
++#
++# 排法（D = 死亡人数，F = 完赛人数，D+F = 本轮人数 N）：
++#   第 i 个**死**的     → i 分          （0 … D-1，早死垫底）
++#   第 j 个**到终点**的 → D + (F-1-j)   （D … N-1，第一名拿 N-1）
++#   → 满档 0~N-1，**不重不漏、无并列**，和 A 名次族同一把尺子。
++#   再加**满血抵达 +1**（原版就有的技巧奖励，只有完赛者拿得到）→ 上限 N。
++#
++# ⚠️ 中点 +1 **取消**：死者已经由死亡顺序排出名次了，它的作用被覆盖，
++#    留着只会把 0~N-1 这个干净区间打乱。
++# ⚠️ 这套**对所有人数生效**（4 人局的算分也会变），和残骸平台那次一样 ——
++#    不按人数分两套规则，否则 4 人和 8 人变成两个游戏。
++var _mp8_dead_order: Array[int] = []
++
++var mp8_player_count: int = 0
++var _mp8_no_expand: bool = false
++var _mp8_edit_on: bool = false
++var _mp8_edit_sel: int = 0
++var _mp8_edit_step_i: int = 1
++var _mp8_edit_panel: Label = null
++var _mp8_edit_canvas: CanvasLayer = null
++var _mp8_tags: Array[Label3D] = []
++var _mp8_layout_src: String = "原版 4 个"
++# 出生点标记 → 这一局站在它上面的人（出生点是 shuffle 过的，只能这样记）
++var _mp8_owner: Dictionary = {}
++
++
+ func _ready() -> void :
+ 	super._ready()
+ 
++	# [MP8] 必须在 spawn_players() 之前把出生点补齐 —— 它是 `player_positions[counter]`
++	# 直接按下标发人的，数组不够长就越界。_ready() 比 initialize() 早，稳。
++	_mp8_setup_spawns()
++
+ 	camera_3d.set_multiplayer_authority(1)
+ 	host_synchronizer.set_multiplayer_authority(1)
+ 
+@@ -160,10 +282,18 @@ func spawn_players():
+ 
+ 
+ 	var counter: int = 0
++	var seated := PackedStringArray()
+ 	for key in PlayerManager.player_presences.keys():
+ 
+ 		var player_presence: PlayerPresence = PlayerManager.player_presences[key]
+ 
++		# [MP8] 上界校验：出生点没补够时宁可少生成一个人，也不要越界崩掉
++		if counter >= player_positions.size():
++			push_warning("[MP8] 雷区：只有 %d 个出生点，第 %d 个人没位置" % [
++				player_positions.size(), counter + 1
++			])
++			break
++
+ 		var player_character = player_scene.instantiate()
+ 		players_node_parent.add_child(player_character, true)
+ 
+@@ -179,14 +309,536 @@ func spawn_players():
+ 
+ 		player_scores[player_presence.network_id] = 0
+ 
++		# [MP8] 记下"这个出生点这一局归谁"。出生点数组是 shuffle 过的，
++		# 只能按**节点对象**记（shuffle 只重排数组，Node3D 对象本身还是那几个）。
++		# 手调时挪某个点，就能把站在上面的人一起挪过去 —— 看得见才好摆。
++		_mp8_owner[player_positions[counter]] = player_character
++		seated.append("%s@(%.2f,%.2f)" % [
++			String(player_presence.network_name),
++			player_positions[counter].global_position.x,
++			player_positions[counter].global_position.z,
++		])
++
+ 		counter += 1
+ 
++	print("[MP8] 雷区：%d 人就位（出生点来源：%s）—— %s" % [
++		counter, _mp8_layout_src, " | ".join(seated)
++	])
++
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] 出生点：补齐 + 手调
++# ═══════════════════════════════════════════════════════════════════════════
++
++func _mp8_setup_spawns() -> void :
++
++	var args := Array(OS.get_cmdline_args())
++	_mp8_no_expand = args.has("mp8noexpand")
++	_mp8_edit_on = args.has("mp8mineedit")
++	mp8_player_count = PlayerManager.player_presences.size()
++
++	print("[MP8] 雷区：运行时真值 —— 出生点 %d 个 / mine_distance %.2f / 探测 %.2f / 引爆 %.2f / 收割机延迟 %.1f；本局 %d 人" % [
++		player_spawn_positions.size(), mine_distance, mine_detection_threshold,
++		mine_explosion_threshold, harvester_start_delay, mp8_player_count,
++	])
++
++	if _mp8_no_expand:
++		print("[MP8] 雷区：mp8noexpand，场地和出生点一个字不改（纯原版对照组，⚠️ 必须配 4 人）")
++		return
++
++	# ≤4 人：**场地和出生点都一个字节不动**，与原版逐值一致
++	if mp8_player_count <= 4:
++		print("[MP8] 雷区：%d 人，用原版场地与 4 个出生点，一个字不改" % mp8_player_count)
++		return
++
++	_mp8_widen_field()
++
++	var want: int = mini(maxi(mp8_player_count, 5), MP8_MAX_PLAYERS)
++	var pts: Array = ([] if args.has("mp8minenofile") else _mp8_load_spawns())
++
++	if pts.is_empty():
++		pts = _mp8_default_spawns(want)
++		_mp8_layout_src = "内置默认（原版4 + 插4）"
++	else:
++		_mp8_layout_src = "存盘文件 %s" % MP8_SPAWN_FILE
++
++	# 少于所需就用默认补齐（宁可摆得糙，也不能少一个点 → 少点 = 少生成人）
++	while pts.size() < want:
++		var fill: Array = _mp8_default_spawns(want)
++		pts.append(fill[pts.size()])
++
++	_mp8_apply_spawns(pts)
++
++	print("[MP8] 雷区：出生点 4 → %d（%s）—— %s" % [
++		player_spawn_positions.size(), _mp8_layout_src, _mp8_spawn_desc()
++	])
++
++	if _mp8_edit_on:
++		_mp8_edit_begin()
++
++
++# [MP8] 整条走廊横向拉宽。命令行 `mp8minewide=<倍率>` 可改，默认 1.2。
++#
++# ⚠️ **每台机器都要跑**：这些都是各机本地的场景节点，不走网络同步
++#    （和枪械工厂 _mp8_setup_field 每台都要跑是同一个理由）。
++#    地雷位置是服务器算好后逐个 RPC 发的，所以只要**每台的墙都一样宽**就对得上。
++func _mp8_widen_field() -> void :
++
++	var forced: String = _mp8_arg("mp8minewide=")
++	_mp8_wide = (clampf(float(forced), 1.0, 2.0) if forced.is_valid_float() else MP8_WIDE_DEFAULT)
++
++	if is_equal_approx(_mp8_wide, 1.0):
++		print("[MP8] 雷区：拉宽倍率 1.0，场地不动")
++		return
++
++	# ---- ① 能缩的缩（里面全是网格或 Box）----
++	var scaled := PackedStringArray()
++	for path in MP8_WIDE_SCALE_NODES:
++		var n: Node3D = get_node_or_null(path) as Node3D
++		if n == null:
++			push_warning("[MP8] 雷区：找不到 %s，这一块没拉宽（走廊会不对齐）" % path)
++			continue
++		# 只动 x，且**赋值不是累乘** —— 累乘会一局比一局更宽（T19 那个坑）
++		n.scale = Vector3(_mp8_wide, n.scale.y, n.scale.z)
++		scaled.append(path)
++
++	# ---- ② 有圆柱/球的只平移，绝不缩 ----
++	var moved: int = 0
++	for parent_path in MP8_WIDE_MOVE_PARENTS:
++		var parent: Node = get_node_or_null(parent_path)
++		if parent == null:
++			push_warning("[MP8] 雷区：找不到 %s" % parent_path)
++			continue
++		for c in parent.get_children():
++			if c is Node3D:
++				var n3: Node3D = c
++				n3.position = Vector3(n3.position.x * _mp8_wide, n3.position.y, n3.position.z)
++				moved += 1
++
++	# ---- ③ danger 牌子再往右挪开（用户 2026-08-16 要求）----
++	var forced_sign: String = _mp8_arg("mp8minesign=")
++	var shift: float = (float(forced_sign) if forced_sign.is_valid_float() else MP8_SIGN_SHIFT_DEFAULT)
++	var sign_note := "没挪"
++	if not is_equal_approx(shift, 0.0):
++		var parts := PackedStringArray()
++		# 视觉件在被缩放过的 Geometry 底下，局部位移会被父级 scale 放大，
++		# 所以这里除掉倍率，保证视觉和碰撞挪的是**同样的世界距离**。
++		var vis: Node3D = get_node_or_null(MP8_SIGN_VISUAL) as Node3D
++		if vis != null:
++			vis.position.x += shift / _mp8_wide
++			parts.append("视觉→%.2f" % vis.global_position.x)
++		var col: Node3D = get_node_or_null(MP8_SIGN_COLLIDER) as Node3D
++		if col != null:
++			col.position.x += shift
++			parts.append("碰撞→%.2f" % col.global_position.x)
++		sign_note = "右移 %.1f 米（%s）" % [shift, ", ".join(parts)]
++
++	print("[MP8] 雷区：走廊拉宽 ×%.2f —— 墙内侧 %.2f~%.2f → %.2f~%.2f，地雷区宽 %.1f → %.1f" % [
++		_mp8_wide, -8.06, 7.99, -8.06 * _mp8_wide, 7.99 * _mp8_wide,
++		16.0, 16.0 * _mp8_wide
++	])
++	print("[MP8] 雷区：缩放 %d 个节点（%s）；平移 %d 个碰撞体（里面有圆柱/球，**不能缩**）；danger 牌子 %s" % [
++		scaled.size(), ", ".join(scaled), moved, sign_note
++	])
++	print("[MP8] 雷区：收割机 KillArea 17.0 → %.1f 宽（走廊 %.1f，仍然横跨，绕不过去）" % [
++		17.0 * _mp8_wide, 16.05 * _mp8_wide
++	])
++
++
++func _mp8_arg(prefix: String) -> String :
++	for a in OS.get_cmdline_args():
++		if String(a).begins_with(prefix):
++			return String(a).substr(prefix.length())
++	return ""
++
++
++# 默认布局：**原版 4 个逐字节保留**，在各自那一排（按 z 分前后两排）的 x 跨度内插新点。
++# 原版就是 2×2：前排 z≈1.85 两个、后排 z≈7.43 两个。8 人 = 每排 4 个。
++func _mp8_default_spawns(want: int) -> Array :
++
++	var orig: Array = []
++	for n in player_spawn_positions:
++		if n != null and is_instance_valid(n):
++			orig.append(Vector2(n.global_position.x, n.global_position.z))
++	if orig.is_empty():
++		return []
++
++	# 按 z 分两排（原版前后排差 5.6 米，用中值切一刀就够）
++	var zsum: float = 0.0
++	for o in orig:
++		zsum += o.y
++	var zmid: float = zsum / float(orig.size())
++
++	var rows: Array = [[], []]
++	for o in orig:
++		rows[0 if o.y < zmid else 1].append(o)
++
++	var out: Array = orig.duplicate()
++	var need: int = want - orig.size()
++	var r: int = 0
++
++	# 轮流往两排里插：每次挑那一排**当前最大的间隙**，插中点
++	while need > 0:
++		var row: Array = rows[r % 2]
++		r += 1
++		if row.size() < 2:
++			continue
++		row.sort_custom(func(a, b): return a.x < b.x)
++		var bi: int = 0
++		var bw: float = -1.0
++		for i in row.size() - 1:
++			var w: float = row[i + 1].x - row[i].x
++			if w > bw:
++				bw = w
++				bi = i
++		var mid := Vector2(
++			(row[bi].x + row[bi + 1].x) * 0.5,
++			(row[bi].y + row[bi + 1].y) * 0.5
++		)
++		row.insert(bi + 1, mid)
++		out.append(mid)
++		need -= 1
++
++	return out
++
++
++func _mp8_apply_spawns(pts: Array) -> void :
++
++	var parent: Node3D = null
++	if player_spawn_positions.size() > 0 and is_instance_valid(player_spawn_positions[0]):
++		parent = player_spawn_positions[0].get_parent() as Node3D
++	if parent == null:
++		push_warning("[MP8] 雷区：找不到出生点的父节点，出生点没补")
++		return
++
++	# 原版那几个节点**继续用原来的对象**（只在 >4 人时才改它们的位置）；不够的新建
++	var arr: Array[Node3D] = []
++	for i in pts.size():
++		var p: Vector2 = _mp8_clamp(pts[i])
++		var n: Node3D
++		if i < player_spawn_positions.size() and is_instance_valid(player_spawn_positions[i]):
++			n = player_spawn_positions[i]
++		else:
++			n = Marker3D.new()
++			n.name = "MP8Spawn%d" % i
++			parent.add_child(n)
++		n.global_position = Vector3(p.x, 0.0, p.y)
++		arr.append(n)
++
++	player_spawn_positions = arr
++
++
++# [MP8] x 的可摆范围**跟着走廊一起变宽**（z 不变，z 方向没拉伸）
++func _mp8_clamp(p: Vector2) -> Vector2 :
++	return Vector2(
++		clampf(p.x, MP8_SPAWN_BOX_MIN.x * _mp8_wide, MP8_SPAWN_BOX_MAX.x * _mp8_wide),
++		clampf(p.y, MP8_SPAWN_BOX_MIN.y, MP8_SPAWN_BOX_MAX.y)
++	)
++
++
++func _mp8_spawn_desc() -> String :
++	var parts := PackedStringArray()
++	for i in player_spawn_positions.size():
++		var n: Node3D = player_spawn_positions[i]
++		if n != null and is_instance_valid(n):
++			parts.append("%d(%.2f,%.2f)" % [i + 1, n.global_position.x, n.global_position.z])
++	return " ".join(parts)
++
++
++func _mp8_load_spawns() -> Array :
++
++	if not FileAccess.file_exists(MP8_SPAWN_FILE):
++		return []
++	var f := FileAccess.open(MP8_SPAWN_FILE, FileAccess.READ)
++	if f == null:
++		push_warning("[MP8] 雷区：打不开 %s（%d）" % [MP8_SPAWN_FILE, FileAccess.get_open_error()])
++		return []
++
++	var rows: Array = []
++	var ln: int = 0
++	while not f.eof_reached():
++		var line: String = f.get_line().strip_edges()
++		ln += 1
++		if line.is_empty() or line.begins_with("#"):
++			continue
++		var cols: PackedStringArray = line.split(",", false)
++		if cols.size() < 2:
++			push_warning("[MP8] 雷区：出生点文件第 %d 行不是 2 个数，跳过：%s" % [ln, line])
++			continue
++		var x: String = cols[0].strip_edges()
++		var z: String = cols[1].strip_edges()
++		if not (x.is_valid_float() and z.is_valid_float()):
++			push_warning("[MP8] 雷区：出生点文件第 %d 行有非数字，跳过：%s" % [ln, line])
++			continue
++		rows.append(Vector2(float(x), float(z)))
++	f.close()
++	return rows
++
++
++func _mp8_save_spawns() -> bool :
++
++	var f := FileAccess.open(MP8_SPAWN_FILE, FileAccess.WRITE)
++	if f == null:
++		push_warning("[MP8] 雷区：写不了 %s（%d）" % [MP8_SPAWN_FILE, FileAccess.get_open_error()])
++		return false
++
++	f.store_line("# 雷区（mp8game=1）出生点 —— 每行 = x, z")
++	f.store_line("# ⚠️ 只在 5 人及以上生效；≤4 人一律用原版那 4 个，一个字节不动。")
++	f.store_line("# 场地：雷区占 x∈[-8,+8]、z∈[-90,-10]；出生点要待在雷区**之前**（z > -10），")
++	f.store_line("#       且 z 不能到 +10（那儿是 KillArea，落后就死的那块，会一生下来就没）。")
++	f.store_line("# 删掉这个文件 = 回到内置默认布局。")
++	f.store_line("# 存于 %s" % Time.get_datetime_string_from_system())
++	f.store_line("")
++	for n in player_spawn_positions:
++		if n != null and is_instance_valid(n):
++			f.store_line("%.2f, %.2f" % [n.global_position.x, n.global_position.z])
++	f.close()
++
++	print("[MP8] 雷区：出生点已存盘 → %s" % ProjectSettings.globalize_path(MP8_SPAWN_FILE))
++	print("[MP8] 雷区：当前布局 —— %s" % _mp8_spawn_desc())
++	return true
++
++
++# ---- 局内手调 ----
++
++func _mp8_edit_begin() -> void :
++
++	var lbl := Label.new()
++	lbl.name = "MP8MineEditPanel"
++	lbl.set_anchors_preset(Control.PRESET_BOTTOM_LEFT)
++	lbl.offset_left = 16.0
++	lbl.offset_top = -132.0
++	lbl.offset_right = 940.0
++	lbl.offset_bottom = -8.0
++	_mp8_style(lbl, Color(0.6, 0.95, 1.0))
++	_mp8_layer().add_child(lbl)
++	_mp8_edit_panel = lbl
++
++	# 每个出生点头顶一个号码牌 —— Marker3D 本身是看不见的，不挂牌根本不知道在调哪个
++	var f = load("res://fonts/Terminal F4.ttf")
++	for i in player_spawn_positions.size():
++		var n: Node3D = player_spawn_positions[i]
++		if n == null or not is_instance_valid(n):
++			continue
++		var tag := Label3D.new()
++		tag.name = "MP8SpawnTag"
++		tag.billboard = BaseMaterial3D.BILLBOARD_ENABLED
++		tag.font_size = 160
++		tag.outline_size = 32
++		tag.outline_modulate = Color.BLACK
++		tag.no_depth_test = true
++		if f != null:
++			tag.font = f
++		n.add_child(tag)
++		tag.position = Vector3(0.0, 3.0, 0.0)
++		_mp8_tags.append(tag)
++
++	_mp8_check_keys()
++	_mp8_edit_refresh()
++	print("[MP8] 雷区：出生点手调模式已开 —— %d 个点可调" % player_spawn_positions.size())
++
++
++func _mp8_layer() -> CanvasLayer :
++	if _mp8_edit_canvas == null:
++		_mp8_edit_canvas = CanvasLayer.new()
++		_mp8_edit_canvas.layer = 100
++		add_child(_mp8_edit_canvas)
++	return _mp8_edit_canvas
++
++
++# ⚠️ 必须显式指定游戏自己的字体：默认主题字体字距是坏的（这是第四次踩）
++func _mp8_style(lbl: Label, color: Color) -> void :
++	var f = load("res://fonts/Terminal F4.ttf")
++	if f != null:
++		lbl.add_theme_font_override("font", f)
++	lbl.add_theme_font_size_override("font_size", 22)
++	lbl.add_theme_color_override("font_color", color)
++	lbl.add_theme_color_override("font_outline_color", Color.BLACK)
++	lbl.add_theme_constant_override("outline_size", 6)
++	lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
++
++
++# 与其赌 I/J/K/L/M/N 没被占，不如开局把 InputMap 查一遍，撞了就报出来
++func _mp8_check_keys() -> void :
++
++	var mine: Dictionary = {
++		KEY_1: "选1", KEY_2: "选2", KEY_3: "选3", KEY_4: "选4",
++		KEY_5: "选5", KEY_6: "选6", KEY_7: "选7", KEY_8: "选8",
++		KEY_I: "远", KEY_K: "近", KEY_J: "左", KEY_L: "右",
++		KEY_M: "步长", KEY_N: "报告", KEY_0: "存盘", KEY_9: "复位",
++	}
++	var clash := PackedStringArray()
++	for action in InputMap.get_actions():
++		for ev in InputMap.action_get_events(action):
++			var k := ev as InputEventKey
++			if k == null:
++				continue
++			for code in [k.keycode, k.physical_keycode]:
++				if code != 0 and mine.has(code):
++					clash.append("%s(%s)↔%s" % [
++						OS.get_keycode_string(code), mine[code], String(action)
++					])
++	if clash.is_empty():
++		print("[MP8] 雷区：手调按键与游戏 InputMap 无冲突（查了 %d 个动作）" % InputMap.get_actions().size())
++	else:
++		print("[MP8] 雷区：⚠️ 按键撞车 —— %s" % ", ".join(clash))
++
++
++func _unhandled_key_input(event: InputEvent) -> void :
++
++	if not _mp8_edit_on or player_spawn_positions.is_empty():
++		return
++	var key := event as InputEventKey
++	if key == null or not key.pressed or key.echo:
++		return
++
++	var step: float = MP8_EDIT_STEPS[_mp8_edit_step_i]
++
++	match key.keycode:
++		KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8:
++			var want: int = key.keycode - KEY_1
++			if want >= player_spawn_positions.size():
++				return
++			_mp8_edit_sel = want
++			_mp8_edit_refresh()
++
++		KEY_I, KEY_K, KEY_J, KEY_L:
++			# 按**屏幕方向**推。相机朝 -Z 看，所以屏幕左右就是世界 x；
++			# 但方向从相机基向量实时算，不写死 —— 相机哪天改了也不会反向。
++			var dir: Vector2 = _mp8_screen_axis(key.keycode)
++			if dir == Vector2.ZERO:
++				return
++			var n: Node3D = player_spawn_positions[_mp8_edit_sel]
++			var cur := Vector2(n.global_position.x, n.global_position.z)
++			mp8_move_spawn_rpc.rpc(_mp8_edit_sel, cur + Vector2(dir.y, dir.x) * step)
++
++		KEY_M:
++			_mp8_edit_step_i = (_mp8_edit_step_i + 1) % MP8_EDIT_STEPS.size()
++			_mp8_edit_refresh()
++
++		KEY_0:
++			var ok: bool = _mp8_save_spawns()
++			_mp8_edit_refresh()
++			if _mp8_edit_panel != null:
++				_mp8_edit_panel.text = ("【已存盘】下次开局自动用这套坐标\n" if ok
++					else "【存盘失败】看日志\n") + _mp8_edit_panel.text
++
++		KEY_9:
++			var d: Array = _mp8_default_spawns(player_spawn_positions.size())
++			for i in mini(d.size(), player_spawn_positions.size()):
++				mp8_move_spawn_rpc.rpc(i, d[i])
++			print("[MP8] 雷区：出生点已复位成内置默认（存盘文件没删，要彻底回退请删文件）")
++
++		KEY_N:
++			print("[MP8] 雷区出生点报告：%s" % _mp8_spawn_desc())
++
++		_:
++			return
++
++	get_viewport().set_input_as_handled()
++
++
++# 屏幕方向 → 世界水平方向。返回 Vector2(dx, dz)。
++func _mp8_screen_axis(code: int) -> Vector2 :
++
++	var cam: Camera3D = get_viewport().get_camera_3d()
++	if cam == null:
++		return Vector2.ZERO
++	var right: Vector3 = cam.global_transform.basis.x
++	var fwd: Vector3 = - cam.global_transform.basis.z
++	var r2 := Vector2(right.x, right.z)
++	var f2 := Vector2(fwd.x, fwd.z)
++	if r2.length() < 0.001 or f2.length() < 0.001:
++		return Vector2.ZERO
++	r2 = r2.normalized()
++	f2 = f2.normalized()
++	match code:
++		KEY_L: return Vector2(r2.y, r2.x)
++		KEY_J: return - Vector2(r2.y, r2.x)
++		KEY_I: return Vector2(f2.y, f2.x)
++		KEY_K: return - Vector2(f2.y, f2.x)
++	return Vector2.ZERO
++
++
++# [MP8] any_peer + call_local：8 台机器一起挪。
++# 出生点本身只有服务器读，但**号码牌和站在上面的人**每台机器都要看得见，所以广播。
++@rpc("any_peer", "call_local", "reliable")
++func mp8_move_spawn_rpc(slot: int, pos: Vector2) -> void :
++
++	if slot < 0 or slot >= player_spawn_positions.size():
++		return
++	var n: Node3D = player_spawn_positions[slot]
++	if n == null or not is_instance_valid(n):
++		return
++
++	var p: Vector2 = _mp8_clamp(pos)
++	n.global_position = Vector3(p.x, n.global_position.y, p.y)
++
++	# 把站在这个点上的人一起挪过去 —— 看得见才好摆。
++	# （出生点是 shuffle 分配的，所以按**节点对象**查，不能按下标。）
++	#
++	# ⚠️ 两条都必须守住：
++	#  ① 只有服务器动人。`_mp8_owner` 只在 spawn_players()（服务器）里填过，
++	#     客户端那份是空的；而且**在广播 RPC 的处理函数里再发一次 RPC**，
++	#     8 台机器会各广播一遍，直接变成风暴。
++	#  ② 走原版的 `teleport_rpc` 而不是直接写 global_position ——
++	#     直接写只在本机生效，别人看到的人还在原地。
++	if multiplayer.is_server():
++		var who = _mp8_owner.get(n)
++		if who != null and is_instance_valid(who):
++			who.teleport_rpc.rpc(Vector3(p.x, (who as Node3D).global_position.y, p.y))
++
++	_mp8_edit_refresh()
++
++
++func _mp8_edit_refresh() -> void :
++
++	for i in _mp8_tags.size():
++		var t: Label3D = _mp8_tags[i]
++		if t == null or not is_instance_valid(t):
++			continue
++		var sel: bool = (i == _mp8_edit_sel)
++		t.text = ("▼%d▼" % (i + 1)) if sel else str(i + 1)
++		t.modulate = (Color(1.0, 0.85, 0.2) if sel else Color(0.55, 0.75, 0.85))
++
++	if _mp8_edit_panel == null:
++		return
++
++	var n: Node3D = player_spawn_positions[_mp8_edit_sel]
++	var cur := Vector2(n.global_position.x, n.global_position.z)
++
++	# 离最近的另一个出生点多远（太近会挤在一起）
++	var gap: float = INF
++	for i in player_spawn_positions.size():
++		if i == _mp8_edit_sel:
++			continue
++		var o: Node3D = player_spawn_positions[i]
++		if o == null or not is_instance_valid(o):
++			continue
++		gap = minf(gap, cur.distance_to(Vector2(o.global_position.x, o.global_position.z)))
++
++	_mp8_edit_panel.text = "\n".join([
++		"【出生点手调】选中第 %d 个 / 共 %d   步长 %.1f 米   来源 %s" % [
++			_mp8_edit_sel + 1, player_spawn_positions.size(),
++			MP8_EDIT_STEPS[_mp8_edit_step_i], _mp8_layout_src],
++		"位置 x=%.2f  z=%.2f      离最近的点 %.2f 米 %s" % [
++			cur.x, cur.y, gap, ("✓" if gap >= 1.5 else "⚠挤")],
++		"可摆范围 x∈[%.1f,%.1f] z∈[%.1f,%.1f]（走廊已拉宽 ×%.2f；z=-10 起是雷区，z=+10 是落后判死区）" % [
++			MP8_SPAWN_BOX_MIN.x * _mp8_wide, MP8_SPAWN_BOX_MAX.x * _mp8_wide,
++			MP8_SPAWN_BOX_MIN.y, MP8_SPAWN_BOX_MAX.y, _mp8_wide],
++		"1~8 选点   I/K 远近   J/L 左右   M 步长   0 存盘   9 复位   N 报告",
++	])
++
++
+ func spawn_mines():
+ 	randomize()
+ 
++	# [MP8] 地雷区必须跟着走廊一起拉宽，否则拉宽出来的那两条边上一颗雷都没有，
++	# 变成"贴边跑就绝对安全"的免死通道，这一局就废了。
++	# 宽度 ×倍率、**密度不变**（mine_distance 不动）→ 地雷数自然按面积多约 20%。
++	var w: float = 16.0 * _mp8_wide
+ 	var polygon: PackedVector2Array = [
+-		Vector2(0.0, 0.0), Vector2(16.0, 0.0), 
+-		Vector2(16.0, 80.0), Vector2(0.0, 80.0), 
++		Vector2(0.0, 0.0), Vector2(w, 0.0),
++		Vector2(w, 80.0), Vector2(0.0, 80.0),
+ 	]
+ 
+ 	var points = PoissonDiscSampling.generate_points_for_polygon(
+@@ -199,8 +851,10 @@ func spawn_mines():
+ 		mine_instance.set_thresholds(mine_detection_threshold, mine_explosion_threshold)
+ 		mine_instance.set_multiplayer_authority(1, true)
+ 		mines_node_parent.add_child(mine_instance, true)
++		# [MP8] 原版是 `-8.0 + p.x`（把 [0,16] 平移到 [-8,+8]）。
++		# 拉宽后要平移到 [-8×倍率, +8×倍率]，所以偏移也乘同一个倍率。
+ 		mine_instance.global_position = Vector3(
+-			-8.0 + p.x, 0.0, -10.0 - p.y
++			-8.0 * _mp8_wide + p.x, 0.0, -10.0 - p.y
+ 		)
+ 		mine_instance.set_active_rpc.rpc()
+ 		mine_instance.exploded.connect(_on_mine_exploded)
+@@ -221,6 +875,10 @@ func check_game_end():
+ 	if not active_players.is_empty():
+ 		return
+ 
++	# [MP8] 名次制结算 —— **必须在这里一次算清**，不能边跑边加。
++	# 「第 j 个到终点」的 j 在中途根本拿不到最终值（猎鸭 T13 踩过同一条）。
++	_mp8_rank_scores()
++
+ 	player_scores_finalized.emit(player_scores)
+ 
+ 	await get_tree().create_timer(2.0).timeout
+@@ -275,8 +933,69 @@ func _on_countdown_expired():
+ 
+ 	state_machine.transition_to_rpc.rpc(&"Play")
+ 
++# [MP8] 名次制结算：把 player_scores **整个覆盖**掉。
++#
++# 覆盖而不是改原版那三处 `+= 1`，是因为原版是边跑边加的，
++# 而名次必须等全场结束才知道。留着那些增量也无所谓 —— 这里会全部盖掉。
++func _mp8_rank_scores() -> void :
++
++	var d: int = _mp8_dead_order.size()
++	var f: int = finished_players.size()
++	var rows := PackedStringArray()
++
++	# 先全部归零：既没跑完也没炸的（例如中途掉线）就是 0 分，
++	# 不能让他保留原版边跑边加的零头。
++	for id in player_scores.keys():
++		player_scores[id] = 0
++
++	# 死者：早死垫底
++	for i in d:
++		var id: int = _mp8_dead_order[i]
++		if player_scores.has(id):
++			player_scores[id] = i
++
++	# 完赛者：接在死者上面，越早到越高；满血再 +1
++	for j in f:
++		var p = finished_players[j]
++		if p == null or not is_instance_valid(p):
++			continue
++		var id: int = p.player_presence.network_id
++		if not player_scores.has(id):
++			continue
++		var s: int = d + (f - 1 - j)
++		var full: bool = (p.lives == p.max_lives)
++		if full:
++			s += 1
++		player_scores[id] = s
++		rows.append("第%d名 %s %d分%s" % [
++			j + 1, String(p.player_presence.network_name), s, ("(满血)" if full else "")
++		])
++
++	print("[MP8] 雷区结算（%d 人：完赛 %d / 阵亡 %d）—— %s%s" % [
++		player_scores.size(), f, d, " | ".join(rows),
++		("" if d == 0 else " || 阵亡（早→晚）：%s" % ", ".join(_mp8_dead_names()))
++	])
++
++
++func _mp8_dead_names() -> PackedStringArray :
++	var out := PackedStringArray()
++	for i in _mp8_dead_order.size():
++		var id: int = _mp8_dead_order[i]
++		var nm: String = str(id)
++		if player_characters.has(id) and is_instance_valid(player_characters[id]):
++			nm = String(player_characters[id].player_presence.network_name)
++		out.append("%s %d分" % [nm, i])
++	return out
++
++
+ func _on_player_exploded(network_id):
+ 
++	# [MP8] 记死亡先后 —— 名次制要用它给没跑完的人排序。
++	# 两条死法（踩雷 _on_mine_exploded / 被收割机追上 _on_behind_harvester_body_entered）
++	# 都走 explode_rpc → exploded → 这里，**单一出口，不会漏人**（已 grep 核对）。
++	if not _mp8_dead_order.has(network_id):
++		_mp8_dead_order.append(network_id)
++
+ 	remove_active_player_rpc.rpc(network_id)
+ 
+ func _on_shaker_area_entered(area):

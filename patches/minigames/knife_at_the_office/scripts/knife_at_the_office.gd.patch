@@ -1,0 +1,1361 @@
+diff --git a/minigames/knife_at_the_office/scripts/knife_at_the_office.gd b/minigames/knife_at_the_office/scripts/knife_at_the_office.gd
+--- a/minigames/knife_at_the_office/scripts/knife_at_the_office.gd
++++ b/minigames/knife_at_the_office/scripts/knife_at_the_office.gd
+@@ -48,9 +48,150 @@ var player_count: int = 0
+ var player_scores: Dictionary[int, int]
+ var dead_players: Array[int]
+ 
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] 内部暗手（knife_at_the_office，mp8game=7）8 人适配 —— ①（2026-08-17）
++# ═══════════════════════════════════════════════════════════════════════════
++#
++# ### 侦察结论（probe55 量原装 PCK；坑第 13 条已全目录 grep）
++#
++# 干净的部分：`light_handler` 与 722 行的玩家脚本**都没有**按玩家下标索引的地方；
++# `searchables` 数组和 `searchable_scene` 预载是**死代码**（从没填过 / 从没实例化）；
++# `items_to_spawn` 也是**死参数**（声明了从没用过）。
++# 分屏（`GameManager.local_game`）那条路在 >4 人时也会坏（`Layouts[player_count]`
++# 键只到 4、`starting_layer = 11 + i*2` 在 i≥5 时超出 Godot 的 20 个渲染层），
++# 但**联机模式 local_game 恒为 false，不走那条路**，本补丁不碰。
++#
++# 要改的只有三处：
++#
++# **一、出生点 4 → 8**（`spawn_players()` 的 `spawn_positions[counter]` 必越界）
++# 坑第 33 条照例成立：原版 4 点是 2×2，通用补位取"相邻两点中点"，
++# 算出的 4 个新点**全落在 x≈0 一条竖线上**，彼此最小间距 0.67 米。→ 必须自管。
++# ⚠️ 容器名 `PlayerSpawnPositions` 与立足之本/隧道险境共用，**不能从白名单摘**，
++# 只能走 `mp8_owns_spawns`。
++#
++# **二、`countdown_handler.alive_indicator_icons` 只有 4 个**
++# `set_active_rpc(active_players.size() - 1)` 与 `update_alive_indicator_rpc(存活-已感染)`
++# 都按下标取，8 人局最大要到下标 6。→ 在 countdown_handler.gd 里补到 8。
++#
++# **三、⚠️ 8 人局约一半概率搜不出针筒 → 整局卡死**（比越界严重得多）
++# 原版：`guaranteed = round(26 * 人数/4) - round(base*0.5*randf())`，
++# 针筒在"全场第 guaranteed 次搜索"时出现；而容器**一次性**（玩家脚本 `if s.searched: continue`），
++# 所以 `containers_searched` 的上限 = 场里的容器总数（probe55 数出 **38 个**）。
++#   4 人 guaranteed ∈ [13,26] ✅ 恒可达；8 人 ∈ [26,52]，**约 52% 够不着**。
++# 搜不出的后果不是难玩，是**卡死**：没针筒 → 猎杀阶段不开始 → 倒计时根本不启动
++# （它只在 `_on_item_found` 里启动）→ 而 `check_game_end()` 只由感染/死亡/掉线触发。
++# → 改法见 `_mp8_setup_syringes()`：阈值改成按**运行时真实容器数**的比例取，恒可达。
++#
++# ### 用户 2026-08-17 定：5~8 人**加第二支针筒**（≤4 人仍是一支，原版不动）
++#
++# 理由是维持"1 个感染源配 4 人"的比例（与猎鸭双猎人 T6 同一个思路）。
++# ⚠️ 接法只有一种成立：**猎杀阶段推迟到两支都被找到**。
++# 因为原版在第一支被找到时就 `set_searching_disabled_rpc(true)` 禁掉全场搜索，
++# 不推迟的话第二支永远搜不到。
++# 先找到的那个人**先被感染但不揭晓**，全场继续搜，第二支到手才一起进猎杀阶段。
++var mp8_owns_spawns: bool = true
++
++const MP8_MAX_PLAYERS: int = 8
++const MP8_MIN_SPAWN_GAP: float = 1.5
++
++# probe70 + 实机编号标记确认：原始 #5 / #6 在封闭房间里，Area3D 虽存在，
++# 但玩家物理上无法抵达。按稳定场景路径识别，不能按收集下标识别——一旦过滤一个，
++# 后续下标就会整体前移。只停用交互与针筒资格，家具视觉保留。
++const MP8_DISABLED_SEARCHABLE_PATHS := [
++	"Geometry/kato office art1/searchables parent/desk with drawers3/Searchable right side",
++	"Geometry/kato office art1/searchables parent/desk with drawers2/Searchable left side",
++]
++
++# ⚠️ **节奏下限已删除**（用户 2026-08-19 定：「请去掉节奏控制器」）。
++#
++# 原来这里有个 `MP8_SEARCH_FRACTION_MIN = 0.34`：早于全图 34% 的搜索次数开到藏针筒的柜子，
++# 就当「针筒还没在这儿」把它挪走。那是照抄原版计数模型的下界。
++#
++# 删它的理由（用户实测「有概率找不到第二根针」）：它是**除了「已感染者开到」之外
++# 唯一的瞬移来源**，而且触发得极频繁 —— 8 个人一起搜，开局十几次搜索全在下限内，
++# 针筒被反复弹来弹去。用户要的是「除了找到针的人再开到针会瞬移，别的瞬移都不要」。
++#
++# 容器模型本来就不需要节奏控制：针筒就在某个柜子里，早开到就是早找到，
++# 这比「假装它不在」更符合直觉，也少一条能把针筒弹丢的路径。
++
++var mp8_player_count: int = 0
++# 本局要藏几支针筒（≤4 人 = 1，5~8 人 = 2）
++var mp8_syringes_needed: int = 1
++# 已被找到的针筒数；等于 mp8_syringes_needed 时才进猎杀阶段
++var mp8_syringes_found: int = 0
++# 本局真实的可搜容器（把原版声明了却从没填过的 `searchables` 用起来）
++var mp8_searchables_collected: bool = false
++# **针筒当前所在的容器**（1~2 个）—— 这就是"基于容器"的那份状态
++var mp8_syringe_containers: Array = []
++# 针筒被"瞬移"过几次，只为日志
++var mp8_relocations: int = 0
++# 兜底信号：_mp8_relocate_syringe 发现"全场无未搜容器、无处可挪"时置 true，
++# 由 _mp8_resolve_find 读走并改判成"找到"。见那里的大段注释。
++var mp8_force_find: bool = false
++# ═══════ [MP8] 2026-08-19 修：已经拿到过针筒的人（服务器侧、同步记账）═══════
++#
++# 为什么不能只看 `infected_players`：那张表是**异步**填的 ——
++#   服务器 _mp8_resolve_find 判定找到
++#     → 广播 search_result_rpc → 目标端 set_has_item_rpc 广播
++#       → 回到服务器 item_found.emit() → _on_item_found 才 append
++# 中间隔着至少两跳网络。玩家连开两个柜子（快到一个来回都不到）时，
++# 第二次 _mp8_resolve_find 里 `infected_players` **还没有他**
++# → 规则 2 不触发 → 同一个人把两支针筒全拿走。
++#
++# 这张表在**判定当帧同步写**，没有任何网络依赖，所以规则 2 关得死。
++var mp8_syringe_holders: Array[int] = []
++var mp8_notice_label: Label = null
++# 右上角容器指示器「容器 12/34」。每台自己数，不走 RPC（见 _mp8_container_hud_refresh）
++var mp8_container_label: Label = null
++
++# ---- 出生点手调（mp8knifeedit，用户 2026-08-17 要自己摆）----
++# 规矩照枪械工厂 -GunEdit / 吸烟小憩 -SmokeEdit 那套：
++# 只加在 1 号窗口、存盘落 user://（8 个实例共用同一个目录，存一份 8 台都读得到）、
++# 下次开局自动生效、删文件 = 回内置布局。
++# ---- ② 得分与感染者移速（用户 2026-08-17 定，只对 5 人以上生效）----
++# 幸存人类的结算分。原版 1，5 人以上改 2。
++const MP8_SURVIVOR_BONUS: int = 2
++# 感染者移速倍率。原版是玩家场景里的 @export（1.25），5 人以上压到 1.05。
++# 理由：5 人以上有**两个**感染源，不压的话人类基本跑不掉。
++# ⚠️ ≤4 人**不发这个 RPC**，场景里的原版值一个字节不动 —— 不要在这里写死 1.25 当"原版值"。
++const MP8_INFECTED_SPEED: float = 1.05
++
++var mp8_survivor_bonus: int = 1
++
++const MP8_SPAWN_FILE: String = "user://mp8_knife_spawns.txt"
++var _mp8_edit_on: bool = false
++var _mp8_edit_sel: int = 0
++var _mp8_edit_step: float = 0.5
++var _mp8_edit_canvas: CanvasLayer = null
++var _mp8_edit_panel: Label = null
++var _mp8_spawn_markers: Array = []
++
++# ---- 针筒调试面板（mp8knifedebug，用户 2026-08-17 要的）----
++# 左上角实时显示针筒在哪个柜子、瞬移了几次、谁被感染了 ——
++# 用户要自己操作玩家去搜箱子，验证瞬移是不是真的发生。
++# ⚠️ 状态（mp8_syringe_containers）只在**服务器**上，所以面板也只有 1 号窗口（房主）有意义。
++# ③ 收尾：整块都在 `_mp8_debug_on` 之下，不传参数 = 屏幕上一个像素都不多。
++var _mp8_debug_on: bool = false
++var _mp8_debug_panel: Label = null
++var _mp8_debug_last: String = "（还没发生过瞬移）"
++
++# ---- 容器标记（mp8knifemark）----
++# 每个未搜容器头顶一个穿墙可见的编号，搜过就消失。用来找"够不着的那几个"。
++var _mp8_mark_on: bool = false
++var _mp8_marks: Array = []          # [[Label3D, Searchable], ...]
++var _mp8_mark_last: String = ""     # 上次报过的剩余编号，防日志刷屏
++
++
+ func _ready() -> void :
+ 	super._ready()
+ 
++	# 必须赶在 spawn_players() 读出生点之前。放 _ready() 每个端都会跑，
++	# 但这些 Marker 只有服务器会读（位置是 teleport_rpc 明发的），多建几个空节点无害。
++	_mp8_expand_spawns()
++	# 同样必须每个端都做：服务器据此建立针筒池；各客户端据此停用 #5/#6 的 Area3D，
++	# 并让右上角容器计数使用相同的 34 个有效容器。
++	_mp8_collect_searchables()
++
+ 	if multiplayer.is_server():
+ 
+ 		countdown_state.countdown_started.connect(_on_countdown_started)
+@@ -59,6 +200,27 @@ func _ready() -> void :
+ 
+ 		countdown_handler.expired.connect(_on_game_countdown_expired)
+ 
++	# [MP8] 出生点手调：只在传 mp8knifeedit 时才建 UI 与接管按键。
++	# 必须在 spawn_players() 之后才有玩家可同步，所以面板延后一帧建。
++	var mp8_args := Array(OS.get_cmdline_args())
++	_mp8_edit_on = mp8_args.has("mp8knifeedit")
++	if _mp8_edit_on:
++		call_deferred("_mp8_edit_begin")
++
++	# [MP8] 针筒调试面板（左上角），只在传 mp8knifedebug 时才建
++	_mp8_debug_on = mp8_args.has("mp8knifedebug")
++	if _mp8_debug_on:
++		call_deferred("_mp8_debug_begin")
++
++	# [MP8] 容器标记（mp8knifemark）：给每个**还没搜过**的容器头顶挂一个穿墙可见的编号。
++	# 用户 2026-08-19 实测「场上只有 34 个可互动容器，找了好久没找到最后两个」——
++	# 静态探针（probe70）证实 36 个容器**结构完全一样**（同父节点、同碰撞层、同可见性），
++	# 唯一差别只有坐标，所以"够不着"是关卡几何造成的，代码里看不出来。
++	# 这个开关把"找柜子"变成"看一眼"：剩哪几个没搜、在哪儿，一目了然。
++	_mp8_mark_on = mp8_args.has("mp8knifemark")
++	if _mp8_mark_on:
++		call_deferred("_mp8_mark_begin")
++
+ 	if GameManager.local_game:
+ 
+ 		await get_tree().create_timer(1.0).timeout
+@@ -71,6 +233,16 @@ func _ready() -> void :
+ 
+ func _process(delta: float) -> void :
+ 
++	# [MP8] 容器指示器：**必须在下面那句 local_game 早退之前**。
++	# 原版这个 _process 整个只服务分屏（local_game），联机时第一行就 return 掉了；
++	# 挂在后面的话联机局永远刷不到。容器表就绪后自动建一次，之后每帧刷。
++	# 每帧遍历 38 个容器，可忽略。
++	if mp8_container_label == null and not searchables.is_empty():
++		_mp8_container_hud_begin()
++	_mp8_container_hud_refresh()
++	if _mp8_mark_on:
++		_mp8_mark_refresh()
++
+ 	if not GameManager.local_game:
+ 		return
+ 
+@@ -117,6 +289,16 @@ func spawn_players():
+ 	var random_removal: int = round((searchable_base * 0.5) * randf())
+ 	guaranteed_search_result = searchable_base - random_removal
+ 
++	# [MP8] ≤4 人时上面算完就是原版结果，一个字不改；5 人及以上才接管。
++	_mp8_setup_syringes()
++
++	# [MP8] ② 的两项旋钮，同样只在 5 人以上生效
++	var mp8_count: int = PlayerManager.player_presences.size()
++	mp8_survivor_bonus = MP8_SURVIVOR_BONUS if mp8_count >= 5 else 1
++	if mp8_count >= 5:
++		print("[MP8] 内部暗手：%d 人 —— 幸存人类结算 %d 分（原版 1），感染者移速 ×%.2f（原版由场景定）" % [
++			mp8_count, mp8_survivor_bonus, MP8_INFECTED_SPEED])
++
+ 
+ 	var counter: int = 0
+ 	for key in PlayerManager.player_presences.keys():
+@@ -127,14 +309,24 @@ func spawn_players():
+ 
+ 		player_character.set_player_presence.rpc(player_presence.network_id)
+ 		player_character.set_game_reference_from_path.rpc(self.get_path())
++		# [MP8] 兜底：正常情况下 _mp8_expand_spawns() 已补够，这里取不越界。
++		# 万一补位没跑成（场景结构变了、节点改名），原版这里是裸下标 → 直接崩。
++		if counter >= spawn_positions.size():
++			push_warning("[MP8] 内部暗手：出生点只有 %d 个，第 %d 个玩家取模复用（补位没跑成？）" % [
++				spawn_positions.size(), counter + 1])
++		var mp8_slot: int = counter % spawn_positions.size()
+ 		player_character.teleport_rpc.rpc(
+-			spawn_positions[counter].global_position, 
+-			spawn_positions[counter].global_rotation, 
++			spawn_positions[mp8_slot].global_position,
++			spawn_positions[mp8_slot].global_rotation,
+ 		)
+ 
+ 		players[player_presence.network_id] = player_character
+ 		active_players[player_presence.network_id] = player_character
+ 
++		# [MP8] 感染者移速：≤4 人不发，场景里的原版值一个字节不动
++		if mp8_count >= 5:
++			player_character.mp8_set_infected_speed_rpc.rpc(MP8_INFECTED_SPEED)
++
+ 		player_character.item_found.connect(_on_item_found)
+ 		player_character.infected.connect(_on_player_infected)
+ 		player_character.dead.connect(_on_player_died)
+@@ -154,6 +346,836 @@ func spawn_players():
+ 			for mesh in fow_meshes:
+ 				mesh.set_layer_mask_value(starting_layer, true)
+ 
++# [MP8] 出生点 4 → 8：**凸包内最远点插入**（T4b 已验证的算法，照抄 network_manager
++# 的 `_mp8_spread_inside`，一字未改地搬过来）。
++#
++# 为什么不像隧道险境那样按列插值：本局原版 4 点挤在 x≈±5 / z∈[-7.5,-2.2] 的小范围里，
++# 按列等分插值算出来最小间距只有 **1.33 米**，太近。凸包最远点插入会自己找空当。
++#
++# 两条硬约束（T4b 定的）：① 不动原始点；② 新点只能是原始点的**凸组合** ——
++# 必落在原版凸包内，天然不会跑到地图外面（坑第 25 条：外面永远最空，不能当"可以放"）。
++func _mp8_spread_inside(originals: Array[Vector3], want: int) -> Array[Vector3] :
++
++	var chosen: Array[Vector3] = originals.duplicate()
++	var result: Array[Vector3] = []
++
++	if originals.size() < 2 or want <= originals.size():
++		return result
++
++	var pool: Array[Vector3] = []
++	for i in originals.size():
++		for j in range(i + 1, originals.size()):
++			for k in range(1, 8):
++				pool.append(originals[i].lerp(originals[j], float(k) / 8.0))
++
++	while chosen.size() < want:
++
++		var best: Vector3 = pool[0]
++		var best_d: float = -1.0
++
++		for c in pool:
++			var d: float = INF
++			for ch in chosen:
++				d = minf(d, c.distance_to(ch))
++			if d > best_d:
++				best_d = d
++				best = c
++
++		chosen.append(best)
++		result.append(best)
++
++	return result
++
++
++func _mp8_expand_spawns() -> void :
++
++	var args := Array(OS.get_cmdline_args())
++	mp8_player_count = PlayerManager.player_presences.size()
++
++	if player_spawn_positions_node == null:
++		push_warning("[MP8] 内部暗手：没有出生点容器，8 席不做")
++		return
++
++	var originals: Array = []
++	for child in player_spawn_positions_node.get_children():
++		if child is Node3D:
++			originals.append(child)
++
++	var n: int = originals.size()
++	if n == 0:
++		push_warning("[MP8] 内部暗手：出生点容器是空的，8 席不做")
++		return
++
++	if args.has("mp8noexpand"):
++		print("[MP8] 内部暗手：mp8noexpand，出生点一个字不改（纯原版对照组，⚠️ 必须配 4 人）")
++		return
++
++	# ⚠️ ≤4 人一律不动：本局 spawn_players() 同样是 shuffle 后按下标取，
++	# 补了就不再与原版一致（照立足之本/隧道险境那套把关）。
++	if mp8_player_count <= 4:
++		print("[MP8] 内部暗手：%d 人，用原版 %d 个出生点，一个字不改" % [mp8_player_count, n])
++		return
++
++	var want: int = mini(maxi(mp8_player_count, 5), MP8_MAX_PLAYERS)
++	if n >= want:
++		print("[MP8] 内部暗手：出生点已有 %d 个（要 %d），不用补" % [n, want])
++		return
++
++	var added: Array = []
++
++	# [MP8] 存盘文件优先：用户手摆过就照他的来，内置算法只是没摆之前的兜底。
++	var saved: Array = _mp8_load_spawn_file()
++	if saved.size() >= want:
++
++		# 原版那 n 个也按文件走（文件里存的是全部 8 个），这样用户能连原版位一起调。
++		for i in range(n, want):
++			var extra: Node3D = (originals[0] as Node3D).duplicate()
++			extra.name = "MP8Spawn%d" % (i - n)
++			player_spawn_positions_node.add_child(extra)
++			added.append(extra)
++
++		var all_now: Array = originals + added
++		for i in all_now.size():
++			if i >= saved.size():
++				break
++			var node3d: Node3D = all_now[i]
++			node3d.position = Vector3(saved[i][0].x, node3d.position.y, saved[i][0].z)
++			node3d.rotation.y = deg_to_rad(saved[i][1])
++
++		print("[MP8] 内部暗手：出生点 %d → %d，**用存盘文件** %s" % [
++			n, all_now.size(), ProjectSettings.globalize_path(MP8_SPAWN_FILE)])
++		_mp8_spawn_markers = all_now
++		return
++
++	if saved.size() > 0:
++		print("[MP8] 内部暗手：存盘文件只有 %d 行（要 %d），已忽略，用内置算法" % [saved.size(), want])
++
++	var origin_points: Array[Vector3] = []
++	for m in originals:
++		origin_points.append((m as Node3D).position)
++
++	var extras: Array[Vector3] = _mp8_spread_inside(origin_points, want)
++
++	for i in extras.size():
++		var extra: Node3D = (originals[0] as Node3D).duplicate()
++		extra.name = "MP8Spawn%d" % i
++		player_spawn_positions_node.add_child(extra)
++		extra.position = extras[i]
++		added.append(extra)
++
++	# 自证：把最小间距算出来打进日志。摆位改动必须能对着数字核，不能只说"摆好了"。
++	var all_points: Array = originals + added
++	var min_gap: float = INF
++	var min_pair: String = ""
++	for i in all_points.size():
++		for j in range(i + 1, all_points.size()):
++			var d: float = (all_points[i] as Node3D).position.distance_to((all_points[j] as Node3D).position)
++			if d < min_gap:
++				min_gap = d
++				min_pair = "%s↔%s" % [all_points[i].name, all_points[j].name]
++
++	var parts: Array = []
++	for m in added:
++		parts.append("%s(%.2f,%.2f)" % [m.name, (m as Node3D).position.x, (m as Node3D).position.z])
++
++	print("[MP8] 内部暗手：%d 人 —— 出生点 %d → %d，最小间距 %.2f 米（%s）；新增 %s" % [
++		mp8_player_count, n, all_points.size(), min_gap, min_pair, ", ".join(parts)])
++
++	if min_gap < MP8_MIN_SPAWN_GAP:
++		push_warning("[MP8] 内部暗手：最小间距 %.2f 米 < %.2f，可能有人叠着生成" % [
++			min_gap, MP8_MIN_SPAWN_GAP])
++
++	_mp8_spawn_markers = all_points
++
++
++# ═══════════════ [MP8] 出生点手调（mp8knifeedit）═══════════════
++# ⚠️ 全部 UI 与按键都在 `_mp8_edit_on` 之下；不传参数 = 屏幕上一个像素都不多、
++# `_unhandled_key_input` 开头就 return。所以 ③ 收尾天然无事可做。
++
++func _mp8_load_spawn_file() -> Array :
++
++	if not FileAccess.file_exists(MP8_SPAWN_FILE):
++		return []
++
++	var f := FileAccess.open(MP8_SPAWN_FILE, FileAccess.READ)
++	if f == null:
++		push_warning("[MP8] 内部暗手：读不了 %s（错误 %d）" % [
++			MP8_SPAWN_FILE, FileAccess.get_open_error()])
++		return []
++
++	var rows: Array = []
++	while not f.eof_reached():
++		var line: String = f.get_line().strip_edges()
++		if line.is_empty() or line.begins_with("#"):
++			continue
++		var parts: PackedStringArray = line.split(",", false)
++		if parts.size() < 2:
++			push_warning("[MP8] 内部暗手：布局文件这一行看不懂，跳过 —— '%s'" % line)
++			continue
++		var x: float = float(parts[0].strip_edges())
++		var z: float = float(parts[1].strip_edges())
++		var yaw: float = (float(parts[2].strip_edges()) if parts.size() >= 3 else 0.0)
++		rows.append([Vector3(x, 0.0, z), yaw])
++	f.close()
++	return rows
++
++
++func _mp8_save_spawn_file() -> void :
++
++	var f := FileAccess.open(MP8_SPAWN_FILE, FileAccess.WRITE)
++	if f == null:
++		push_warning("[MP8] 内部暗手：写不了 %s（错误 %d）" % [
++			MP8_SPAWN_FILE, FileAccess.get_open_error()])
++		return
++
++	f.store_line("# 内部暗手（mp8game=7）出生点")
++	f.store_line("# 一行一个点：x, z, 朝向度数。**必须 8 行**，行数不足会被忽略。")
++	f.store_line("# 前 4 行是场景原版那 4 个（也可以调），后 4 行是本 mod 新增的。")
++	f.store_line("# 只在 5 人及以上生效；≤4 人一律用场景里原版那 4 个点，一个字节不动。")
++	f.store_line("# 删掉这个文件 = 回到内置的凸包最远点插入算法。可以直接用记事本改。")
++	f.store_line("# 存于 %s" % Time.get_datetime_string_from_system())
++	f.store_line("")
++
++	var snippet := PackedStringArray()
++	for m in _mp8_spawn_markers:
++		var node3d: Node3D = m
++		f.store_line("%.2f, %.2f, %.0f" % [
++			node3d.position.x, node3d.position.z, rad_to_deg(node3d.rotation.y)])
++		snippet.append("\t[Vector3(%.2f, 0.0, %.2f), %.1f]," % [
++			node3d.position.x, node3d.position.z, rad_to_deg(node3d.rotation.y)])
++	f.close()
++
++	print("[MP8] 内部暗手：出生点已存盘（%d 个）→ %s" % [
++		_mp8_spawn_markers.size(), ProjectSettings.globalize_path(MP8_SPAWN_FILE)])
++	# 定稿后可直接贴回代码当内置默认，省得下一个 agent 再反推坐标
++	print("[MP8] 内部暗手：贴回代码用 ——\n%s" % "\n".join(snippet))
++
++
++func _mp8_edit_begin() -> void :
++
++	_mp8_edit_canvas = CanvasLayer.new()
++	_mp8_edit_canvas.layer = 80
++	add_child(_mp8_edit_canvas)
++
++	_mp8_edit_panel = Label.new()
++	_mp8_edit_panel.set_anchors_preset(Control.PRESET_TOP_LEFT)
++	_mp8_edit_panel.offset_left = 24
++	_mp8_edit_panel.offset_top = 24
++	# Label 默认不裁剪，不设这两个也画得出来；设上是为了别踩右上角那个坑
++	_mp8_edit_panel.offset_right = 720
++	_mp8_edit_panel.offset_bottom = 520
++	# 同上：默认主题字体字距是坏的，必须用游戏自己的
++	var edit_font = load("res://fonts/Terminal F4.ttf")
++	if edit_font != null:
++		_mp8_edit_panel.add_theme_font_override("font", edit_font)
++	_mp8_edit_panel.add_theme_font_size_override("font_size", 20)
++	_mp8_edit_panel.add_theme_color_override("font_color", Color(0.6, 1.0, 0.6))
++	_mp8_edit_panel.add_theme_color_override("font_outline_color", Color.BLACK)
++	_mp8_edit_panel.add_theme_constant_override("outline_size", 6)
++	_mp8_edit_panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
++	_mp8_edit_canvas.add_child(_mp8_edit_panel)
++
++	_mp8_edit_refresh()
++	print("[MP8] 内部暗手：出生点手调已开 —— 1~8 选点 / IKJL 挪 / UO 转 / M 步长 / 0 存盘 / N 报告")
++
++
++func _mp8_edit_refresh() -> void :
++
++	if _mp8_edit_panel == null:
++		return
++
++	var lines := PackedStringArray()
++	lines.append("内部暗手 出生点手调　步长 %.2f 米（M 键切换）" % _mp8_edit_step)
++	lines.append("1~8 选点　IKJL 挪　UO 转　0 存盘　N 打报告")
++	lines.append("")
++	for i in _mp8_spawn_markers.size():
++		var node3d: Node3D = _mp8_spawn_markers[i]
++		lines.append("%s %d号  (%6.2f, %6.2f)  %5.0f°" % [
++			"▶" if i == _mp8_edit_sel else "　", i + 1,
++			node3d.position.x, node3d.position.z, rad_to_deg(node3d.rotation.y)])
++	_mp8_edit_panel.text = "\n".join(lines)
++
++
++func _mp8_edit_report() -> void :
++
++	var parts := PackedStringArray()
++	for i in _mp8_spawn_markers.size():
++		var node3d: Node3D = _mp8_spawn_markers[i]
++		parts.append("%d号(%.2f,%.2f)@%.0f°" % [
++			i + 1, node3d.position.x, node3d.position.z, rad_to_deg(node3d.rotation.y)])
++
++	var min_gap: float = INF
++	for i in _mp8_spawn_markers.size():
++		for j in range(i + 1, _mp8_spawn_markers.size()):
++			min_gap = minf(min_gap, (_mp8_spawn_markers[i] as Node3D).position.distance_to(
++				(_mp8_spawn_markers[j] as Node3D).position))
++
++	print("[MP8] 内部暗手出生点报告（最小间距 %.2f 米）：%s" % [min_gap, " | ".join(parts)])
++
++
++# [MP8] 挪完把对应的人也传过去，好当场看站位（只有服务器发，否则 8 台各广播一遍）
++func _mp8_edit_sync_player(index: int) -> void :
++
++	if not multiplayer.is_server():
++		return
++	if index >= _mp8_spawn_markers.size():
++		return
++
++	var list: Array = players.values()
++	if index >= list.size():
++		return
++
++	var node3d: Node3D = _mp8_spawn_markers[index]
++	list[index].teleport_rpc.rpc(node3d.global_position, node3d.global_rotation)
++
++
++func _unhandled_key_input(event: InputEvent) -> void :
++
++	if not _mp8_edit_on:
++		return
++	if not (event is InputEventKey) or not event.pressed or event.echo:
++		return
++
++	var key: int = (event as InputEventKey).keycode
++
++	if key >= KEY_1 and key <= KEY_8:
++		var want_sel: int = key - KEY_1
++		if want_sel < _mp8_spawn_markers.size():
++			_mp8_edit_sel = want_sel
++			_mp8_edit_refresh()
++		return
++
++	if _mp8_edit_sel >= _mp8_spawn_markers.size():
++		return
++	var sel: Node3D = _mp8_spawn_markers[_mp8_edit_sel]
++
++	match key:
++		KEY_I: sel.position.z -= _mp8_edit_step
++		KEY_K: sel.position.z += _mp8_edit_step
++		KEY_J: sel.position.x -= _mp8_edit_step
++		KEY_L: sel.position.x += _mp8_edit_step
++		KEY_U: sel.rotation.y += deg_to_rad(15.0)
++		KEY_O: sel.rotation.y -= deg_to_rad(15.0)
++		KEY_M:
++			_mp8_edit_step = (
++				1.0 if is_equal_approx(_mp8_edit_step, 0.5)
++				else (0.1 if is_equal_approx(_mp8_edit_step, 1.0) else 0.5)
++			)
++		KEY_0:
++			_mp8_save_spawn_file()
++			return
++		KEY_N:
++			_mp8_edit_report()
++			return
++		_:
++			return
++
++	_mp8_edit_sync_player(_mp8_edit_sel)
++	_mp8_edit_refresh()
++
++
++# [MP8] 把场景里**真实**的可搜容器收进 `searchables`。
++# `searchables` 是原版声明了却从没填过的数组（类型正好对），这里把它用起来。
++# 不用硬编码的 26（那是设计意图值，与场景实际不符：probe70 数出 36 个），
++# 主体仍走类型判定；仅对实机确认不可达的原始 #5 / #6 使用稳定完整路径排除。
++func _mp8_collect_searchables() -> void :
++
++	if mp8_searchables_collected:
++		return
++	mp8_searchables_collected = true
++
++	searchables.clear()
++	var stack: Array = [self]
++	var disabled_count: int = 0
++	var raw_index: int = 0
++	while not stack.is_empty():
++		var node: Node = stack.pop_back()
++		if node is KnifeAtTheOfficeSearchable:
++			var searchable := node as KnifeAtTheOfficeSearchable
++			# 调试标记继续显示过滤前的原始编号：停用后画面会缺 #5/#6，
++			# 而不是让原始 #7/#8 前移后冒充成新的 #5/#6。
++			searchable.set_meta(&"mp8_raw_searchable_index", raw_index)
++			raw_index += 1
++			if _mp8_disable_searchable_if_needed(searchable):
++				disabled_count += 1
++			else:
++				searchables.append(searchable)
++		for c in node.get_children():
++			stack.append(c)
++
++	if disabled_count != MP8_DISABLED_SEARCHABLE_PATHS.size():
++		push_warning("[MP8] 内部暗手：应停用 %d 个不可达容器，实际命中 %d 个；场景路径可能变了" % [
++			MP8_DISABLED_SEARCHABLE_PATHS.size(), disabled_count])
++	else:
++		print("[MP8] 内部暗手：不可达容器 #5/#6 已停用；有效容器 %d 个" % searchables.size())
++
++
++func _mp8_disable_searchable_if_needed(node: KnifeAtTheOfficeSearchable) -> bool :
++
++	var relative_path: String = String(get_path_to(node))
++	if not MP8_DISABLED_SEARCHABLE_PATHS.has(relative_path):
++		return false
++
++	# 玩家交互区通过 area_entered 发现 Searchable。四项一起清掉，既不再被发现，
++	# 也不再主动检测任何对象；视觉子树不动，所以房间布景保持原样。
++	node.monitoring = false
++	node.monitorable = false
++	node.collision_layer = 0
++	node.collision_mask = 0
++	return true
++
++
++# [MP8] 针筒：**真的放进容器里**（用户 2026-08-17 要的容器模型）。
++#
++# 原版是计数模型：`containers_searched == guaranteed_search_result` 时，
++# 谁在搜谁就拿到 —— 针筒没有位置，容器也不知道自己有没有东西
++# （`Searchable.has_item` / `set_has_item_rpc` 在原版里从来没人调用过）。
++# 现在改成：开局把针筒塞进随机的容器，`has_item = true`，开到那个柜子才算找到。
++#
++# 顺带治好原版的一个卡死：原版把出现位次算成 `round(26 * 人数/4) - 随机`，
++# 8 人局能算到 52，而全场只有 38 个容器且**一次性** → 约 52% 的局永远搜不出针筒，
++# 猎杀阶段不开始、倒计时不启动、check_game_end 不成立 → **整局卡死**。
++# 容器模型天然没有这个问题：针筒就在某个柜子里，最坏也就是等它被开到。
++#
++# 保留原版的**节奏下限**：早于全图 34% 的搜索次数不出针筒（原版 4 人局的下界）。
++# 早于它开到藏针筒的柜子，就当"还没在这儿"，照瞬移规则挪走。
++# 不设上限 —— 容器模型下上限是自然的（柜子迟早被开到）。
++func _mp8_setup_syringes() -> void :
++
++	var args := Array(OS.get_cmdline_args())
++	mp8_player_count = PlayerManager.player_presences.size()
++	mp8_syringes_found = 0
++	mp8_relocations = 0
++	mp8_syringe_containers.clear()
++	mp8_syringe_holders.clear()
++
++	_mp8_collect_searchables()
++	var total: int = searchables.size()
++
++	if args.has("mp8noexpand"):
++		mp8_syringes_needed = 1
++		print("[MP8] 内部暗手：mp8noexpand，针筒保持原版计数模型（纯原版对照组，⚠️ 必须配 4 人）")
++		return
++
++	if total <= 0:
++		push_warning("[MP8] 内部暗手：一个可搜容器都没数到，针筒退回原版计数模型")
++		return
++
++	# ≤4 人：原版一支。⚠️ 仍然改用容器模型 —— 原版计数模型在 4 人下不会卡死，
++	# 但两套模型并存会让后面的瞬移规则要写两遍。容器模型在 4 人下的手感与原版一致：
++	# 都是"搜到第 34%~ 若干次时出现"，只是决定权从计数器换成了柜子。
++	mp8_syringes_needed = 1 if mp8_player_count <= 4 else 2
++
++	# 开局把针筒塞进随机容器（真的写 has_item，用原版那个没人用过的 RPC）
++	var pool: Array = searchables.duplicate()
++	pool.shuffle()
++	for i in mini(mp8_syringes_needed, pool.size()):
++		var c = pool[i]
++		c.set_has_item_rpc.rpc(true)
++		mp8_syringe_containers.append(c)
++
++	var names := PackedStringArray()
++	for c in mp8_syringe_containers:
++		names.append(String(c.name))
++
++	print("[MP8] 内部暗手：%d 人 —— 容器 %d 个，针筒 %d 支已放进 [%s]（无节奏下限，开到即找到）" % [
++		mp8_player_count, total, mp8_syringes_needed, ", ".join(names)])
++
++
++# [MP8] 针筒瞬移（用户 2026-08-17 定的规则）。
++#
++# 规则：**已经被感染的人不许再摸到针筒。** 他照样能搜（不禁），
++# 但当他开到装着针筒的柜子时，针筒**立刻挪到另一个还没被搜过的容器里**。
++#
++# 挑新柜子时**优先离触发者远的**（真容器模型才做得到这件事，计数模型表达不出来）。
++#
++# 兜底（用户点名要的）：**场上没有未搜容器时，随机挑一个重置状态再把针筒塞进去。**
++# 不做这一步的话，最后一个容器被感染者开走就再也没地方放针筒了 → 又卡死。
++func _mp8_relocate_syringe(from_container, away_from: Vector3, reason: String) -> void :
++
++	if is_instance_valid(from_container):
++		from_container.set_has_item_rpc.rpc(false)
++		mp8_syringe_containers.erase(from_container)
++
++	# 候选：还没被搜过的、且不是刚开的那个、且身上还没有针筒的
++	var candidates: Array = []
++	for s in searchables:
++		if not is_instance_valid(s):
++			continue
++		if s == from_container or s.searched or mp8_syringe_containers.has(s):
++			continue
++		candidates.append(s)
++
++	mp8_relocations += 1
++
++	if candidates.is_empty():
++
++		# ═══════════════════════════════════════════════════════════════════
++		# [MP8] 🩸 没有未搜容器时**不再重置柜子** —— 那正是"找不到第二根针"的根因
++		# ═══════════════════════════════════════════════════════════════════
++		#
++		# 旧做法：随机挑一个已搜柜子 `set_searched_rpc(false)` + 塞回针筒。
++		# 看着合理，实际把针筒藏进了一个**画面上永远开着的柜子**：
++		#
++		#   `searchable.gd` 的 `set_searched_rpc()` 里只有
++		#       `if searched && searchable_visuals != null: open_container()`
++		#   —— **没有关回去的分支**，`Searchable_Visuals` 也只有 `open_container()`，
++		#   抽屉是 tween 出去的，没有任何方法能收回来。
++		#
++		# 于是 `searched` 标志虽然清了、柜子却还敞着，高亮也还是红的
++		#（`get_highlight_color()` 看的是 searched，这个倒是跟着变绿了，
++		#  但抽屉的开合是玩家真正会依据的视觉线索）。
++		# 玩家扫一眼"这柜子开过了"就走了 —— 针筒就此人间蒸发，本局再也找不到第二支。
++		#
++		# 新做法：**放弃瞬移，直接让这个已感染者拿走**。
++		# 理由：走到这一步说明全场 38 个柜子都被搜过了，游戏已经到了收尾阶段，
++		# 「不让感染者摸到针筒」这条规则的意义（保持悬念）已经不存在，
++		# 而**让局能结束**的优先级更高 —— 原版卡死的教训就在本文件开头第三条。
++		# 这条路径正常局跑不到（节奏下限删掉之后瞬移本来就很少），是纯兜底。
++		mp8_relocations -= 1   # 这次没真的瞬移，别记进计数
++		_mp8_debug_last = "%s → 全场无未搜容器，破例判定为找到" % reason
++		_mp8_debug_refresh()
++		print("[MP8] 内部暗手：⚠️ 全场 %d 个容器都搜过了，无处可挪 —— 破例让这次算找到（%s）" % [
++			searchables.size(), reason])
++		mp8_force_find = true
++		return
++
++	# 优先挪远：在候选里取离触发者最远的前半段，再随机挑一个
++	candidates.sort_custom(func(a, b):
++		return a.global_position.distance_to(away_from) > b.global_position.distance_to(away_from)
++	)
++	var half: int = maxi(candidates.size() / 2, 1)
++	var target = candidates[randi() % half]
++	target.set_has_item_rpc.rpc(true)
++	mp8_syringe_containers.append(target)
++
++	var from_name: String = String(from_container.name) if is_instance_valid(from_container) else "?"
++	_mp8_debug_last = "%s → %s 挪到 %s（远 %.1f 米）" % [
++		reason, from_name, target.name, target.global_position.distance_to(away_from)]
++	_mp8_debug_refresh()
++
++	print("[MP8] 内部暗手：针筒瞬移（%s）—— 从 %s 挪到 %s（离触发点 %.1f 米，候选 %d 个）" % [
++		reason, from_name, target.name,
++		target.global_position.distance_to(away_from),
++		candidates.size(),
++	])
++
++
++# [MP8] 结算日志。**不改任何分数**，纯为事后核对得分对不对。
++# 三个得分点：找到针筒 +1 ／ 成功感染一人 +1 ／ 活到最后的人类 +mp8_survivor_bonus。
++# 判据：把每个人的分拆开看 —— 幸存者至少有 bonus 分；感染者的分 = 是否找到针筒 + 感染人数。
++func _mp8_log_scores(survivors: int) -> void :
++
++	var rows := PackedStringArray()
++	for id in players.keys():
++		rows.append("%s %d分%s" % [
++			_mp8_name(id),
++			player_scores.get(id, 0),
++			"(感染者)" if infected_players.has(id) else "(人类)",
++		])
++
++	print("[MP8] 内部暗手结算（%d 人在场 / %d 人幸存 / 幸存分 %d / 感染者 %d 人）：%s" % [
++		players.size(), survivors, mp8_survivor_bonus, infected_players.size(),
++		" | ".join(rows),
++	])
++
++
++func _mp8_name(network_id: int) -> String :
++
++	if players.has(network_id) and is_instance_valid(players[network_id]):
++		return String(players[network_id].player_presence.network_name)
++	return "id%d" % network_id
++
++
++# [MP8] 猎杀阶段开始时，把之前"揣着没揭晓"的人统一装备上。
++#
++# 先找到的那个人当初是 `set_has_item_rpc(true, false)` 收到的针筒 ——
++# has_item 记了，但没出模型、没变感染态。到这一刻再补发一次 equip=true。
++#
++# ⚠️ 重发会让玩家那边再 `item_found.emit()` 一次 → `_on_item_found` 再跑一轮。
++# 那边已经被 `mp8_first_time`（= `not infected_players.has()`）挡住，不会重复加分
++# —— 这条依赖必须一直成立。
++#
++# [MP8] 2026-08-19：`mp8_syringes_found` 现在**不在 `_on_item_found` 里加**了
++#（搬到了 `request_item_find_rpc`），所以这条补发路径根本碰不到针筒计数，
++# 比原来更安全：走补发进来的这一轮只会被 mp8_first_time 挡掉加分，别的什么都不动。
++func _mp8_equip_all_infected() -> void :
++
++	var done: int = 0
++	for id in infected_players:
++		if not (players.has(id) and is_instance_valid(players[id])):
++			continue
++		# 已经装备过的不再补发 —— needed=1 时找到即当场装备，这里就是空操作，
++		# 免得白白多一轮 RPC 与 item_found 回环。
++		if players[id].is_holding_syringe:
++			continue
++		players[id].set_has_item_rpc.rpc(true, true)
++		done += 1
++
++	print("[MP8] 内部暗手：揭晓 —— %d 个感染者现在装备针筒并变模型（在场感染者 %d 个）" % [
++		done, infected_players.size()])
++
++
++# ═══════════════ [MP8] 针筒调试面板（mp8knifedebug）═══════════════
++# 用户 2026-08-17：「我会操作玩家搜箱子，来测试是否真的会瞬移」。
++# 左上角实时列出针筒当前在哪个柜子、瞬移过几次、最后一次是从哪挪到哪。
++# ⚠️ 状态只在服务器上，所以**只有 1 号窗口（房主）**的面板有内容。
++
++func _mp8_debug_begin() -> void :
++
++	var layer := CanvasLayer.new()
++	layer.name = "MP8KnifeDebugHud"
++	layer.layer = 99
++	add_child(layer)
++
++	_mp8_debug_panel = Label.new()
++	_mp8_debug_panel.set_anchors_preset(Control.PRESET_TOP_LEFT)
++	_mp8_debug_panel.offset_left = 18.0
++	_mp8_debug_panel.offset_top = 14.0
++	_mp8_debug_panel.offset_right = 860.0
++	_mp8_debug_panel.offset_bottom = 460.0
++	# 同前：默认主题字体字距是坏的，必须用游戏自己的（这条已经栽过四次）
++	var f = load("res://fonts/Terminal F4.ttf")
++	if f != null:
++		_mp8_debug_panel.add_theme_font_override("font", f)
++	_mp8_debug_panel.add_theme_font_size_override("font_size", 20)
++	_mp8_debug_panel.add_theme_color_override("font_color", Color(1.0, 0.9, 0.4))
++	_mp8_debug_panel.add_theme_color_override("font_outline_color", Color.BLACK)
++	_mp8_debug_panel.add_theme_constant_override("outline_size", 6)
++	_mp8_debug_panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
++	layer.add_child(_mp8_debug_panel)
++
++	_mp8_debug_refresh()
++	print("[MP8] 内部暗手：针筒调试面板已开（左上角，只有房主这台有内容）")
++
++
++func _mp8_debug_refresh() -> void :
++
++	if not _mp8_debug_on or _mp8_debug_panel == null:
++		return
++
++	if not multiplayer.is_server():
++		_mp8_debug_panel.text = "内部暗手 针筒调试\n（针筒状态只在房主那台，这里没有内容）"
++		return
++
++	var searched: int = 0
++	for s in searchables:
++		if is_instance_valid(s) and s.searched:
++			searched += 1
++
++	var where := PackedStringArray()
++	for c in mp8_syringe_containers:
++		if is_instance_valid(c):
++			where.append(String(c.name))
++
++	var infected := PackedStringArray()
++	for id in infected_players:
++		infected.append(_mp8_name(id))
++
++	var lines := PackedStringArray()
++	lines.append("内部暗手 针筒调试（房主）")
++	lines.append("容器 %d 个：已搜 %d / 未搜 %d　　搜索次数 %d" % [
++		searchables.size(), searched, searchables.size() - searched, containers_searched])
++	lines.append("针筒 %d/%d 已找到　场上还剩 %d 支" % [
++		mp8_syringes_found, mp8_syringes_needed, mp8_syringe_containers.size()])
++	lines.append("针筒现在在：%s" % ("（没有了）" if where.is_empty() else ", ".join(where)))
++	lines.append("已瞬移 %d 次" % mp8_relocations)
++	lines.append("　最后一次：%s" % _mp8_debug_last)
++	lines.append("已感染：%s" % ("（无）" if infected.is_empty() else ", ".join(infected)))
++	lines.append("猎杀阶段：%s（决定能不能扎人）" % ("已开始" if searching_disabled else "**未开始**"))
++	_mp8_debug_panel.text = "\n".join(lines)
++
++
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] 右上角容器指示器「容器 12/34」（用户 2026-08-19 要的）
++# ═══════════════════════════════════════════════════════════════════════════
++#
++# 用户实测「有概率找不到第二根针」时提的：搜了半天不知道还剩多少柜子没开，
++# 也不知道是自己没搜到、还是针筒根本不在场上。这一行把它变成可见的。
++#
++# ### 为什么每台自己数，不发 RPC
++#
++# `_mp8_collect_searchables()` 在 `_ready()` 里跑，**每个端都会跑**，
++# 所以每台机器的 `searchables` 都是全的；而 `set_searched_rpc` 是
++# `call_local` 广播，每台的 `searched` 标志也都是准的。
++# → 本机遍历一遍就是正确答案，不需要服务器告诉它。
++# （这跟左上角那个调试面板不同：那个显示的是针筒在哪个柜子，
++#   `mp8_syringe_containers` 只有服务器有，所以那个面板只对房主有意义。）
++#
++# ### 显示的是「已搜/总数」，不是「剩余」
++#
++# 34/34 = 当前有效容器全搜完了。
++# 全搜完还没找到针筒时变红 —— 那说明撞上了兜底路径，看一眼就知道该查日志。
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] 容器标记（mp8knifemark）—— 把"找柜子"变成"看一眼"
++# ═══════════════════════════════════════════════════════════════════════════
++#
++# 每个**还没搜过**的容器头顶挂一个 Label3D，写过滤前的原始收集编号，
++# `no_depth_test = true` 所以**穿墙可见**。搜过一个就消失一个。
++#
++# 用途：找出"数得到但玩家摸不着"的容器。用户 2026-08-19 报「场上只有 34 个可互动，
++# 找了好久没找到最后两个」，而 probe70 证实 36 个容器结构完全一样、
++# 只有坐标不同 —— 所以够不着是关卡几何造成的，静态分析查不出来，只能进场看。
++#
++# 跑完把剩下的编号告诉我（或看日志里那行「还剩 N 个没搜」），就能精确排除它们。
++func _mp8_mark_begin() -> void :
++
++	if not _mp8_marks.is_empty():
++		return
++	_mp8_collect_searchables()
++
++	for i in searchables.size():
++		var s = searchables[i]
++		if not is_instance_valid(s):
++			continue
++
++		var lbl := Label3D.new()
++		lbl.text = str(s.get_meta(&"mp8_raw_searchable_index", i))
++		lbl.font_size = 96
++		lbl.pixel_size = 0.012
++		lbl.billboard = BaseMaterial3D.BILLBOARD_ENABLED
++		# 穿墙可见 —— 这是本开关的全部意义，没有它就还是得挨个屋子找
++		lbl.no_depth_test = true
++		lbl.modulate = Color(1.0, 0.9, 0.2)
++		lbl.outline_modulate = Color.BLACK
++		lbl.outline_size = 12
++		lbl.position = Vector3(0, 1.6, 0)
++		s.add_child(lbl)
++		_mp8_marks.append([lbl, s])
++
++	print("[MP8] 内部暗手：mp8knifemark —— %d 个容器已挂编号（穿墙可见，搜过即消失）" % _mp8_marks.size())
++
++
++func _mp8_mark_refresh() -> void :
++
++	if _mp8_marks.is_empty():
++		return
++
++	var left := PackedStringArray()
++	for pair in _mp8_marks:
++		var lbl = pair[0]
++		var s = pair[1]
++		if not is_instance_valid(lbl) or not is_instance_valid(s):
++			continue
++		lbl.visible = not s.searched
++		if not s.searched:
++			left.append(lbl.text)
++
++	# 只在"快搜完了"的时候打日志，免得刷屏。剩 4 个以内时每次变化都报一次。
++	if left.size() <= 4 and left.size() > 0:
++		var key: String = ",".join(left)
++		if key != _mp8_mark_last:
++			_mp8_mark_last = key
++			var parts := PackedStringArray()
++			for pair in _mp8_marks:
++				var s = pair[1]
++				if is_instance_valid(s) and not s.searched:
++					parts.append("#%s (%.1f, %.1f)" % [
++						pair[0].text, s.global_position.x, s.global_position.z])
++			print("[MP8] 内部暗手：还剩 %d 个容器没搜 —— %s" % [left.size(), " / ".join(parts)])
++
++
++func _mp8_container_hud_refresh() -> void :
++
++	if mp8_container_label == null or not is_instance_valid(mp8_container_label):
++		return
++
++	var total: int = searchables.size()
++	if total <= 0:
++		mp8_container_label.text = ""
++		return
++
++	var searched: int = 0
++	for s in searchables:
++		if is_instance_valid(s) and s.searched:
++			searched += 1
++
++	mp8_container_label.text = "容器 %d/%d" % [searched, total]
++
++	# 全开完了还在搜 = 异常，标红提醒
++	if searched >= total:
++		mp8_container_label.add_theme_color_override("font_color", Color(1.0, 0.45, 0.45))
++	else:
++		mp8_container_label.add_theme_color_override("font_color", Color(0.85, 0.9, 0.85))
++
++
++func _mp8_container_hud_begin() -> void :
++
++	if mp8_container_label != null and is_instance_valid(mp8_container_label):
++		return
++
++	var layer := CanvasLayer.new()
++	layer.name = "MP8ContainerHud"
++	layer.layer = 100
++	add_child(layer)
++
++	var lbl := Label.new()
++	lbl.set_anchors_preset(Control.PRESET_TOP_RIGHT)
++	lbl.offset_left = -320.0
++	# ⚠️ 压在「有人已被感染」那行**下面**（那行 top=14 / bottom=54），
++	# 不设 bottom 会得到负高度、文字被裁 —— 见下面那个函数的血泪注释。
++	lbl.offset_top = 58.0
++	lbl.offset_right = -18.0
++	lbl.offset_bottom = 96.0
++	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
++
++	# ⚠️ 必须显式指定游戏自己的字体，默认主题字体字距是坏的（第五次踩，见下方注释）
++	var f = load("res://fonts/Terminal F4.ttf")
++	if f != null:
++		lbl.add_theme_font_override("font", f)
++	lbl.add_theme_font_size_override("font_size", 24)
++	lbl.add_theme_color_override("font_color", Color(0.85, 0.9, 0.85))
++	lbl.add_theme_color_override("font_outline_color", Color.BLACK)
++	lbl.add_theme_constant_override("outline_size", 6)
++	lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
++	layer.add_child(lbl)
++
++	mp8_container_label = lbl
++	_mp8_container_hud_refresh()
++	print("[MP8] 内部暗手：右上角容器指示器已建（本机自己数，%d 个容器）" % searchables.size())
++
++
++# [MP8] 右上角常驻一行「有人已被感染」（用户 2026-08-17 要的）。
++# ⚠️ 照枪械工厂那套：HUD 建在**小游戏自己身上**，只建一次。
++# 猎鸭当初把 HUD 挂在玩家身上，结果每台机器 8 个玩家各建一个 Label 叠成一团。
++@rpc("any_peer", "call_local", "reliable")
++func mp8_show_infected_notice_rpc() -> void :
++
++	if mp8_notice_label != null and is_instance_valid(mp8_notice_label):
++		return
++
++	var layer := CanvasLayer.new()
++	layer.name = "MP8InfectedHud"
++	layer.layer = 100
++	add_child(layer)
++
++	var lbl := Label.new()
++	lbl.set_anchors_preset(Control.PRESET_TOP_RIGHT)
++	lbl.offset_left = -640.0
++	lbl.offset_top = 14.0
++	lbl.offset_right = -18.0
++	# ⚠️ offset_bottom 必须设。`set_anchors_preset` 会把四个 offset 全清零，
++	# 只设 top 不设 bottom → 高度是**负的**，文字会被裁掉。第一版就是这么错的。
++	lbl.offset_bottom = 54.0
++	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
++	lbl.text = "有人已被感染"
++
++	# ⚠️ 必须显式指定游戏自己的字体：默认主题字体**字距是坏的**。
++	# 猎鸭、残骸平台、枪械工厂都栽过 —— 这是第四次，照抄枪械工厂那份。
++	var f = load("res://fonts/Terminal F4.ttf")
++	if f != null:
++		lbl.add_theme_font_override("font", f)
++	lbl.add_theme_font_size_override("font_size", 26)
++	lbl.add_theme_color_override("font_color", Color(1.0, 0.35, 0.35))   # 红 = 有人被感染
++	lbl.add_theme_color_override("font_outline_color", Color.BLACK)
++	lbl.add_theme_constant_override("outline_size", 6)
++	lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
++	layer.add_child(lbl)
++
++	mp8_notice_label = lbl
++	print("[MP8] 内部暗手：右上角提示「有人已被感染」已显示")
++
++
+ func all_players_loaded():
+ 	super.all_players_loaded()
+ 
+@@ -189,10 +1211,19 @@ func end_game():
+ 
+ 	await get_tree().create_timer(1.0).timeout
+ 
++	# [MP8] ② 得分（用户 2026-08-17 定）：**只动"幸存人类"这一项，1 分 → 2 分。**
++	# 另外两个得分点原版就是 1 分，一个字不改：
++	#   找到针筒 +1（`_on_item_found`）／ 成功感染一人 +1（`_on_player_infected`）
++	# ≤4 人仍是原版的 +1（`mp8_survivor_bonus` 只在 5 人以上变 2）。
++	var mp8_survivors: int = 0
+ 	for p in players.values():
+ 		if infected_players.has(p.player_presence.network_id):
+ 			continue
+-		player_scores[p.player_presence.network_id] += 1
++		player_scores[p.player_presence.network_id] += mp8_survivor_bonus
++		mp8_survivors += 1
++
++	_mp8_log_scores(mp8_survivors)
++
+ 	player_scores_finalized.emit(player_scores)
+ 
+ 	await get_tree().create_timer(1.0).timeout
+@@ -206,9 +1237,21 @@ func start_2nd_phase_music():
+ 	MusicManager.play_kato_2nd_phase_music()
+ 	speaker_syringe_found.play()
+ 
++	# [MP8] 这个函数在**每台机器上各跑一遍**（走 start_projector_hide_hunt_loop_rpc 广播），
++	# 而 `camera_zoom_in()` 动的是各自本机玩家的相机。
++	# 加计数日志：上一轮"只有找到的人镜头变了、别人没变"就是靠猜的，
++	# 有了这行下次能直接看出每台机器到底跑没跑、把谁算成了幸存者。
++	var mp8_zoomed: int = 0
++	var mp8_skipped: int = 0
+ 	for player: KnifeAtTheOfficePlayer in player_spawn_node.get_children():
+ 		if !player.is_infected:
+ 			player.camera_zoom_in()
++			mp8_zoomed += 1
++		else:
++			mp8_skipped += 1
++
++	print("[MP8] 内部暗手：本机第二阶段表现 —— 拉近镜头 %d 人 / 跳过（已感染）%d 人" % [
++		mp8_zoomed, mp8_skipped])
+ 
+ 
+ func player_disconnected(_network_id: int):
+@@ -230,7 +1273,15 @@ func remove_player_rpc(_network_id: int):
+ 	var player_instance = players.get(_network_id, null)
+ 	if player_instance:
+ 
+-		player_instance.cleanup_rpc.rpc()
++		# ═══════ [MP8] 2026-08-19 修：cleanup 只由服务器发一次 ═══════
++		#
++		# `remove_player_rpc` 本身是 call_local 广播 → 8 个端都跑到这里。
++		# 旧版 8 个端各自 `cleanup_rpc.rpc()` 再广播一遍 = 64 次投递，
++		# 而 `cleanup_rpc` 的函数体只在 authority 端有效果（`queue_free()`）——
++		# 第一次就把节点释放了，后面 7 次打到已释放节点上，白刷 RPC 报错。
++		# 下面那句本地 `queue_free()` 才是各端真正清理自己那份副本的地方。
++		if multiplayer.is_server():
++			player_instance.cleanup_rpc.rpc()
+ 		player_instance.queue_free()
+ 
+ 		player_scores.erase(_network_id)
+@@ -258,36 +1309,190 @@ func enable_player_fow_rpc():
+ 		p.set_fow_rpc.rpc(true)
+ 
+ @rpc("any_peer", "call_local", "reliable")
+-func request_item_find_rpc(_network_id: int):
++func request_item_find_rpc(_network_id: int, _searchable_path: NodePath = ^""):
+ 
+ 	if not multiplayer.is_server():
+ 		return
+ 
+ 	containers_searched += 1
+ 
++	var hit: bool = _mp8_resolve_find(_network_id, _searchable_path)
++
++	# ═══════ [MP8] 2026-08-19 修：针筒计数搬到这里 ═══════
++	#
++	# 旧版在 `_on_item_found` 里加，而且压在 `mp8_first_time`
++	#（= `not infected_players.has(id)`）后面。那是**按人**去重，
++	# 可 `mp8_syringes_found` 是**按针**的计数 —— 两者根本不是一回事。
++	#
++	# 后果（用户 2026-08-19 报的 bug）：已经拿到针的人再拿到一支时
++	# `mp8_first_time` 为 false → 计数不加 → `found(1) < needed(2)` 永远成立
++	# → 猎杀阶段永不开始：**扎不了人、别人视角不缩、灯也不关**。
++	# 而那支针已经被 `_mp8_resolve_find` 从容器表里取走了，
++	# 场上再没有第二支可找 → 整局卡死到超时。
++	#
++	# 现在改成：判定为找到 = 当场记账。服务器侧、同步、每支只加一次，
++	# 既不依赖 `infected_players` 的异步填表，也不受 RPC 扇出影响。
++	if hit:
++		mp8_syringes_found += 1
++		if not mp8_syringe_holders.has(_network_id):
++			mp8_syringe_holders.append(_network_id)
++
++	# 每搜一次都刷面板（已搜/未搜计数要跟着动，不然看不出"搜过的柜子变多了"）
++	_mp8_debug_refresh()
++
++	# [MP8] 这一支是不是"凑齐最后一支"？是才当场装备（出针筒模型、变感染态）。
++	# 不是的话先揣着不揭晓，到猎杀阶段由 `_mp8_equip_all_infected()` 统一装备。
++	# ⚠️ 计数已经在上面加过了，所以这里**不再 +1**（旧版那个 +1 是因为当时还没加）。
++	# ≤4 人：needed=1、hit 后 found=1 → 1>=1 → 当场装备 = 原版行为，一点没变。
++	var equip_now: bool = mp8_syringes_found >= mp8_syringes_needed
++
+ 	if GameManager.local_game:
+ 
+-		if containers_searched == guaranteed_search_result:
+-			players[_network_id].search_result_rpc(true)
+-		else:
+-			players[_network_id].search_result_rpc(false)
++		players[_network_id].search_result_rpc(hit, equip_now)
+ 
+ 		return
+ 
+-	if containers_searched == guaranteed_search_result:
+-		players[_network_id].search_result_rpc.rpc(true)
+-	else:
+-		players[_network_id].search_result_rpc.rpc(false)
++	# ═══════ [MP8] 2026-08-19 修：定点发给搜索者，不再广播 ═══════
++	#
++	# 旧版 `.rpc()` 是**广播**，而 `search_result_rpc` 当时是 `call_remote`：
++	# 7 个远端各自执行一遍，每个再 `set_has_item_rpc.rpc()` 广播一遍
++	# → 服务器这边一次寻获收 7 次（8 人局实测，见 `_on_item_found` 的注释）。
++	# 拔刀音也跟着响 7 次、装备 Tween 建 7 个。
++	#
++	# 搜索结果**只与搜索者一个人有关**，用 rpc_id 定点发。
++	# ⚠️ 配套改动：`search_result_rpc` 的注解必须从 `call_remote` 改成 `call_local`，
++	# 否则房主自己搜柜子时 `rpc_id(1, ...)` 会被 call_remote 挡掉、一端都不执行。
++	players[_network_id].search_result_rpc.rpc_id(_network_id, hit, equip_now)
++
++
++# [MP8] 判定这一次开柜子算不算找到针筒。**基于容器**，不是数搜索次数。
++#
++# 三条规则（用户 2026-08-17 定）：
++#   1. 开的柜子里没针筒 → 没找到（就这么简单，这才是"基于容器"）
++#   2. 有针筒、但**开的人已经被感染** → 针筒立刻瞬移到别的没搜过的柜子，本次算没找到
++#   3. 有针筒、但还没到节奏下限（全图 34% 的搜索次数）→ 同样瞬移，当"还没在这儿"
++# 其余情况 = 找到。
++func _mp8_resolve_find(_network_id: int, _searchable_path: NodePath) -> bool :
++
++	# 拿不到容器身份就退回原版计数模型（`mp8noexpand` 对照组、或玩家脚本没打补丁）
++	if _searchable_path.is_empty() or mp8_syringe_containers.is_empty():
++		return containers_searched == guaranteed_search_result
++
++	# ⚠️ 不用 `get_node_or_null(绝对路径)` —— 节点一旦离开活动场景树（回合切换、清理阶段）
++	# 它会刷 "Can't use get_node() with absolute paths from outside the active scene tree"。
++	# 改成在**自己收集的容器表里比路径**，既不碰场景树状态，也不会认错节点。
++	var node: Node = null
++	for s in mp8_syringe_containers:
++		if is_instance_valid(s) and s.get_path() == _searchable_path:
++			node = s
++			break
++
++	if node == null:
++		return false
++
++	var where: Vector3 = (node as Node3D).global_position
++
++	# 规则 2：已感染的人开到了 —— 挪走，并且优先挪到离他远的柜子。
++	# **这是全局唯一的瞬移来源**（节奏下限已按用户 2026-08-19 的要求删除）。
++	#
++	# ⚠️ [MP8] 2026-08-19：这里**必须**同时看 `mp8_syringe_holders`。
++	# 只看 `infected_players` 会漏掉「同一个人连开两柜、两支全拿走」——
++	# 那张表要两跳网络才填得上，快速连开时它还是空的。见变量声明处的大段注释。
++	if infected_players.has(_network_id) or mp8_syringe_holders.has(_network_id):
++		mp8_force_find = false
++		_mp8_relocate_syringe(node, where, "已感染者 %s 开到了" % _mp8_name(_network_id))
++		# 兜底：全场无未搜容器时不挪了，破例判定为找到（否则针筒会消失，见那里的注释）
++		if mp8_force_find:
++			mp8_force_find = false
++		else:
++			return false
++
++	# 找到了：把针筒从这个柜子里取走
++	node.set_has_item_rpc.rpc(false)
++	mp8_syringe_containers.erase(node)
++	_mp8_debug_last = "%s 在 %s 里拿走了一支" % [_mp8_name(_network_id), node.name]
++	_mp8_debug_refresh()
++	print("[MP8] 内部暗手：%s 在 %s 里找到了针筒（第 %d 次搜索）" % [
++		_mp8_name(_network_id), node.name, containers_searched])
++	return true
+ 
+ 
+ 
+ @rpc("any_peer", "call_local", "reliable")
+ func _on_item_found(_network_id):
+ 
+-	if not infected_players.has(_network_id):
++	# ⚠️⚠️ [MP8] **这个函数一次寻获会被调用不止一次。**
++	#
++	# 历史（2026-08-17 实机踩到，8 人局实测 7 次）：
++	#   服务器 `players[id].search_result_rpc.rpc(true)` 是**广播**，
++	#   而 `search_result_rpc` 是 `call_remote` → 7 个远端各自执行，
++	#   每个都再 `set_has_item_rpc.rpc(true)` **广播一遍**，
++	#   而 `set_has_item_rpc` 内部会 `item_found.emit()` → 服务器这边收 7 次。
++	#
++	# ✅ 2026-08-19 已修：`request_item_find_rpc` 改成 `rpc_id(_network_id, ...)`
++	#    定点发、`search_result_rpc` 改 `call_local` → 这条链现在是 **1 次**。
++	#
++	# ⚠️ 但**去重标志位仍然不能删**：`_mp8_equip_all_infected()` 在猎杀阶段开始时
++	#    会给"揣着没揭晓"的人补发一次 `set_has_item_rpc(true, true)`，
++	#    那边照样 `item_found.emit()` → 本函数再跑一轮。
++	#
++	# **原版对此免疫，因为它每一处副作用都压在标志位后面**
++	# （`if not infected_players.has()` / `if !projector_started` / `if not hunting_phase`）。
++	# 本 mod 加的任何累加**必须同样压在标志位后面**。
++	#
++	# ⚠️⚠️ 但是——**"按人去重"只能挡住重复的人，挡不住重复的针**。
++	# `mp8_syringes_found` 是**按针**的计数，2026-08-19 已经从这里搬到
++	# `request_item_find_rpc`（判定当帧同步加）。别再把它搬回来：
++	# 搬回来 = 同一个人拿到第二支时计数不加 = 猎杀阶段永不开始 = 整局卡死。
++	var mp8_first_time: bool = not infected_players.has(_network_id)
++
++	if mp8_first_time:
+ 		infected_players.append(_network_id)
+ 
++		# [MP8] 找到针筒的人各得 1 分。这是**把原版那句从下面搬上来**，不是新计分规则：
++		# 原版它在 `if not hunting_phase:` 里，因为原版只有一支针筒、找到即进猎杀阶段，
++		# 两者同一时刻。现在猎杀推迟到第二支到手，不搬的话只有最后一个找到的人拿分。
++		# ⚠️ 搬出来就**必须自带 guard**（就是外面这个 mp8_first_time），
++		# 否则一次寻获会加 7 次 —— 第一版正是这么错的。
++		#
++		# 「找到针筒 +1」按**人**给（一个人拿两支也只算一次），
++		# 所以它留在 mp8_first_time 里是对的 —— 与 mp8_syringes_found 的语义不同。
++		player_scores[_network_id] += 1
++
++		# [MP8] 2026-08-19：`mp8_syringes_found += 1` 已移到 `request_item_find_rpc`。
++		# 理由见本函数顶部注释与那边的大段说明。**不要挪回来。**
++
++	# [MP8] 猎杀阶段推迟到**所有针筒**都被找到。
++	# ≤4 人 / 对照组下 mp8_syringes_needed == 1，这个条件与原版的
++	# `if not hunting_phase` 完全等价（第一次进来就满足），行为逐值一致。
++	#
++	# ⚠️⚠️ 这一段**必须放在放映示（start_projector_hide_hunt_loop_rpc）之前**。
++	# 原版是"找到针筒 → 立刻放映示 + 换音乐 + 给幸存者拉近镜头"，因为原版找到即开猎杀。
++	# 现在猎杀推迟到第二支，若还让第一支就放映示，会出两个错：
++	#   ① 第二阶段的音乐/放映在"还没揭晓"时就响了，等于提前剧透；
++	#   ② `start_2nd_phase_music()` 用 `if !player.is_infected` 判谁是幸存者，
++	#      而这时第一个找到的人 `is_infected` 还是 false（模型延后），
++	#      **于是他被当成幸存者、给他拉了镜头** —— 2026-08-17 实机就是这个现象。
++	if mp8_syringes_found < mp8_syringes_needed:
++
++		# ⚠️ 同样只在第一次真寻获时做，否则 7 次重复调用会刷 7 行日志
++		if mp8_first_time:
++			# 右上角告诉所有人"有人已被感染"，但**不说是谁**（用户 2026-08-17 要的）
++			# 这就是这一阶段**唯一**的对外反馈，其余表现一概不动。
++			mp8_show_infected_notice_rpc.rpc()
++
++			# 这里**不用**再藏下一支：两支针筒开局就已经分别放进两个柜子了
++			# （`_mp8_setup_syringes`）。剩下那支还在它自己的柜子里等人开。
++			# 这个人已经感染了，之后他就算开到那个柜子也会被瞬移走（规则 2）。
++			print("[MP8] 内部暗手：第 %d/%d 支针筒已被找到，先不揭晓，全场继续搜（还剩 %d 支在场上）" % [
++				mp8_syringes_found, mp8_syringes_needed, mp8_syringe_containers.size()])
++		return
++
++	# [MP8] 凑齐了。**先装备再放映示** —— 顺序不能反：
++	# 装备会把 `is_infected` 置 true，`start_2nd_phase_music()` 正是靠它区分幸存者。
++	# needed=1 时这里就是原版那一刻，装备是空操作（当场已装备），时序与原版一致。
+ 	if !projector_started:
++		_mp8_equip_all_infected()
+ 		start_projector_hide_hunt_loop_rpc.rpc()
+ 	projector_started = true
+ 	await get_tree().create_timer(1.5).timeout
+@@ -295,12 +1500,17 @@ func _on_item_found(_network_id):
+ 	if not hunting_phase:
+ 		hunting_phase = true
+ 
+-		player_scores[_network_id] += 1
+ 		set_searching_disabled_rpc.rpc(true)
++		# [MP8] 猎杀阶段开始 = 从这一刻起才准扎人（玩家脚本 update_has_knife 判的就是这个）
++		_mp8_debug_refresh()
+ 
+ 		light_handler.transition_to_dark_rpc.rpc()
+ 		await get_tree().create_timer(3.0).timeout
+-		countdown_handler.set_active_rpc.rpc(active_players.size() - 1)
++		# [MP8] 原版写死 `- 1`（只有一个感染者）。现在感染源可能有两个，
++		# 存活指示灯要按**真实未感染人数**点，否则 8 人局会多点一格。
++		countdown_handler.set_active_rpc.rpc(
++			maxi(active_players.size() - infected_players.size(), 0)
++		)
+ 		enable_player_fow_rpc.rpc()
+ 
+ func _on_player_infected(_network_id: int, _by_network_id: int):

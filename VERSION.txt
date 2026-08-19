@@ -1,0 +1,6 @@
+mod 版本：overtime-1.2
+适用游戏版本：v2.1.2（Steam）
+补丁数：51
+生成时间：2026-08-19 20:55
+
+本文件由 tools\make_release_repo.ps1 生成。

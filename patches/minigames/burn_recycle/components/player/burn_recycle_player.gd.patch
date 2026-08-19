@@ -1,0 +1,435 @@
+diff --git a/minigames/burn_recycle/components/player/burn_recycle_player.gd b/minigames/burn_recycle/components/player/burn_recycle_player.gd
+--- a/minigames/burn_recycle/components/player/burn_recycle_player.gd
++++ b/minigames/burn_recycle/components/player/burn_recycle_player.gd
+@@ -60,6 +60,11 @@ enum InputType{
+ @export var player_marker: Node3D
+ @export var player_name_label: PlayerNameLabel
+ 
++# [MP8] ⚠️ 原版是 `const`，而且是**按玩家下标索引的定长 4 项**（坑第 13 条那个模式，
++# 跟 T15 的 rank_y_positions 一模一样）：5~8 号工位会越界读。
++# 现在不再索引它，改走 _mp8_visual_rotation() 的公式（= 180 + 角步*seat）。
++# 保留这一行是当**原版基准值**用：角步 90° 时公式逐项等于这张表（360≡0、450≡90），
++# 所以 4 人局一个值都没变。_mp8_self_check() 每局开头会真的逐项比一遍。
+ const visual_parent_rotations: Array[float] = [180.0, 270.0, 0.0, 90.0]
+ 
+ var game_instance: BurnRecycleMinigame
+@@ -201,13 +206,16 @@ func setup_local_visuals():
+ 
+ func setup_clientside_visuals(_seat_counter: int):
+ 	await get_tree().create_timer(1, false).timeout
++	# [MP8] 原版这里是 visual_parent_rotations[_seat_counter]（4 项，5~8 号越界）
+ 	game_instance.clientside_visuals_parent.rotation_degrees = Vector3(
+-		0.0, visual_parent_rotations[_seat_counter], 0.0
++		0.0, _mp8_visual_rotation(_seat_counter), 0.0
+ 	)
+ 
++	# [MP8] 亮的是**前一个工位**那个人的结算指示灯。原版环形回绕写死成 3（4 工位），
++	# 8 工位要绕到 7 —— 不改的话 0 号工位会去点 3 号的灯，而 4~7 号的灯永远不亮。
+ 	var index_to_enable_indicator_on = _seat_counter - 1
+ 	if index_to_enable_indicator_on == -1:
+-		index_to_enable_indicator_on = 3
++		index_to_enable_indicator_on = _mp8_seats() - 1
+ 	for i in game_instance.player_parent_node.get_children():
+ 		var pl: BurnRecyclePlayer = i
+ 		if pl.active_seat_index == index_to_enable_indicator_on:
+@@ -219,13 +227,26 @@ func setup_clientside_visuals(_seat_counter: int):
+ func set_active_belt(_seat_counter: int):
+ 	active_seat_index = _seat_counter
+ 	debug.text = "seat: " + str(_seat_counter)
+-	active_belt = game_instance.belts[_seat_counter]
++	# [MP8] 原版直接 belts[_seat_counter]，4 条带子 8 个人 → 5~8 号越界拿到 null，
++	# 之后 move_items_visual() 里 active_belt.get_active_material(0) 每推进一格报一次错。
++	# 上界校验 + 喊出来（burn_recycle.gd 已经把数组补到 8 并按工位号重排）。
++	if _seat_counter < game_instance.belts.size():
++		active_belt = game_instance.belts[_seat_counter]
++	else:
++		printerr("[MP8] 人工筛选：%d 号工位没有传送带（数组只有 %d 条）—— 货道不会滚" % [
++			_seat_counter, game_instance.belts.size()])
+ 
+ func set_active_press(_seat_counter: int):
+ 	for i in game_instance.presses:
+ 		if i.press_id == _seat_counter:
+ 			active_press = i
+ 			break
++	# [MP8] 匹配不到就是致命的：set_eliminated_rpc() 第一句 active_press.start_press()
++	# 会报错**中断整个函数**，后面的 is_dead=true / active=false 全不执行
++	# → 被淘汰的人照样能继续玩。所以这里必须喊出来。
++	if active_press == null:
++		printerr("[MP8] 人工筛选：%d 号工位配不到冲压机（共 %d 台）—— 淘汰流程会出问题" % [
++			_seat_counter, game_instance.presses.size()])
+ 
+ func play_lever_sound():
+ 	speaker_pull_lever.stream = sounds_lever.pick_random()
+@@ -240,29 +261,30 @@ func play_death_sound():
+ 	speaker_death.play()
+ 
+ func look_at_seat(_seat_index: int):
++	# [MP8] 原版是一张写死的 4×4 表（我的工位 × 出事的工位 → self/right/center/left）。
++	# 那张表的语义就是**相对位次**：offset = (目标 - 我 + N) % N，
++	# 0=self、1=right、2=center、3=left。下面的公式在 N=4 时与原表**逐格一致**
++	# （已逐格核对过），N=8 时把 1~3 归 right、4 归 center、5~7 归 left。
++	#
++	# ⚠️ 两条已知妥协，都是表现层，等用户看过再决定要不要动：
++	#   1. 动画只有这四个方向，8 工位表达不出"隔三个工位那个人"；
++	#   2. `look left/right` 的转头角度是按 **90° 邻座**烘死在 anim_camera movement 里的，
++	#      45° 间隔下会转过头（转 90° 却只该转 45°）。
++	#
++	# 另外原版这里读的是 active_press.press_id —— 5~8 号工位配不到冲压机时那是 null，
++	# 整个函数当场中断。改用 active_seat_index（两者恒等：press 就是按工位号配的），
++	# 顺带把这个空指针堵掉。
++	var n: int = _mp8_seats()
++	var offset: int = ((_seat_index - active_seat_index) % n + n) % n
+ 	var direction: String = "center"
+-
+-	match active_press.press_id:
+-		0:
+-			if _seat_index == 0: direction = "self"
+-			if _seat_index == 1: direction = "right"
+-			if _seat_index == 2: direction = "center"
+-			if _seat_index == 3: direction = "left"
+-		1:
+-			if _seat_index == 0: direction = "left"
+-			if _seat_index == 1: direction = "self"
+-			if _seat_index == 2: direction = "right"
+-			if _seat_index == 3: direction = "center"
+-		2:
+-			if _seat_index == 0: direction = "center"
+-			if _seat_index == 1: direction = "left"
+-			if _seat_index == 2: direction = "self"
+-			if _seat_index == 3: direction = "right"
+-		3:
+-			if _seat_index == 0: direction = "right"
+-			if _seat_index == 1: direction = "center"
+-			if _seat_index == 2: direction = "left"
+-			if _seat_index == 3: direction = "self"
++	if offset == 0:
++		direction = "self"
++	elif offset * 2 < n:
++		direction = "right"
++	elif offset * 2 == n:
++		direction = "center"
++	else:
++		direction = "left"
+ 
+ 	anim_camera_movement.play("look " + direction)
+ 
+@@ -310,10 +332,15 @@ func move_items_visual():
+ 				item_tweens.erase(item)
+ 		)
+ 
++		# [MP8] active_belt 可能是 null（工位配不到带子），原版裸用会中断整个搬货循环
++		if active_belt == null:
++			continue
+ 		var t2 = create_tween()
+ 		var mat: StandardMaterial3D = active_belt.get_active_material(0)
+ 		var prev_uv = mat.uv1_offset.x
+-		t2.tween_property(mat, "uv1_offset", Vector3(prev_uv - 0.028, mat.uv1_offset.y, mat.uv1_offset.z), conveyor_move_time / 1.5)
++		# [MP8] 原版写死 0.028（= 18 槽那条长带子上"一格 1 米"对应的 UV）。
++		# 带子按槽位数缩短后，同样的 UV 值对应的世界距离变了 → 不补就是"带子滚得比货慢"。
++		t2.tween_property(mat, "uv1_offset", Vector3(prev_uv - _mp8_uv_step(), mat.uv1_offset.y, mat.uv1_offset.z), conveyor_move_time / 1.5)
+ 
+ 
+ func update_score_screen():
+@@ -517,7 +544,13 @@ func set_eliminated_rpc():
+ 
+ 	ik_left.stop()
+ 	ik_right.stop()
+-	active_press.start_press()
++	# [MP8] 原版这里裸调 active_press.start_press()。它一旦是 null（工位配不到冲压机），
++	# 报错会**中断整个函数**，下面的 is_dead=true / active=false 全不执行 →
++	# 人死了还能继续搬货。冲压机没了是表现问题，淘汰本身不能跟着黄。
++	if active_press != null:
++		active_press.start_press()
++	else:
++		printerr("[MP8] 人工筛选：%d 号工位没有冲压机，跳过压死动画（淘汰照常生效）" % active_seat_index)
+ 	anim_character.play("thrown on control panel death1")
+ 	hide_nametag()
+ 	shake_camera()
+@@ -559,15 +592,185 @@ func set_active_rpc(_active: bool):
+ 	active = _active
+ 
+ @rpc("any_peer", "call_local", "reliable")
+-func setup_rpc(_rotation_degrees: Vector3, _random_types_byte_array: PackedByteArray):
++func setup_rpc(_rotation_degrees: Vector3, _random_types_byte_array: PackedByteArray, _slots: int = 0, _push: float = 0.0):
+ 
+ 	rotation_degrees = _rotation_degrees
+ 
++	# [MP8] 两派摆位：奇数号工位整体沿自己的径向往外退（内圈原位不动）。
++	# 径向 = 转过之后的**局部 +Z**（⚠️ 不是 +X，第一版错在这儿：+X 是货道方向，
++	# 按 +X 推等于把工位沿着自己的传送带平移，看起来就是"玩家没跟着工位动"）。
++	# 控制台、货道、记分屏、摄像机全挂在这个实例下，所以推整个实例 = 连人带镜头一起退后，
++	# 本人看自己工位的取景**一点没变**（用户 2026-08-17 想到的那条）。
++	# 必须放在 rotation_degrees 之后：basis.z 要用转过之后的。
++	if _push != 0.0:
++		position = transform.basis.z.normalized() * _push
++
++	# [MP8] -BurnEdit 的手调增量（相对默认摆位）。整个实例一起挪 =
++	# 控制台/货道/记分屏/**摄像机**一起挪，本人取景不变。
++	# ⚠️ 顺序与手调时**必须一致**：先绕工位锚点转 dyaw，再平移 dpos。
++	# 锚点不是实例原点（那在场地正中，绕它转人会飞到对面），
++	# 而是实例局部 (0, 0, 半径) 处 —— 详见 burn_recycle.gd 末尾「-BurnEdit」那一节。
++	if game_instance != null and game_instance.has_method("mp8_layout_delta"):
++		var d: Array = game_instance.mp8_layout_delta(active_seat_index)
++		var dyaw: float = float(d[1])
++		if absf(dyaw) > 0.001:
++			var anchor: Vector3 = global_transform * Vector3(
++				0.0, 0.0, game_instance.mp8_station_radial())
++			var b: Basis = Basis(Vector3.UP, deg_to_rad(dyaw))
++			var t: Transform3D = global_transform
++			t.origin = anchor + b * (t.origin - anchor)
++			t.basis = b * t.basis
++			global_transform = t
++		position += d[0] as Vector3
++
++	# [MP8] 第三个参数是原版没有的：服务器权威的货道槽位数（见 burn_recycle.gd 文件头）。
++	# 必须在这里（而不是 _ready）应用 —— _ready 时 game_instance 还没接上，问不到人数。
++	# 这时候还没有任何货物（货是倒计时开始才发的），所以砍数组是安全的。
++	if _slots > 0:
++		_mp8_apply_slot_count(_slots)
++
+ 	for b in _random_types_byte_array:
+ 		random_item_types.append(
+ 			BurnRecycleMinigame.ItemTypes.values()[b]
+ 		)
+ 
++	# [MP8] 玩家操作平台的可见开关（mp8burnnopanel，play.ps1 -BurnNoPanel）。
++	# 放在这里而不是 _ready：拉杆/活塞的世界位置到这一步才定下来。
++	# 各端各自读命令行，不走 RPC —— 所以这个参数要**给全部实例**，
++	# 只给房主会出现"房主看不到操作台、别人看得到"。
++	if Array(OS.get_cmdline_args()).has("mp8burnnopanel"):
++		mp8_set_panel_visible(false)
++
++	# [MP8] 局内绑定调试面板（-BurnDebug）。放在这里是因为到这一步
++	# 工位号、带子、冲压机、槽位、外推增量全都定下来了。
++	_mp8_debug_build()
++	_mp8_debug_refresh()
++
++
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] 以下全是新增
++# ═══════════════════════════════════════════════════════════════════════════
++
++# [MP8] 玩家操作平台（活塞 / 两根拉杆 / 控制台屏）的显隐。
++#
++# **和"可见平台"是两件不同的东西，别混**：
++#   · 玩家操作平台 = 这几件，挂在玩家实例下、跟着工位走，**8 个工位都有**；
++#   · 可见平台     = 主场景 `burn recycle visuals final` 下那几套**静态**工位框架，
++#     归 burn_recycle.gd 的 `_mp8_set_frames_visible()` 管（原版只有 4 套，理由见那边）。
++#
++# ⚠️ 三样**故意不动**：
++#   · 记分屏 `score_parent`（ScoreScreenParent）—— show_end_score_rpc 结算要用它显示分数；
++#   · 角色本体与 `indicator` —— 隐了就判不出"人站在哪个工位"，而摆位正是要判这个；
++#   · 货位 `item_position_parent` 与货物 —— 那是玩法可读性，不属于平台。
++# ⚠️ `visible = false` 只关画面：Area3D 的碰撞照旧（改的不是 scale，与坑第 28 条无关），
++# 所以隐着照样能烧/回收/被冲压 —— 它是纯观察开关，不改玩法。
++func mp8_set_panel_visible(on: bool) -> void :
++
++	var hit: int = 0
++	for nd in [piston, lever_burn, lever_recycle, _mp8_panel_screen()]:
++		var n3: Node3D = nd as Node3D
++		if n3 == null:
++			continue
++		n3.visible = on
++		hit += 1
++
++	# 四件都该在。少了就报警：这个开关"没生效"和"生效了"在画面上难分辨，
++	# 不报的话下次会白查一轮（同 burn_recycle.gd 那边找不到框架时的处理）。
++	if hit < 4:
++		push_warning("[MP8] 人工筛选：%d 号工位的操作平台只找到 %d/4 件（活塞/两拉杆/台屏），其余照旧" % [
++			active_seat_index, hit])
++
++
++# [MP8] 控制台屏那一组。原版没给它 @export，只能按名字找（probe65 量的节点名）。
++# 找的是 parent 而不是 mesh 本身：屏幕内容是挂在 parent 下的 SubViewport 那一套。
++func _mp8_panel_screen() -> Node3D :
++	return find_child("control panel screen parent", true, false) as Node3D
++
++
++# [MP8] 工位总数。game_instance 还没接上时退回 4（= 原版），
++# 这样任何一处早于 set_manager_from_path_rpc 的调用都不会拿到 0 去做取模。
++func _mp8_seats() -> int:
++	if game_instance != null and game_instance.mp8_seats > 0:
++		return game_instance.mp8_seats
++	return 4
++
++
++# [MP8] 每推进一格带子该滚多少 UV（带子缩短后要按比例放大，见 move_items_visual）
++func _mp8_uv_step() -> float:
++	if game_instance != null and game_instance.mp8_belt_uv_step > 0.0:
++		return game_instance.mp8_belt_uv_step
++	return 0.028
++
++
++# [MP8] 客户端视觉总成的朝向。
++# 原版是 visual_parent_rotations[seat]（定长 4 项，5~8 号越界）；
++# 那张表就是 180 + 90*seat（mod 360），换成公式即可推广到任意角步。
++func _mp8_visual_rotation(seat: int) -> float:
++	var step: float = 90.0
++	if game_instance != null and game_instance.mp8_seat_step > 0.0:
++		step = game_instance.mp8_seat_step
++	return fposmod(180.0 + step * float(seat), 360.0)
++
++
++# [MP8] 把货道砍到 n 格。
++#
++# 原版 18 格里只有 0~3 有玩法意义（0~2 预告、3 操作位），4~17 是"没分拣的货开走"的
++# 视觉尾巴；45° 八工位下那条 16.89 米的带子会横穿邻座，用户 2026-08-17 定砍到 8~10 格。
++#
++# ⚠️ 两端格数必须一致：move_items_data() 的 erase 下标是从 items 长度推的，
++# 长度不同两端会 erase 不同的格子。所以格数由服务器经 setup_rpc 下发，本函数不自己算。
++func _mp8_apply_slot_count(n: int) -> void :
++
++	if n <= 4 or n >= item_positions.size():
++		return
++
++	_mp8_self_check()
++
++	item_positions.resize(n)
++	items.clear()
++	for i in n:
++		items[i] = null
++
++	if active_item_index >= n:
++		printerr("[MP8] 人工筛选：操作位下标 %d 超出 %d 格货道，货永远走不到操作位" % [
++			active_item_index, n])
++
++
++# [MP8] 自检：burn_recycle.gd 缩短带子用的是三个写死的几何常量
++# （首格 z=+3、格距 1 米、原版 18 格，都是 probe57 从原装 PCK 量的）。
++# 游戏更新后场景一改，那三个数就可能不对，而带子长度错了只是"看着怪"，不会报错。
++# 所以这里拿真实货位逐项比一遍，对不上就喊出来。只在 0 号工位报一次，不刷屏。
++func _mp8_self_check() -> void :
++
++	if active_seat_index != 0 or item_positions.size() < 2 or game_instance == null:
++		return
++
++	# ⚠️ 必须换算到**玩家根节点自己的坐标系**（to_local）再比 —— 这一条踩过两次：
++	# 玩家场景根节点烘死了 90° yaw，而运行时 rotation_degrees 把它覆盖掉了，
++	# 所以"连根变换一起累乘"量出来的坐标（probe57 那一版）跟运行时差 90°。
++	# 运行时真相（probe62）：货道沿局部 **x** 走（-3.00 起，格距 1 米），径向是 **z**（恒 5.20）。
++	var p0: Vector3 = to_local(item_positions[0].global_position)
++	var p1: Vector3 = to_local(item_positions[1].global_position)
++	var first_x: float = p0.x
++	var spacing: float = absf(p1.x - p0.x)
++	print("[MP8] 人工筛选货道实况：%d 格 / 首格 x=%.2f / 格距 %.2f 米 / 径向 z=%.2f（常量是 %d / %.2f / %.2f / %.2f）" % [
++		item_positions.size(), first_x, spacing, p0.z,
++		BurnRecycleMinigame.MP8_ORIG_SLOTS, BurnRecycleMinigame.MP8_SLOT_FIRST_X,
++		BurnRecycleMinigame.MP8_SLOT_SPACING, BurnRecycleMinigame.MP8_STATION_RADIAL_Z])
++
++	if item_positions.size() != BurnRecycleMinigame.MP8_ORIG_SLOTS \
++			or absf(first_x - BurnRecycleMinigame.MP8_SLOT_FIRST_X) > 0.05 \
++			or absf(spacing - BurnRecycleMinigame.MP8_SLOT_SPACING) > 0.05 \
++			or absf(p0.z - BurnRecycleMinigame.MP8_STATION_RADIAL_Z) > 0.05:
++		printerr("[MP8] ⚠️ 人工筛选：货道几何跟 burn_recycle.gd 里的常量对不上 —— 带子长度/外推方向会摆错，去改那三个常量")
++
++	# 顺带核对"公式等于原表"这条（角步 90° 时必须逐项一致，否则 4 人局就被我改坏了）
++	for s in visual_parent_rotations.size():
++		var want: float = visual_parent_rotations[s]
++		var got: float = fposmod(180.0 + 90.0 * float(s), 360.0)
++		if absf(fposmod(want - got, 360.0)) > 0.01:
++			printerr("[MP8] ❌ 视觉朝向公式与原版表第 %d 项不符（表 %.1f / 公式 %.1f）" % [s, want, got])
++
+ @rpc("any_peer", "call_local", "reliable")
+ func set_random_type_array_rpc(_random_types_byte_array: PackedByteArray):
+ 
+@@ -623,3 +826,100 @@ func set_player_presence(_network_id: int, seat_counter: int):
+ 
+ 		set_process(false)
+ 		indicator.visible = false
++
++
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] 局内绑定调试面板（-BurnDebug / 命令行 mp8burndebug），**默认全关**
++# ═══════════════════════════════════════════════════════════════════════════
++#
++# 屏幕左上角，**每台机器显示自己那个玩家的绑定**（8 个窗口各看各的）。
++#
++# 为什么值得单独做一个：本局最致命的一类 bug 就是"工位号 → 硬件"配错或配不到 ——
++#   * belts[seat] 越界拿到 null → 货道不滚；
++#   * presses 匹配不到 → active_press 恒 null → set_eliminated_rpc() 第一句就报错
++#     中断整个函数 → **被淘汰的人照样能继续玩**。
++# 这两条在画面上都不会立刻显形（第二条要等有人被淘汰才爆），
++# 所以把绑定结果直接摆在屏幕上，一眼就能判 8 个工位是不是都配齐了。
++#
++# 原版有一个 `debug: Label3D` 只写了 "seat: N"，那是**世界空间**里的小牌子，
++# 远了根本看不清，也不含 id 与硬件绑定 —— 这里是屏幕空间的独立面板，不动它。
++#
++# ⚠️ ③ 收尾：这是显式开关、默认关、不跟 -debug-tools 走。不传参数一个像素都不多。
++
++var _mp8_dbg_canvas: CanvasLayer = null
++var _mp8_dbg_panel: Label = null
++
++
++func _mp8_debug_on() -> bool :
++	return Array(OS.get_cmdline_args()).has("mp8burndebug")
++
++
++func _mp8_debug_build() -> void :
++
++	if _mp8_dbg_panel != null or not _mp8_debug_on():
++		return
++
++	# 只在**本人那一端**建面板：每个窗口显示自己的绑定，不是别人的。
++	if player_presence == null:
++		return
++	if not GameManager.local_game and player_presence.network_id != multiplayer.get_unique_id():
++		return
++
++	var lbl := Label.new()
++	lbl.name = "MP8BurnDebugPanel"
++	lbl.set_anchors_preset(Control.PRESET_TOP_LEFT)
++	lbl.position = Vector2(14, 10)
++	lbl.add_theme_color_override("font_color", Color(0.6, 1.0, 0.6))
++	lbl.add_theme_color_override("font_outline_color", Color.BLACK)
++	lbl.add_theme_constant_override("outline_size", 6)
++	lbl.add_theme_font_size_override("font_size", 15)
++
++	_mp8_dbg_canvas = CanvasLayer.new()
++	_mp8_dbg_canvas.layer = 127
++	_mp8_dbg_canvas.add_child(lbl)
++	add_child(_mp8_dbg_canvas)
++	_mp8_dbg_panel = lbl
++
++
++func _mp8_debug_refresh() -> void :
++
++	if _mp8_dbg_panel == null:
++		return
++
++	var seats: int = _mp8_seats()
++	var pname: String = "?"
++	var pid: int = 0
++	if player_presence != null:
++		pname = String(player_presence.network_name)
++		pid = player_presence.network_id
++
++	# 指示灯：本工位负责点亮的是**前一个工位**那盏（原版语义，环形回绕）
++	var ind_id: int = active_seat_index - 1
++	if ind_id < 0:
++		ind_id = seats - 1
++
++	var belt_txt: String = "✗ 没配到"
++	if active_belt != null:
++		belt_txt = "✓ %s" % String(active_belt.name)
++
++	var press_txt: String = "✗ 没配到（淘汰流程会炸）"
++	if active_press != null:
++		press_txt = "✓ press_id=%d" % active_press.press_id
++
++	var ring: String = "?"
++	var push: float = 0.0
++	if game_instance != null:
++		push = float(game_instance.mp8_ring_push)
++		ring = "外圈 +%.2f 米" % push if (active_seat_index % 2) == 1 and push > 0.0 else "内圈"
++
++	var lines := PackedStringArray()
++	lines.append("[MP8] 人工筛选 · 绑定调试")
++	lines.append("玩家 %s    id = %d" % [pname, pid])
++	lines.append("工位 %d / 共 %d 个    %s" % [active_seat_index, seats, ring])
++	lines.append("传送带  %s" % belt_txt)
++	lines.append("冲压机  %s" % press_txt)
++	lines.append("指示灯  我负责点亮 %d 号工位那盏" % ind_id)
++	lines.append("货道 %d 格    工位世界坐标 (%.2f, %.2f)" % [
++		item_positions.size(), global_position.x, global_position.z])
++
++	_mp8_dbg_panel.text = "\n".join(lines)

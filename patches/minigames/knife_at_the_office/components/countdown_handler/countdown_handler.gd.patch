@@ -1,0 +1,95 @@
+diff --git a/minigames/knife_at_the_office/components/countdown_handler/countdown_handler.gd b/minigames/knife_at_the_office/components/countdown_handler/countdown_handler.gd
+--- a/minigames/knife_at_the_office/components/countdown_handler/countdown_handler.gd
++++ b/minigames/knife_at_the_office/components/countdown_handler/countdown_handler.gd
+@@ -19,8 +19,33 @@ var active: bool = false
+ 
+ signal expired()
+ 
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] 内部暗手：存活指示灯 4 → 8（2026-08-17）
++# ═══════════════════════════════════════════════════════════════════════════
++#
++# `alive_indicator_icons` 是场景里烘死的 **4 个 TextureRect**（probe55 量的），
++# 而喂进来的参数是"未感染人数"：
++#   set_active_rpc(...)            8 人局最大 7
++#   update_alive_indicator_rpc(...) 同上
++# 下面两处 `alive_indicator_icons[i].visible = true` 是**按下标取**的 → 8 人局越界。
++# 这正是坑第 13 条那个模式（记分板就是这么崩过的）。
++#
++# 补法：复制第一个图标，塞进**同一个父容器**（HBoxContainer，会自己排版），
++# 补到 MP8_ICON_TARGET 个。TextureRect 没有指向子节点的 @export，
++# 所以不涉及坑第 14 条那套"复制后要重解析 @export"（那条是给大厅展示位/记分板用的）。
++# 也**不新建音源**（坑第 14 条实测会卡死流程）—— 这里只是纯 UI 节点。
++#
++# ⚠️ 尚未核实的一点：`anim_alive_indicator_fader` 的 "show"/"hide" 轨
++# 如果是**逐个点名**原来那 4 个图标（而不是动父容器），新增的 4 个不会跟着淡入淡出。
++# 记分板 T15 踩过同一类问题。实机验收时盯一眼：8 人局猎杀阶段开始时，
++# 后面 4 个指示灯有没有跟着一起出现/消失。真不跟就改成在代码里直接设 visible。
++const MP8_ICON_TARGET: int = 8
++
++
+ func _ready() -> void :
+ 
++	_mp8_extend_alive_indicators()
++
+ 	countdown_label.visible = false
+ 	countdown_background.visible = false
+ 	time_remaining = countdown_time
+@@ -31,6 +56,34 @@ func _ready() -> void :
+ 	timer.timeout.connect(_on_timer_tick)
+ 
+ 
++# [MP8] 把指示灯补到 8 个。原版那 4 个一个字节不动，只在后面追加。
++func _mp8_extend_alive_indicators() -> void :
++
++	var have: int = alive_indicator_icons.size()
++	if have == 0:
++		push_warning("[MP8] 内部暗手：存活指示灯数组是空的，补不了")
++		return
++	if have >= MP8_ICON_TARGET:
++		return
++
++	var src: TextureRect = alive_indicator_icons[0]
++	if src == null or src.get_parent() == null:
++		push_warning("[MP8] 内部暗手：存活指示灯没有父容器，补不了")
++		return
++
++	var parent: Node = src.get_parent()
++
++	for i in range(have, MP8_ICON_TARGET):
++		var dup: TextureRect = src.duplicate()
++		dup.name = "MP8AliveIndicator%d" % i
++		parent.add_child(dup)
++		dup.visible = false
++		alive_indicator_icons.append(dup)
++
++	print("[MP8] 内部暗手：存活指示灯 %d → %d（父容器 %s）" % [
++		have, alive_indicator_icons.size(), parent.name])
++
++
+ 
+ @rpc("any_peer", "call_local", "reliable")
+ func set_active_rpc(num_of_players: int = 1):
+@@ -68,7 +121,12 @@ func _on_timer_tick():
+ func setup_alive_indicator(num_of_alive_players: int):
+ 	for i in alive_indicator_icons:
+ 		i.visible = false
+-	for i in num_of_alive_players:
++	# [MP8] 兜底：正常情况下 _mp8_extend_alive_indicators() 已补到 8 个。
++	# 万一没补成，原版这里是裸下标 → 越界。夹一下并报出来，别静默。
++	if num_of_alive_players > alive_indicator_icons.size():
++		push_warning("[MP8] 内部暗手：要点 %d 个存活指示灯，只有 %d 个（补位没跑成？）" % [
++			num_of_alive_players, alive_indicator_icons.size()])
++	for i in mini(num_of_alive_players, alive_indicator_icons.size()):
+ 		alive_indicator_icons[i].visible = true
+ 
+ 
+@@ -87,6 +145,7 @@ func update_alive_indicator_rpc(num_of_alive_players: int):
+ 	await get_tree().create_timer(0.16, false).timeout
+ 	for i in alive_indicator_icons:
+ 		i.visible = false
+-	for i in num_of_alive_players:
++	# [MP8] 同上，夹一下下标
++	for i in mini(num_of_alive_players, alive_indicator_icons.size()):
+ 		alive_indicator_icons[i].visible = true
+ 	anim_alive_indicator_fader.play("show")

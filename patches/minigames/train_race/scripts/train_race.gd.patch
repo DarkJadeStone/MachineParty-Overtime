@@ -1,0 +1,279 @@
+diff --git a/minigames/train_race/scripts/train_race.gd b/minigames/train_race/scripts/train_race.gd
+--- a/minigames/train_race/scripts/train_race.gd
++++ b/minigames/train_race/scripts/train_race.gd
+@@ -41,9 +41,60 @@ var dead_players: Array[int]
+ 
+ var trains_in_proximity: Array
+ 
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] 隧道险境（train_race，mp8game=9）8 人适配 —— ① 适配（2026-08-17）
++# ═══════════════════════════════════════════════════════════════════════════
++#
++# ### 侦察结论（probe53/54 量的原装 PCK，不是猜的）
++#
++# **好消息：这个小游戏的核心玩法本来就随人数缩放，一个字不用改。**
++# nook_handler.gd:30 `nooks_to_open = max((player_count + 2) - rounds_passed, 1)`,
++# 而 `player_count` 每轮由 train_race.gd 用 `active_players.size()` 刷新（见 _on_cycle_finished）。
++# 开几个是算出来的，循环上界是 `nooks.size()`，**不按玩家下标索引 → 不越界**。
++#
++# 坑第 13 条 grep 全目录跑过：**只有一处按玩家下标索引** —— 就是下面 spawn_players()
++# 的 `player_spawn_positions[counter]`。4 个点、8 个人，counter=4 起必越界。
++#
++# ### ⚠️⚠️ 为什么必须自管出生点（坑第 33 条，本局比致命反弹更严重）
++#
++# 原版 4 个 Marker 的**场景排列顺序又是对角交叉的**（probe53 量的世界坐标）：
++#     [0]=(-3.95,-4.06)  [1]=(3.42,4.19)  [2]=(-3.97,4.55)  [3]=(4.11,-4.00)
++# 容器式补位（network_manager `_mp8_topup`）取"相邻两点中点"，这里的"相邻"取到的是对角线：
++#     j=0: mid([0],[1]) = (-0.27, 0.07)
++#     j=2: mid([2],[3]) = ( 0.07, 0.28)   ← 与 j=0 相距 **0.40 米，基本叠在一起**
++# 而且这两个点都落在 **x≈0**，也就是**火车碾过去的中线**上。
++# → 必须 `mp8_owns_spawns = true` 让通用补位让开。
++#
++# ⚠️ 容器名 `PlayerSpawnPositions` 是**和立足之本共用的**，
++# 绝不能像猎鸭/枪械工厂那样从 `MP8_SPAWN_CONTAINERS` 里摘掉 —— 那会打坏已验收的立足之本。
++# 走 `mp8_owns_spawns` 这条只影响本小游戏的路。
++#
++# ### 本局的摆法：**按列等分插入**（不写死坐标，从原版点现算）
++#
++# 原版 4 点其实是 2 列 × 2 行：左列 x≈-3.96、右列 x≈+3.4~4.1，z 各约 ±4。
++# 做法：按 x 正负分两列，每列在**自己那两个端点之间**等分插入 2 个（连 x 一起 lerp）。
++# 新点因此是**同列两个原版点的凸组合**，天然落在原版凸包内（T4b 定的硬约束），
++# 且**没有任何一个落在 x≈0 的中线上**。
++#   左列 z 跨度 8.61 → 间距 2.87 米；右列 z 跨度 8.19 → 间距 2.73 米
++#   最小间距 **2.73 米**（对比通用补位的 0.40 米）
++# 原版 4 个点一个字节不动 —— 4 人局与原版逐值一致。
++var mp8_owns_spawns: bool = true
++
++# 新点与任意已有点之间要求的最小间距，低于它打警告（只报不拦，便于日后改摆位时发现问题）
++const MP8_MIN_SPAWN_GAP: float = 1.5
++const MP8_MAX_PLAYERS: int = 8
++
++var mp8_player_count: int = 0
++
++
+ func _ready() -> void :
+ 	super._ready()
+ 
++	# 必须赶在 spawn_players() 读出生点之前建好。
++	# 放 _ready() 每个端都会跑，但这些 Marker 只有服务器会读
++	# （位置是 teleport_rpc 明发的），多建几个空节点无害。照致命反弹那套。
++	_mp8_expand_spawns()
++
+ 	multiplayer_synchronizer.set_multiplayer_authority(1)
+ 
+ 	shake_proximity.area_entered.connect(_on_shake_proximity_entered)
+@@ -106,8 +157,14 @@ func spawn_players():
+ 
+ 		player_character.set_player_presence.rpc(player_presence.network_id)
+ 		player_character.set_marker_camera_from_path_rpc.rpc(camera.get_path())
++		# [MP8] 兜底：正常情况下 _mp8_expand_spawns() 已把点补到 8 个，这里取不越界。
++		# 万一补位没跑成（场景结构变了、节点被改名），原版这里是裸下标 —— 直接 null 崩。
++		# 取模至少让人叠着生成而不是崩，并且**大声报出来**，别静默吞掉。
++		if counter >= player_spawn_positions.size():
++			push_warning("[MP8] 隧道险境：出生点只有 %d 个，第 %d 个玩家取模复用（补位没跑成？）" % [
++				player_spawn_positions.size(), counter + 1])
+ 		player_character.teleport_rpc.rpc(
+-			player_spawn_positions[counter].global_position
++			player_spawn_positions[counter % player_spawn_positions.size()].global_position
+ 		)
+ 		players[player_presence.network_id] = player_character
+ 		add_active_player_rpc.rpc(player_presence.network_id)
+@@ -117,6 +174,111 @@ func spawn_players():
+ 
+ 		counter += 1
+ 
++# [MP8] 出生点 4 → 8：按列等分插入。原版那 4 个一个字节不动。
++func _mp8_expand_spawns() -> void :
++
++	var args := Array(OS.get_cmdline_args())
++	mp8_player_count = PlayerManager.player_presences.size()
++
++	if player_spawn_positions_node == null:
++		push_warning("[MP8] 隧道险境：没有出生点容器，8 席不做")
++		return
++
++	var originals: Array = []
++	for child in player_spawn_positions_node.get_children():
++		if child is Node3D:
++			originals.append(child)
++
++	var n: int = originals.size()
++	if n == 0:
++		push_warning("[MP8] 隧道险境：出生点容器是空的，8 席不做")
++		return
++
++	if args.has("mp8noexpand"):
++		print("[MP8] 隧道险境：mp8noexpand，出生点一个字不改（纯原版对照组，⚠️ 必须配 4 人）")
++		return
++
++	# ⚠️ ≤4 人一律不动。本局 spawn_players() 是 **shuffle 后按下标取**的，
++	# 多补的点会被 4 人局抽中 —— 补了就不再"与原版逐值一致"。
++	# （致命反弹/立足之本同样是 shuffle，立足之本就是这么把关的。）
++	if mp8_player_count <= 4:
++		print("[MP8] 隧道险境：%d 人，用原版 %d 个出生点，一个字不改" % [mp8_player_count, n])
++		return
++
++	var want: int = mini(maxi(mp8_player_count, 5), MP8_MAX_PLAYERS)
++	if n >= want:
++		print("[MP8] 隧道险境：出生点已有 %d 个（要 %d），不用补" % [n, want])
++		return
++
++	# 按 x 正负分两列（原版就是左右各两个）
++	var columns: Dictionary = {"left": [], "right": []}
++	for m in originals:
++		if m.position.x < 0.0:
++			columns["left"].append(m)
++		else:
++			columns["right"].append(m)
++
++	# 每列按 z 排序，便于在端点之间插值
++	for key in columns.keys():
++		columns[key].sort_custom(func(a, b): return a.position.z < b.position.z)
++
++	var need: int = want - n
++	var added: Array = []
++
++	# 需要的点在两列之间轮流分配，保证左右对称
++	var order: Array = ["left", "right"]
++	var per_column: Dictionary = {"left": 0, "right": 0}
++	for j in need:
++		per_column[order[j % order.size()]] += 1
++
++	for key in order:
++
++		var col: Array = columns[key]
++		var add: int = per_column[key]
++		if add <= 0:
++			continue
++
++		# 一列至少要两个端点才能插值；只有一个就退化成"贴着它排"，
++		# 但原版是 2/2，走不到这条。真走到了就报出来，别静默摆歪。
++		if col.size() < 2:
++			push_warning("[MP8] 隧道险境：%s 列只有 %d 个原版点，插不了值，这一列跳过" % [key, col.size()])
++			continue
++
++		var a: Node3D = col[0]
++		var b: Node3D = col[col.size() - 1]
++
++		for i in add:
++			# t 取 1/(add+1) .. add/(add+1)，把新点均匀铺在两端点之间（含 x 一起 lerp）
++			var t: float = float(i + 1) / float(add + 1)
++			var extra: Node3D = a.duplicate()
++			extra.name = "MP8Spawn_%s_%d" % [key, i]
++			player_spawn_positions_node.add_child(extra)
++			extra.position = a.position.lerp(b.position, t)
++			added.append(extra)
++
++	# 自证：把最小间距算出来打进日志。摆位改动必须能对着数字核，不能只说"摆好了"。
++	var all_points: Array = originals + added
++	var min_gap: float = INF
++	var min_pair: String = ""
++	for i in all_points.size():
++		for j in range(i + 1, all_points.size()):
++			var d: float = all_points[i].position.distance_to(all_points[j].position)
++			if d < min_gap:
++				min_gap = d
++				min_pair = "%s↔%s" % [all_points[i].name, all_points[j].name]
++
++	var parts: Array = []
++	for m in added:
++		parts.append("%s(%.2f,%.2f)" % [m.name, m.position.x, m.position.z])
++
++	print("[MP8] 隧道险境：%d 人 —— 出生点 %d → %d，最小间距 %.2f 米（%s）；新增 %s" % [
++		mp8_player_count, n, all_points.size(), min_gap, min_pair, ", ".join(parts)])
++
++	if min_gap < MP8_MIN_SPAWN_GAP:
++		push_warning("[MP8] 隧道险境：最小间距 %.2f 米 < %.2f，可能有人叠着生成" % [
++			min_gap, MP8_MIN_SPAWN_GAP])
++
++
+ func all_players_loaded():
+ 	super.all_players_loaded()
+ 
+@@ -176,7 +338,21 @@ func check_game_end():
+ 	for network_id in players.keys():
+ 		if dead_players.has(network_id):
+ 			continue
+-		player_scores[network_id] = player_count
++		# [MP8] ② 得分（2026-08-17 用户定案）：**只堵掉线洞，其余一个字不改。**
++		#
++		# 原版是 `player_scores[network_id] = player_count`，而 `player_count` 是
++		# **开局人数**（spawn_players 里从 player_presences.size() 取的）。
++		# 中途掉线的人会被 remove_player_rpc 从 players/active_players 里移走，
++		# 但**不会进 dead_players** —— 于是 player_count 比实际参与结算的人数大，
++		# 冠军凭空多拿几分。用"死亡人数 + 1"推 = 比最后一个死的多 1 名，掉多少人都对。
++		#
++		# ⚠️⚠️ **`+ 1` 一个字都不能省。** 省了就变成 `dead_players.size()`，
++		# 那是**压平冠亚断层**（残骸平台 T13 / 碎骨者 T24 的做法）——
++		# 本局用户明确选了**保留断层**，跟致命反弹 T26 一样。
++		#   8 人无掉线：dead=7 → 阵亡者 0..6，冠军 7+1=8，断层仍是 2 分（与原版逐值一致）
++		#   8 人掉 1 个：dead=6 → 阵亡者 0..5，冠军 6+1=7（原版会给 8，多算了掉线那个人）
++		# 无人掉线时与原版**完全等价**，所以这条改动不会动到已有的 4 人局手感。
++		player_scores[network_id] = dead_players.size() + 1
+ 
+ 
+ 
+@@ -186,6 +362,8 @@ func check_game_end():
+ 				active_player.trigger_achievement_rpc.rpc()
+ 				break
+ 
++	_mp8_log_scores()
++
+ 	player_scores_finalized.emit(player_scores)
+ 
+ 	await get_tree().create_timer(2.0).timeout
+@@ -194,12 +372,53 @@ func check_game_end():
+ 	state_machine.transition_to_rpc.rpc(&"Finished")
+ 	set_effects_visibility_rpc.rpc(false)
+ 
++# [MP8] 结算日志。纯为事后核对 —— 配合「验收口径」把 ② 的判据降级成
++# "真人玩到时顺手瞄一眼"。只在服务器侧跑（check_game_end 本来就是服务器调的）。
++#
++# 当前算分（2026-08-17 定案后）：
++#   第 i 个死的拿 i 分（**同一趟车里死的人仍分先后，用户定案保持原版不动**）
++#   幸存者拿 dead_players.size() + 1（只堵掉线洞，断层保留）
++#
++# ⚠️ 掉线人数是推出来的：开局人数 − 阵亡 − 幸存。用它核对冠军分对不对。
++func _mp8_log_scores() -> void :
++
++	var rows := PackedStringArray()
++
++	for i in dead_players.size():
++		var id: int = dead_players[i]
++		rows.append("第%d个死 %s %d分" % [i + 1, _mp8_name(id), i])
++
++	var survivors: int = 0
++	for network_id in active_players.keys():
++		rows.append("幸存 %s %d分" % [_mp8_name(network_id), dead_players.size() + 1])
++		survivors += 1
++		break
++
++	print("[MP8] 隧道险境结算（开局 %d 人 / %d 人阵亡 / 推算掉线 %d 人）：%s" % [
++		player_count, dead_players.size(),
++		maxi(player_count - dead_players.size() - survivors, 0),
++		" | ".join(rows)
++	])
++
++
++func _mp8_name(network_id: int) -> String :
++
++	if players.has(network_id) and is_instance_valid(players[network_id]):
++		return String(players[network_id].player_presence.network_name)
++	return "id%d" % network_id
++
++
+ @rpc("any_peer", "call_local", "reliable")
+ func remove_player_rpc(_network_id: int):
+ 
+ 	var player_instance = players.get(_network_id, null)
+ 	if player_instance:
+-		player_instance.cleanup_rpc.rpc()
++		# ═══════ [MP8] 2026-08-19 修：cleanup 只由服务器发一次 ═══════
++		# 与「内部暗手」同一处改动，理由见 knife_at_the_office.remove_player_rpc。
++		# 外层是 call_local 广播 → 8 个端都跑到这里 → 旧版 8 次广播 / 64 次投递，
++		# 而函数体只在 authority 端有效果，第一次就 queue_free 了。
++		if multiplayer.is_server():
++			player_instance.cleanup_rpc.rpc()
+ 		player_instance.queue_free()
+ 		players.erase(_network_id)
+ 		active_players.erase(_network_id)

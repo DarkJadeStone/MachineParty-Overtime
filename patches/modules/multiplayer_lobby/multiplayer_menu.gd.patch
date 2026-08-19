@@ -1,0 +1,245 @@
+diff --git a/modules/multiplayer_lobby/multiplayer_menu.gd b/modules/multiplayer_lobby/multiplayer_menu.gd
+--- a/modules/multiplayer_lobby/multiplayer_menu.gd
++++ b/modules/multiplayer_lobby/multiplayer_menu.gd
+@@ -17,7 +17,7 @@ var player_order_by_seat: Dictionary[int, int] = {
+ 	0: -1, 
+ 	1: -1, 
+ 	2: -1, 
+-	3: -1
++	3: -1, 4: -1, 5: -1, 6: -1, 7: -1  # [MP8] 原为 4 席
+ }
+ 
+ func _ready() -> void :
+@@ -97,48 +97,128 @@ func _ready() -> void :
+ 	var arguments = Array(OS.get_cmdline_args())
+ 	var m_size = DisplayServer.screen_get_usable_rect()
+ 
+-	if arguments.has("1"):
+-		debug_lobby_handler.name_entry.text = "P1"
+-		get_window().size = Vector2(m_size.size.x * 0.5, m_size.size.y * 0.5)
+-		get_window().position = Vector2(m_size.position.x + (m_size.size.x * 0.5), 0.0)
+-
+-	elif arguments.has("2"):
+-		debug_lobby_handler.name_entry.text = "P2"
+-		get_window().size = Vector2(m_size.size.x * 0.5, m_size.size.y * 0.5)
+-		get_window().position = Vector2(m_size.position.x, 0.0)
+-
+-	elif arguments.has("3"):
+-		debug_lobby_handler.name_entry.text = "P3"
+-		get_window().size = Vector2(m_size.size.x * 0.5, m_size.size.y * 0.5)
+-		get_window().position = Vector2(m_size.position.x + (m_size.size.x * 0.5), m_size.size.y * 0.5)
++	# [MP8] 作者内置的 1~4 测试台扩到 MAX_PLAYERS 个。
++	# 同时去掉原来的 get_window().size/position 强改——它会覆盖命令行的
++	# --resolution/--position，8 开的时候窗口会互相叠住看不见。
++	var mp8_index: int = 0
++	for k in range(1, NetworkManager.MAX_PLAYERS + 1):
++		if arguments.has(str(k)):
++			mp8_index = k
++			break
+ 
+-	elif arguments.has("4"):
+-		debug_lobby_handler.name_entry.text = "P4"
+-		get_window().size = Vector2(m_size.size.x * 0.5, m_size.size.y * 0.5)
+-		get_window().position = Vector2(m_size.position.x, m_size.size.y * 0.5)
++	if mp8_index > 0:
++		debug_lobby_handler.name_entry.text = "P%d" % mp8_index
++		# [MP8] mp8longname：测试名字换成 20 个字符。
++		# 默认的 "P1".."P8" 只有两个字符，**拿它测排版会骗人**——
++		# 名字栏的宽度看不出来，20 字符上限改没改也看不出来。
++		if arguments.has("mp8longname"):
++			debug_lobby_handler.name_entry.text = (
++				("P%d" % mp8_index) + "_ABCDEFGHIJKLMNOPQRST"
++			).left(20)
++		# [MP8] 8 个实例同时出声会吵成一团，所以除了一个之外全部静音。
++		#
++		# ⚠️ **这条会严重干扰音效测试**（2026-08-15 踩到）：
++		# 猎人的拉栓 / 装弹 / 开镜声都是**只在自己机器上响**的第一人称音效
++		# （代码里按 multiplayer authority 判的），而开枪声是走 RPC 广播的。
++		# 于是从没静音的那个实例听过去，另一个猎人**只有枪声、没有拉栓声**——
++		# 看起来像"第二个猎人缺音效"，其实是这里把它静音了。
++		#
++		# 要听哪个实例的声音就传 mp8audio=<序号>，默认 1。
++		var mp8_audio_index: int = 1
++		for a in arguments:
++			var s_audio: String = String(a)
++			if s_audio.begins_with("mp8audio="):
++				mp8_audio_index = int(s_audio.substr(9))
++		# mp8audio=0 表示**谁都不静音**（要同时听两个猎人各自的第一人称音效时用，
++		# 代价是几个实例的环境音会叠在一起，吵）
++		if mp8_audio_index > 0 and mp8_index != mp8_audio_index:
++			AudioServer.set_bus_mute(0, true)
++		elif mp8_audio_index <= 0:
++			print("[MP8] 本实例（P%d）保留声音（mp8audio=0：全都不静音）" % mp8_index)
++		else:
++			print("[MP8] 本实例（P%d）保留声音，其余静音" % mp8_index)
+ 
+ 	if arguments.has("host"):
++		print("[MP8] 自动 HOST（P%d）" % mp8_index)
+ 		_on_host_button_pressed()
+ 
+-	elif arguments.has("join"):
+-		if arguments.has("1"):
+-			await get_tree().create_timer(0.2, false).timeout
+-			AudioServer.set_bus_mute(0, true)
+-		if arguments.has("2"):
+-			await get_tree().create_timer(0.6, false).timeout
+-		if arguments.has("3"):
+-			await get_tree().create_timer(0.8, false).timeout
+-			AudioServer.set_bus_mute(0, true)
+-		if arguments.has("4"):
+-			await get_tree().create_timer(1, false).timeout
+-			AudioServer.set_bus_mute(0, true)
++		# [MP8] 自动开局开关：mp8start = 等满 MAX_PLAYERS；mp8start=<n> = 等满 n 人
++		var mp8_want: int = 0
++		for a in arguments:
++			var s: String = String(a)
++			if s == "mp8start":
++				mp8_want = NetworkManager.MAX_PLAYERS
++			elif s.begins_with("mp8start="):
++				mp8_want = maxi(int(s.substr(9)), 2)
++		if mp8_want > 0:
++			_mp8_autostart(mp8_want)
+ 
++	elif arguments.has("join"):
++		await get_tree().create_timer(0.4 * float(maxi(mp8_index, 1)), false).timeout
++		print("[MP8] 自动 JOIN（P%d）" % mp8_index)
+ 		_on_join_button_pressed()
+ 
+ 	lobby_handler.root.visible = false
+ 	hide_screens()
+ 	debug_lobby_handler.set_active(true)
+ 
++# [MP8] 自动开局：人到齐后房主自己按 START，省掉人工点按钮。
++# 只在 host 实例上跑；超时就放弃，不会把大厅卡死。
++func _mp8_autostart(want: int) -> void :
++
++	print("[MP8] autostart：等 %d 人到齐" % want)
++
++	var waited: int = 0
++	while waited < 180:
++
++		await get_tree().create_timer(1.0).timeout
++		waited += 1
++
++		if not NetworkManager.active_backend:
++			continue
++
++		var n: int = NetworkManager.active_backend.connected_players.size()
++
++		if waited % 5 == 0:
++			print("[MP8] autostart：已连 %d/%d（%d 秒）" % [n, want, waited])
++
++		if n >= want:
++			print("[MP8] autostart：%d 人到齐，3 秒后开局" % n)
++			# [MP8] 大厅 8 席位宣传图就在这 3 秒里拍 —— 这是**唯一**"人全到齐、
++			# 还没开局"的窗口，错过就只剩空椅子或已经进小游戏了。
++			# 把原来一次 3 秒的等待劈成 1.5 + 1.5，总时长不变，不影响开局时序。
++			await get_tree().create_timer(1.5).timeout
++			_mp8_lobby_shot()
++			await get_tree().create_timer(1.5).timeout
++			print("[MP8] autostart：开局")
++			_on_lobby_start_button_pressed()
++			return
++
++	print("[MP8] autostart：等了 %d 秒还没到 %d 人，放弃" % [waited, want])
++
++
++# [MP8] 大厅 8 席位宣传图（mp8promo）。
++#
++# 和 game.gd 里那套局内截图是**两回事**：那个挂在 load_minigame() 上，
++# 大厅阶段 game.gd 还没进树，够不着。所以大厅这张只能在这里单独拍。
++#
++# 只在房主实例上跑（autostart 本来就只在房主上跑），拍的是房主的视口 ——
++# 大厅摄像机是固定机位，八个席位都在取景框内（T1~T3 已看图验收过）。
++#
++# 落点：user://mp8_promo_lobby.png
++func _mp8_lobby_shot() -> void :
++
++	if not Array(OS.get_cmdline_args()).has("mp8promo"):
++		return
++
++	await RenderingServer.frame_post_draw
++
++	var img: Image = get_viewport().get_texture().get_image()
++	if img != null:
++		img.save_png("user://mp8_promo_lobby.png")
++		print("[MP8] mp8promo：已存 user://mp8_promo_lobby.png")
++
++
+ func hide_screens():
+ 
+ 	for screen in screen_handlers:
+@@ -151,8 +231,14 @@ func setup_lobby_view():
+ func update_player_list():
+ 
+ 	if not NetworkManager.active_backend:
++		print("[MP8] update_player_list: 没有 active_backend，跳过")
+ 		return
+ 
++	print("[MP8] update_player_list seats=%s connected=%d slots=%d" % [
++		str(player_order_by_seat.values()),
++		NetworkManager.active_backend.connected_players.size(),
++		lobby_handler.players.size(),
++	])
+ 	lobby_handler.update_player_list(player_order_by_seat.values())
+ 
+ func show_message(_message: String):
+@@ -179,17 +265,57 @@ func _on_customization_button_pressed():
+ 
+ 	get_tree().change_scene_to_file("res://scenes/character_customization.tscn")
+ 
++# [MP8] 建房/入房的幂等保护（2026-08-17）
++#
++# 起因：8 人测试台跑碎骨者时，P1 日志里出现**两次** `HOST 按钮被按下` ——
++# 自动 HOST 只会调一次（arguments.has("host") 那条路），所以第二次必然来自 UI 按钮。
++# 测试台每次都要先点窗口才能拿焦点（坑第 19 条：GameManager.game_focused 初值 false），
++# 而 HOST 按钮就在那块画面上，**点窗口拿焦点时很容易顺手点到它**。
++#
++# 后果不是"多按一下没事"：start_host() 会重建 ENet 服务器、并把 player_order_by_seat
++# 整个重置。已经连进来的 peer 就此丢失，之后 JOIN 的也进不来 ——
++# 现场表现是「P1 好像没建房，其余 7 个全卡 loading」，很难往误点上想。
++#
++# ⚠️⚠️ 判据必须用 **NetworkManager.active_backend**，不要碰 SceneTree 的 multiplayer：
++#
++#   第一版写的是 `multiplayer.has_multiplayer_peer()` + `get_connection_status()`，
++#   结果**把自动 HOST 自己挡掉了**（日志：自动 HOST（P1）→ 紧接着"已经在联机中，忽略"）。
++#   根因是 Godot 4 默认就给 SceneTree 挂了一个 **OfflineMultiplayerPeer**：
++#   `has_multiplayer_peer()` 恒 true、`get_connection_status()` 恒 CONNECTED
++#   （离线 peer 认为自己就是 id=1 的"已连接"节点）。这个判据永远为真。
++#
++#   `active_backend` 是本项目自己的字段：初值 null，只有 create_backend() 里
++#   set_active_backend() 会给它赋值，reset()/断开时置回 null —— 语义就是"建过房/连过没"。
++#   而且 Enet 分支里 set_active_backend() 是同步执行的（没有 await），
++#   第二次误点进来时它已经非 null，挡得住。
++func _mp8_net_busy() -> bool :
++
++	return NetworkManager.active_backend != null
++
++
+ func _on_host_button_pressed():
++	if _mp8_net_busy():
++		# 把 backend 打出来：万一这条又误挡了自动 HOST，日志能直接看出是谁占着
++		print("[MP8] HOST 被按了，但已经有 backend（%s）—— 忽略（防误点重建服务器）" % str(NetworkManager.active_backend))
++		return
++	print("[MP8] HOST 按钮被按下")
+ 	NetworkManager.start_host(debug_lobby_handler.name_entry.text)
+ 
+-	player_order_by_seat = {0: 1, 1: -1, 2: -1, 3: -1}
++	player_order_by_seat = {0: 1, 1: -1, 2: -1, 3: -1, 4: -1, 5: -1, 6: -1, 7: -1}  # [MP8]
+ 	player_list_updated_rpc.rpc(player_order_by_seat)
+ 
+ func _on_steam_host_button_pressed():
++	if _mp8_net_busy():
++		print("[MP8] STEAM HOST 被按了，但本机已经在联机中 —— 忽略")
++		return
+ 	NetworkManager.active_backend_type = NetworkManager.NetworkBackendType.Steam
+ 	NetworkManager.start_host(debug_lobby_handler.name_entry.text)
+ 
+ func _on_join_button_pressed():
++	if _mp8_net_busy():
++		print("[MP8] JOIN 被按了，但本机已经在联机中 —— 忽略（防误点重连）")
++		return
++	print("[MP8] JOIN 按钮被按下")
+ 	NetworkManager.start_client(debug_lobby_handler.name_entry.text)
+ 
+ 	update_player_list()

@@ -1,0 +1,55 @@
+diff --git a/minigames/escalator_pit/components/player/scripts/escalator_pit_player.gd b/minigames/escalator_pit/components/player/scripts/escalator_pit_player.gd
+--- a/minigames/escalator_pit/components/player/scripts/escalator_pit_player.gd
++++ b/minigames/escalator_pit/components/player/scripts/escalator_pit_player.gd
+@@ -233,12 +233,22 @@ func _physics_process(delta: float) -> void :
+ 
+ func show_death_indicator():
+ 	await get_tree().create_timer(1.2, false).timeout
+-	SoundManager.play_omni_rpc.rpc(
+-		"escalator_pit_fail_alert", 
+-		"SFX", 
+-		4, 
+-		randf_range(0.95, 1.05), 
+-	)
++
++	# ═══════ [MP8] 2026-08-19 修：失败提示音只由服务器发起 ═══════
++	# 本函数由 `kill_rpc`（call_local 广播）调用，8 个端都会跑到这里。
++	# 旧版 8 个端各自 `play_omni_rpc.rpc()` 广播一遍 → 每个端收 8 份，
++	# 而 omni 是**从 32 路池取空闲槽**的，8 份 = 8 个声部同时响。
++	# 8 人局里人接连掉下去时，这个 alert 会糊成一片。
++	#
++	# ⚠️ 下面三行指示灯必须**所有端都执行**，所以 guard 只包住音效，不能早退整个函数。
++	if multiplayer.is_server():
++		SoundManager.play_omni_rpc.rpc(
++			"escalator_pit_fail_alert", 
++			"SFX", 
++			4, 
++			randf_range(0.95, 1.05), 
++		)
++
+ 	input_indicator.visible = false
+ 	win_indicator.visible = false
+ 	lose_indicator.visible = true
+@@ -308,13 +318,15 @@ func kill_rpc():
+ 	tween.tween_property(ik_torso, "influence", 0, blend_time)
+ 	tween.tween_property(character_animation_tree, "parameters/death_blend/blend_amount", 1, blend_time)
+ 
+-	SoundManager.play_positional_rpc.rpc(
+-		"escalator_pit_death", 
+-		global_position, 
+-		"SFX", 
+-		1, 
+-		randf_range(0.95, 1), 
+-	)
++	# [MP8] 2026-08-19：死亡音只由服务器发起（理由同 show_death_indicator）。
++	if multiplayer.is_server():
++		SoundManager.play_positional_rpc.rpc(
++			"escalator_pit_death", 
++			global_position, 
++			"SFX", 
++			1, 
++			randf_range(0.95, 1), 
++		)
+ 
+ 	show_death_indicator()
+ 
