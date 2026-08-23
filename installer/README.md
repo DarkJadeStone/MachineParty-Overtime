@@ -68,6 +68,13 @@ Your game is not v2.1.2 (it updated), or another mod is installed. **Nothing was
 fix: Steam → right click the game → Properties → Installed Files → Verify integrity, then check
 whether Overtime has a build for your version.
 
+**Can I use this together with a mod loader?**
+**Not right now.** Overtime installs by rewriting the game's `.pck`, so it is mutually exclusive with
+MachinePartyModLoader and any other tool that also modifies the PCK — pick one. The reason: the
+player cap lives in `const MAX_PLAYERS`, and GDScript inlines constants at compile time, so it
+cannot be changed at runtime, only by replacing compiled bytecode inside the PCK. Loaders that
+override scripts by `extends`-ing them cannot reach an inlined constant.
+
 **The launcher cannot find my game.**
 Use **Browse…** and pick the folder that contains `Machine Party.pck`
 (Steam → right click the game → Manage → Browse local files).
@@ -152,6 +159,12 @@ Steam 更新了游戏，或者你点过「验证游戏文件的完整性」—�
 **提示「当前数据包跟本 mod 认识的原版对不上」？**
 说明你那份游戏不是 v2.1.2（更新了），或者装过别的 mod。**程序没有动你的文件。**
 最稳的办法：先用 Steam「验证游戏文件的完整性」拿回原版，再看 Overtime 有没有出适配版本。
+
+**能和 mod loader 一起用吗？**
+**目前不能。** Overtime 是靠重打游戏数据包（`.pck`）安装的，跟 MachinePartyModLoader
+以及任何同样改 PCK 的工具**互斥，请二选一**。原因：人数上限写在 `const MAX_PLAYERS` 里，
+而 GDScript 的常量是编译期内联的，运行时改不了，只能替换包里已编译的字节码；
+而那类用 `extends` 继承原脚本做覆盖的加载器，够不到一个已经内联的常量。
 
 **启动器找不到我的游戏？**
 点「**浏览…**」，选那个装着 `Machine Party.pck` 的目录
