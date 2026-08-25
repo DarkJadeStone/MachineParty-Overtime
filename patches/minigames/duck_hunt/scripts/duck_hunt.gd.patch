@@ -133,7 +133,7 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
  var spectate_duck_players: Array[DuckHuntDuckPlayer]
  var spectator_index: int = 0
  var spectate_player: DuckHuntDuckPlayer
-@@ -63,6 +186,140 @@ var player_scores: Dictionary[int, int]
+@@ -63,6 +186,181 @@ var player_scores: Dictionary[int, int]
  var player_count: int
  var hunter_name: String = ""
  
@@ -202,6 +202,24 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
 +		)
 +
 +
++# [MP8] 本回合是不是「独狼回合」—— 本该两个猎人却只有一个
++# （7 人局的最后一个小回合：possible_hunters 每轮 pop 两个，7 个人分成 2/2/2/1；
++#  或者传了 mp8lone 测试开关）。
++#
++# ⚠️ 与 hunter_player.gd 的 `_mp8_is_lone_hunter()`
++# （`mp8_hunter_total == 1 and mp8_player_count >= 6`）是**同一条判据**，
++# 只是这边用客户端拿得到的数据表达 —— `hunter_players` 只有服务器有，
++# 而 `mp8_hunter_names` 是 `set_hunter_names_rpc` 广播下来的。
++#
++# 🩸 2026-08-24 用户 7 人实机报的：这条判据原先只写在 `_mp8_setup_countdown()` 里，
++# 两个角色揭示函数各自漏掉，于是 7 人局最后一轮**倒计时说「猎人已大幅增强」、
++# 揭示屏说「削弱已启动」** —— 同一局的两块屏互相打架。
++# 收成一个函数就是为了不再出现第二份抄写。
++# **今后任何按强弱分支的显示，一律调这个函数，不要再抄那行表达式。**
++func _mp8_is_lone_round() -> bool :
++	return mp8_hunter_names.size() == 1 and mp8_total_players >= MP8_TWO_HUNTERS_FROM
++
++
 +func mp8_role_reveal_bbcode() -> String:
 +
 +	var zh: bool = TranslationServer.get_locale().to_upper().begins_with("ZH")
@@ -215,20 +233,28 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
 +	for n in mp8_hunter_names:
 +		lines.append("[color=%s]%s[/color]" % [MP8_ROLE_COLOR_NAME, String(n).to_upper()])
 +
-+	# 三种状态各有各的提示：增强红、削弱蓝、**无效果绿**（≤4 和 8 人是基准档）
-+	match mp8_total_players:
-+		5:
-+			lines.append("[color=%s]%s[/color]" % [
-+				MP8_ROLE_COLOR_BUFF, "增强已启动" if zh else "BUFF ENGAGED"
-+			])
-+		6, 7:
-+			lines.append("[color=%s]%s[/color]" % [
-+				MP8_ROLE_COLOR_NERF, "削弱已启动" if zh else "NERF ENGAGED"
-+			])
-+		_:
-+			lines.append("[color=%s]%s[/color]" % [
-+				MP8_ROLE_COLOR_NONE, "无效果" if zh else "NO EFFECT"
-+			])
++	# [MP8] 🩸 独狼回合先判 —— 那一轮猎人拿的是**独狼专属参数**
++	# （hunter_player.gd 的 mp8_lone_hunter_magazine / _cycle），和下面这张
++	# 按总人数分的五档表根本没关系。判据见 _mp8_is_lone_round() 上的说明。
++	if _mp8_is_lone_round():
++		lines.append("[color=%s]%s[/color]" % [
++			MP8_ROLE_COLOR_BUFF, "大幅增强已启动" if zh else "GREATLY BUFFED"
++		])
++	else:
++		# 三种状态各有各的提示：增强红、削弱蓝、**无效果绿**（≤4 和 8 人是基准档）
++		match mp8_total_players:
++			5:
++				lines.append("[color=%s]%s[/color]" % [
++					MP8_ROLE_COLOR_BUFF, "增强已启动" if zh else "BUFF ENGAGED"
++				])
++			6, 7:
++				lines.append("[color=%s]%s[/color]" % [
++					MP8_ROLE_COLOR_NERF, "削弱已启动" if zh else "NERF ENGAGED"
++				])
++			_:
++				lines.append("[color=%s]%s[/color]" % [
++					MP8_ROLE_COLOR_NONE, "无效果" if zh else "NO EFFECT"
++				])
 +
 +	return "[center]" + "\n".join(lines) + "[/center]"
 +
@@ -256,16 +282,31 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
 +		head = ("双猎人：%s" % joined) if zh else ("HUNTERS: %s" % joined)
 +
 +	# 强弱提示：只有偏离基准的档位才提示
++	#
++	# [MP8] 🩸 独狼回合先判，理由同 mp8_role_reveal_bbcode()（同一个 bug 的另一半）。
++	# ⚠️ 这里**故意不写具体数值**：独狼那两个数是 hunter_player 上的 @export，
++	# 本文件够不着，抄一份过来迟早对不上。措辞与倒计时那行保持一致。
 +	var tip: String = ""
-+	match mp8_total_players:
-+		5:
-+			tip = "猎人强化　弹夹 12・射速 0.70" if zh else "HUNTER BUFFED  MAG 12 / CYCLE 0.70"
-+		6:
-+			tip = "猎人削弱　弹夹 7・射速 1.00" if zh else "HUNTER NERFED  MAG 7 / CYCLE 1.00"
-+		7:
-+			tip = "猎人削弱　弹夹 8・射速 0.80" if zh else "HUNTER NERFED  MAG 8 / CYCLE 0.80"
-+		8:
-+			tip = "基准配置　弹夹 10・射速 0.80" if zh else "BASELINE  MAG 10 / CYCLE 0.80"
++	if _mp8_is_lone_round():
++		tip = "猎人大幅增强　独狼回合" if zh else "HUNTER GREATLY BUFFED  LONE ROUND"
++	else:
++		# 🩸 这几行的数字是**手抄**自 hunter_player.gd 的两张 @export 表
++		# （`magazine_capacity_by_player_count` / `cycle_time_by_player_count`）——
++		# duck_hunt.gd 够不着它们：那两张表在**猎人实例**上，而鸭子端根本没有猎人实例。
++		# **改表就必须回来改这里**，两处对不上不会有任何东西报错。
++		#
++		# 2026-08-24 逐值对账时抓到一处**已经漂了 9 天**的：5 人档 08-15 就从 0.70
++		# 改成了 0.42，这行还写着 0.70。已改正。四档现在逐值一致：
++		#   4 人 10 / 0.80（不显示）　5 人 12 / 0.42　6 人 7 / 1.375　7 人 8 / 0.80　8 人 10 / 0.80
++		match mp8_total_players:
++			5:
++				tip = "猎人强化　弹夹 12・射速 0.42" if zh else "HUNTER BUFFED  MAG 12 / CYCLE 0.42"
++			6:
++				tip = "猎人削弱　弹夹 7・射速 1.375" if zh else "HUNTER NERFED  MAG 7 / CYCLE 1.375"
++			7:
++				tip = "猎人削弱　弹夹 8・射速 0.80" if zh else "HUNTER NERFED  MAG 8 / CYCLE 0.80"
++			8:
++				tip = "基准配置　弹夹 10・射速 0.80" if zh else "BASELINE  MAG 10 / CYCLE 0.80"
 +
 +	if tip == "":
 +		return head
@@ -274,7 +315,7 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
  var last_spectate_camera_transform: Transform3D
  
  var local_duck_players: Dictionary[int, DuckHuntDuckPlayer]
-@@ -216,17 +473,47 @@ func spawn_players():
+@@ -216,17 +514,47 @@ func spawn_players():
  		local_game_players_order[player_presence] = null
  
  
@@ -325,7 +366,7 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
  
  	var spawn_positions = duck_player_spawn_positions.get_children()
  	spawn_positions.shuffle()
-@@ -235,7 +522,7 @@ func spawn_players():
+@@ -235,7 +563,7 @@ func spawn_players():
  	var counter: int = 0
  	for network_id in PlayerManager.player_presences.keys():
  
@@ -334,7 +375,7 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
  			continue
  
  		player_presence = PlayerManager.player_presences[network_id]
-@@ -261,18 +548,11 @@ func spawn_players():
+@@ -261,18 +589,11 @@ func spawn_players():
  		counter += 1
  
  	duck_player_count = duck_players.size()
@@ -357,7 +398,7 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
  
  	var hunter_initialization_delay = 8.0
  	if current_round > 0:
-@@ -281,16 +561,43 @@ func spawn_players():
+@@ -281,16 +602,43 @@ func spawn_players():
  	if GameManager.local_game:
  		hunter_initialization_delay -= 2.0
  
@@ -381,16 +422,16 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
 +		)
 +
 +		hunter_player_character.initialize_hunter_rpc.rpc(hunter_initialization_delay)
- 
--	local_game_players_order[player_presence.network_id] = hunter_player_character
--	hunter_player = hunter_player_character
--	players.append(hunter_player_character)
++
 +		local_game_players_order[player_presence.network_id] = hunter_player_character
 +		hunter_players.append(hunter_player_character)
 +		players.append(hunter_player_character)
 +
 +	hunter_player = hunter_players[0] if not hunter_players.is_empty() else null
-+
+ 
+-	local_game_players_order[player_presence.network_id] = hunter_player_character
+-	hunter_player = hunter_player_character
+-	players.append(hunter_player_character)
 +	print("[MP8] 猎鸭开局：%d 人 → %d 鸭 %d 猎，猎人位 %s" % [
 +		total_players, duck_player_count, hunter_players.size(),
 +		str(hunter_names)
@@ -406,7 +447,7 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
  
  func force_game_end():
  
-@@ -317,9 +624,15 @@ func check_game_end():
+@@ -317,9 +665,15 @@ func check_game_end():
  	if resetting:
  		return
  
@@ -423,7 +464,7 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
  	if not possible_hunters.is_empty():
  		resetting = true
  		await get_tree().create_timer(3.0).timeout
-@@ -337,12 +650,23 @@ func check_game_end():
+@@ -337,12 +691,23 @@ func check_game_end():
  func set_hunter_name_rpc(_hunter_name: String):
  	hunter_name = _hunter_name
  
@@ -451,7 +492,7 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
  
  @rpc("authority", "call_local", "reliable")
  func duck_player_added_rpc(_network_id):
-@@ -368,6 +692,56 @@ func set_hunter_rpc(_network_id):
+@@ -368,6 +733,56 @@ func set_hunter_rpc(_network_id):
  
  	acknowledge_role_rpc.rpc(multiplayer.get_unique_id())
  
@@ -484,7 +525,7 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
 +		return
 +
 +	var zh: bool = TranslationServer.get_locale().to_upper().begins_with("ZH")
-+	var lone: bool = mp8_hunter_names.size() == 1 and mp8_total_players >= MP8_TWO_HUNTERS_FROM
++	var lone: bool = _mp8_is_lone_round()
 +
 +	minigame_overlay.mp8_shake_on_go = true
 +
@@ -508,7 +549,7 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
  @rpc("any_peer", "call_local", "reliable")
  func acknowledge_role_rpc(_network_id: int):
  	if not multiplayer.is_server():
-@@ -376,10 +750,14 @@ func acknowledge_role_rpc(_network_id: int):
+@@ -376,10 +791,14 @@ func acknowledge_role_rpc(_network_id: int):
  	players_acknowledged.append(_network_id)
  
  	if players_acknowledged.size() == PlayerManager.player_presences.keys().size():
@@ -524,7 +565,7 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
  			state_machine.transition_to_rpc.rpc(&"RoleReveal")
  
  @rpc("any_peer", "call_local", "reliable")
-@@ -429,7 +807,9 @@ func remove_player_rpc(_network_id: int):
+@@ -429,7 +848,9 @@ func remove_player_rpc(_network_id: int):
  			remove_spectate_player_rpc.rpc(_network_id)
  			duck_players.erase(_network_id)
  		if player_instance is DuckHuntHunterPlayer:
@@ -535,7 +576,24 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
  			duck_player_count -= 1
  
  		player_instance.queue_free()
-@@ -498,13 +878,20 @@ func _on_player_finished(_network_id: int):
+@@ -450,6 +871,16 @@ func player_disconnected(_network_id: int):
+ 
+ 	if multiplayer.is_server():
+ 		await get_tree().create_timer(1.0).timeout
++
++		# [MP8] T44 守卫：本局还没正式开始（有人卡在加载里，闸门未放行）。
++		# 猎鸭的判据是 `if not duck_players.is_empty() and not hunter_players.is_empty(): return`
++		# —— 开局前**两个都是空的**，条件为假，直接穿过去走结算。
++		# ⚠️ 缩进是**两个**制表符：调用埋在一层多余的 `if multiplayer.is_server():` 里
++		#    （函数开头已经提前返回过一次了）。完整分析见 T44。
++		if not is_all_player_loaded:
++			print("[MP8] 猎鸭：%d 掉线时本局还没开始，跳过收尾检查" % _network_id)
++			return
++
+ 		check_game_end()
+ 
+ func _on_duck_player_spectate(_network_id):
+@@ -498,13 +929,20 @@ func _on_player_finished(_network_id: int):
  			local_duck_players.erase(_network_id)
  
  	if duck_players.has(_network_id):
@@ -560,7 +618,7 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
  
  	check_game_end()
  
-@@ -517,15 +904,76 @@ func _on_player_died(_network_id: int):
+@@ -517,15 +955,76 @@ func _on_player_died(_network_id: int):
  	if duck_players.has(_network_id):
  		duck_players.erase(_network_id)
  		remove_spectate_player_rpc.rpc(_network_id)

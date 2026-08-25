@@ -1121,7 +1121,23 @@ diff --git a/minigames/knife_at_the_office/scripts/knife_at_the_office.gd b/mini
  
  
  func player_disconnected(_network_id: int):
-@@ -230,7 +1273,15 @@ func remove_player_rpc(_network_id: int):
+@@ -220,6 +1263,15 @@ func player_disconnected(_network_id: int):
+ 	remove_player_rpc.rpc(_network_id)
+ 	await get_tree().create_timer(1.0).timeout
+ 
++	# [MP8] T44 守卫：本局还没正式开始（有人卡在加载里，闸门未放行）。
++	# 此时 `spawn_players()` 还没跑过（它由 `initialize()` 触发），场上一个人都没有，
++	# 下面那句会把一局**尚未开始**的游戏当成打完了收尾。
++	# 判据是 `if active_players.size() <= 1:` 就**直接进结算**（不是 return）——空字典是 0，天然满足，比别的小游戏更容易中。
++	# 清理照做，只不做收尾。完整分析见 T44。
++	if not is_all_player_loaded:
++		print("[MP8] 内部暗手：%d 掉线时本局还没开始，跳过收尾检查" % _network_id)
++		return
++
+ 	check_game_end()
+ 
+ 
+@@ -230,7 +1282,15 @@ func remove_player_rpc(_network_id: int):
  	var player_instance = players.get(_network_id, null)
  	if player_instance:
  
@@ -1138,7 +1154,7 @@ diff --git a/minigames/knife_at_the_office/scripts/knife_at_the_office.gd b/mini
  		player_instance.queue_free()
  
  		player_scores.erase(_network_id)
-@@ -258,36 +1309,190 @@ func enable_player_fow_rpc():
+@@ -258,36 +1318,190 @@ func enable_player_fow_rpc():
  		p.set_fow_rpc.rpc(true)
  
  @rpc("any_peer", "call_local", "reliable")
@@ -1339,7 +1355,7 @@ diff --git a/minigames/knife_at_the_office/scripts/knife_at_the_office.gd b/mini
  		start_projector_hide_hunt_loop_rpc.rpc()
  	projector_started = true
  	await get_tree().create_timer(1.5).timeout
-@@ -295,12 +1500,17 @@ func _on_item_found(_network_id):
+@@ -295,12 +1509,17 @@ func _on_item_found(_network_id):
  	if not hunting_phase:
  		hunting_phase = true
  

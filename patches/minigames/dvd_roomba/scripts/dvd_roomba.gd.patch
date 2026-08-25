@@ -190,3 +190,19 @@ diff --git a/minigames/dvd_roomba/scripts/dvd_roomba.gd b/minigames/dvd_roomba/s
  	player_scores_finalized.emit(player_scores)
  
  	await get_tree().create_timer(2.0).timeout
+@@ -191,6 +350,15 @@ func player_disconnected(_network_id: int):
+ 	remove_player_rpc.rpc(_network_id)
+ 	await get_tree().create_timer(1.0).timeout
+ 
++	# [MP8] T44 守卫：本局还没正式开始（有人卡在加载里，闸门未放行）。
++	# 此时 `spawn_players()` 还没跑过（它由 `initialize()` 触发），场上一个人都没有，
++	# 下面那句会把一局**尚未开始**的游戏当成打完了收尾。
++	# 判据是 active_players.size() > 1，开局前是 0，条件为假直接穿过去结算。
++	# 清理照做，只不做收尾。完整分析见 T44。
++	if not is_all_player_loaded:
++		print("[MP8] 致命反弹：%d 掉线时本局还没开始，跳过收尾检查" % _network_id)
++		return
++
+ 	check_game_end()
+ 
+ func _on_countdown_expired():

@@ -1384,7 +1384,25 @@ diff --git a/minigames/escalator_pit/scripts/escalator_pit.gd b/minigames/escala
  func fade_in_ambience():
  
  	for speaker_controller in ambience_speaker_controllers:
-@@ -195,17 +1500,33 @@ func _on_countdown_expired():
+@@ -177,6 +1482,17 @@ func player_disconnected(_network_id: int):
+ 		player_instance.queue_free()
+ 
+ 	if multiplayer.is_server():
++
++		# [MP8] T44 守卫：本局还没正式开始（有人卡在加载里，闸门未放行）。
++		# 判据是 `active_players.size() > 1`，开局前是 0，条件为假直接穿过去结算。
++		# ⚠️ 本小游戏**没有 await**，掉线当帧就走到这里 —— 别的小游戏那 1 秒延迟
++		#    偶尔能等到闸门被别人的上报放行，这里等不到，所以更容易中招。
++		# 上面那段清理（player_characters 已用 has() 判过）照做，只不做收尾。
++		# 完整分析见 T44。
++		if not is_all_player_loaded:
++			print("[MP8] 逆向行进：%d 掉线时本局还没开始，跳过收尾检查" % _network_id)
++			return
++
+ 		check_game_end()
+ 
+ 
+@@ -195,17 +1511,33 @@ func _on_countdown_expired():
  		player.set_active_rpc.rpc(true)
  	state_machine.transition_to_rpc.rpc(&"Play")
  
@@ -1422,7 +1440,7 @@ diff --git a/minigames/escalator_pit/scripts/escalator_pit.gd b/minigames/escala
  
  		body.owner.finish_rpc.rpc()
  
-@@ -223,7 +1544,14 @@ func _on_kill_area_entered(body):
+@@ -223,7 +1555,14 @@ func _on_kill_area_entered(body):
  		active_players.erase(body.owner)
  		body.owner.kill_rpc.rpc()
  

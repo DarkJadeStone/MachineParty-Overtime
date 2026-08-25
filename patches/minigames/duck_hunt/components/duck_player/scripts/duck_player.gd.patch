@@ -1,0 +1,24 @@
+diff --git a/minigames/duck_hunt/components/duck_player/scripts/duck_player.gd b/minigames/duck_hunt/components/duck_player/scripts/duck_player.gd
+--- a/minigames/duck_hunt/components/duck_player/scripts/duck_player.gd
++++ b/minigames/duck_hunt/components/duck_player/scripts/duck_player.gd
+@@ -280,6 +280,20 @@ func set_crouching_rpc(_crouching: bool):
+ @rpc("any_peer", "call_local", "reliable")
+ func shot_rpc(_damage: int):
+ 
++	# [MP8] T47 ③：防重入。**原版这里没有这道门。**
++	#
++	# 原版是单猎人，一个人受射击冷却限制、很难同一瞬间打中同一只鸭两次，所以露不出来。
++	# **是 T6b（6 人以上双猎人）让它变可达的**：两个**互相独立**的玩家可以同时命中同一只，
++	# 两条 `shot_rpc` 都会走完下面的死亡路径 —— 血、音效、动画各来两遍。
++	#
++	# 得分侧有兜底（`duck_hunt.gd` 那段被 `duck_players.has(id)` 挡着，第二次进不去），
++	# 所以**分不会重复加**；这里挡的是表现层重复，以及 `health` 被继续往下减。
++	#
++	# ⚠️ 判据用 `active` 而不是 `health > 0`：`active` 在死亡时置 false（见下），
++	#    也在回合没开始时是 false —— 两种「不该挨枪」的情况一并覆盖。
++	if not active:
++		return
++
+ 	health -= _damage
+ 
+ 	if health > 0:

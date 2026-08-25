@@ -879,6 +879,52 @@ static class Core
         try { Process.Start("steam://validate/" + AppId); } catch { }
     }
 
+    // ── 游戏自己的日志目录（Godot 写的，不是本安装器写的那份）────────────────
+    //
+    // 排 mod 的 bug 要的是这一份。T45 那次碎骨者黑屏就卡在拿不到房主机器上的
+    // godot.log —— 让每个玩家都能两下点开自己的日志目录，就是为了堵这个缺口。
+    //
+    // ⚠️⚠️ 这里**刻意只开文件夹，不复制、不打包、不上传**，这条别改：
+    //   本 exe 未签名，而「读用户目录下的文件 → 打包 → 往外发」正是 infostealer
+    //   的行为签名。只调 explorer 打开一个目录，杀软画像一点不动。
+    //   **本文件至今零网络调用（grep 不到 System.Net / HttpClient / Socket），
+    //   别在这里开第一处。** 用户自己把文件拖出来即可。
+    //
+    // /select 会顺带把 godot.log 选中：目录里还躺着几个轮换的 godot<日期>.log，
+    // 不指一下用户不知道该拿哪个（而且 godot.log 才是当前这次的）。
+    // 文件不在就退回只开目录；目录也不在（游戏还没启动过）就返回 false，由界面提示。
+    public static string GameLogDir
+    {
+        get
+        {
+            return Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                @"Godot\app_userdata\Machine Party\logs");
+        }
+    }
+
+    public static bool OpenGameLogFolder()
+    {
+        try
+        {
+            string dir = GameLogDir;
+            string cur = Path.Combine(dir, "godot.log");
+
+            if (File.Exists(cur))
+            {
+                Process.Start("explorer.exe", "/select,\"" + cur + "\"");
+                return true;
+            }
+            if (Directory.Exists(dir))
+            {
+                Process.Start("explorer.exe", "\"" + dir + "\"");
+                return true;
+            }
+            return false;
+        }
+        catch { return false; }
+    }
+
     public static void LaunchGame()
     {
         try { Process.Start("steam://rungameid/" + AppId); } catch { }
@@ -1121,7 +1167,7 @@ class MainForm : Form
     ComboBox dirBox;
     Label    stateLabel, noteLabel;
     Panel    accentBar;
-    Button   toggleBtn, launchBtn, validateBtn, logBtn;
+    Button   toggleBtn, launchBtn, validateBtn, logBtn, gameLogBtn;
     Core.State st;
     bool busy;
 
@@ -1252,12 +1298,29 @@ class MainForm : Form
         validateBtn.Click += delegate { Core.OpenSteamValidate(); };
         Controls.Add(validateBtn);
 
-        logBtn = FlatBtn(L.T("打开日志", "Open log"), Color.White, Ghost, Muted, 8.5f, FontStyle.Regular);
+        // 两个日志入口，一个是安装器自己的、一个是游戏的 —— 标签必须分得开。
+        // 原来只有一个叫「打开日志」，加了第二个之后那个名字就有歧义了，一并改掉。
+        logBtn = FlatBtn(L.T("安装日志", "Install log"), Color.White, Ghost, Muted, 8.5f, FontStyle.Regular);
         logBtn.SetBounds(24, 318, 100, 24);
         logBtn.Click += delegate {
             try { Core.FlushLog(); Process.Start("notepad.exe", Core.LogPath); } catch { }
         };
         Controls.Add(logBtn);
+
+        // 报 bug 时要交的是这一份。见 Core.OpenGameLogFolder() 上那段说明：
+        // 只开文件夹，不复制不上传。
+        gameLogBtn = FlatBtn(L.T("游戏日志", "Game log"), Color.White, Ghost, Muted, 8.5f, FontStyle.Regular);
+        gameLogBtn.SetBounds(132, 318, 116, 24);
+        gameLogBtn.Click += delegate {
+            if (Core.OpenGameLogFolder()) return;
+            MessageBox.Show(this,
+                L.T("还没有游戏日志 —— 游戏至少要启动过一次。\n\n目录：\n",
+                    "No game logs yet — launch the game at least once.\n\nFolder:\n")
+                + Core.GameLogDir,
+                "Machine Party-Overtime",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+        };
+        Controls.Add(gameLogBtn);
 
         // ── 免费声明（红色，常驻）──────────────────────────────────────
         // 社区里有人把同类 mod 闭源收费卖，这条得让人一眼看见。

@@ -149,7 +149,38 @@ diff --git a/minigames/spine_breaker/components/player/scripts/spine_breaker_pla
  			DynamicInput.get_axis(player_presence.device_id, "up", "down")
  		).rotated(Vector3.UP, deg_to_rad(scene_rotation))
  
-@@ -167,10 +277,10 @@ func update_movement(delta: float):
+@@ -138,8 +248,29 @@ func update_throwing(_delta: float):
+ 	if not has_spine_breaker:
+ 		return
+ 
++	# ═══════ [MP8] 2026-08-19 修：这道「防止对着墙扔」的检测把人和机器也当成了墙 ═══════
++	#
++	# 用户实机报的：「有人站在面前，则无法把碎骨装置丢出」。
++	#
++	# 根因：`wall_raycast` 在 `_ready()` 里只 `add_exception(self)` —— **只排除了自己**。
++	# 而活着的玩家就在碰撞层 1 上（死亡时才 `set_collision_layer_value(1, false)`，
++	# 见本文件 break_spine 那段），碎骨装置也在层 1
++	# （`spine_breaker_device.gd` 的 `set_collision_layer_value(1, true)`）——
++	# 正好都是这条射线用来找墙的那一层。
++	# 于是只要正前方站着人、或躺着一台机器，射线就报碰撞 → 这里直接 return → 扔不出去。
++	#
++	# 顺带印证了报告的细节：**尸体不挡**，因为死亡时已经被移出层 1。
++	#
++	# 原版就有这个 bug（`src/` 里是同一行），但 4 人时场地相对空、很少正对着人站；
++	# 8 人挤在同样大的场地里，正对着人是高频事件，所以到 8 人才显形。
++	#
++	# 改成看**撞到的是什么**：只有真墙才拦，人和机器一律放行。
++	# ⚠️ RayCast3D 只报最近的那一个碰撞体，所以「人背后紧贴着墙」时这里会放行。
++	#    这是有意的取舍 —— 宁可偶尔扔到墙上，也不要出现「扔不出去」这种完全卡死的手感。
+ 	if wall_raycast.is_colliding():
+-		return
++		var wall_hit = wall_raycast.get_collider()
++		if not (wall_hit is SpineBreakerPlayer or wall_hit is SpineBreakerDevice):
++			return
+ 
+ 	if GameManager.local_game and player_presence and not player_presence.local_controller_connected:
+ 		return
+@@ -167,10 +298,10 @@ func update_movement(delta: float):
  	if movement_input.length() > Globals.Epsilon:
  
  		visuals.rotation.y = rotate_toward(
@@ -162,7 +193,7 @@ diff --git a/minigames/spine_breaker/components/player/scripts/spine_breaker_pla
  			delta * rotation_speed
  		)
  
-@@ -179,8 +289,8 @@ func update_movement(delta: float):
+@@ -179,8 +310,8 @@ func update_movement(delta: float):
  func update_animations(delta: float):
  
  	var delayed_blend = move_toward(
@@ -173,7 +204,7 @@ diff --git a/minigames/spine_breaker/components/player/scripts/spine_breaker_pla
  		delta * move_blend_multiplier
  	)
  
-@@ -203,7 +313,6 @@ func beep():
+@@ -203,7 +334,6 @@ func beep():
  
  
  
@@ -181,7 +212,7 @@ diff --git a/minigames/spine_breaker/components/player/scripts/spine_breaker_pla
  var tween_attachment: Tween
  var tween_throw: Tween
  @rpc("any_peer", "call_local", "reliable")
-@@ -212,6 +321,12 @@ func set_spine_breaker_rpc(_has_spine_breaker: bool, _thrown: bool = false, _fro
+@@ -212,6 +342,12 @@ func set_spine_breaker_rpc(_has_spine_breaker: bool, _thrown: bool = false, _fro
  	spine_breaker_visual.visible = _has_spine_breaker
  	has_spine_breaker = _has_spine_breaker
  
@@ -194,7 +225,7 @@ diff --git a/minigames/spine_breaker/components/player/scripts/spine_breaker_pla
  	if _thrown:
  		set_spinebreaker_visuals()
  		animation_tree_attached.set("parameters/blend_normal_attached/blend_amount", 0)
-@@ -313,22 +428,45 @@ func break_spine_rpc():
+@@ -313,22 +449,45 @@ func break_spine_rpc():
  		if player_presence.customization.size() > 0:
  
  			PropManager.spawn_rpc.rpc(
@@ -247,7 +278,7 @@ diff --git a/minigames/spine_breaker/components/player/scripts/spine_breaker_pla
  	spine_broken.emit()
  
  	player_name_label.visible = false
-@@ -339,7 +477,15 @@ func break_spine_rpc():
+@@ -339,7 +498,15 @@ func break_spine_rpc():
  	if multiplayer.is_server():
  
  		emit_died.emit(player_presence.network_id)
@@ -264,7 +295,7 @@ diff --git a/minigames/spine_breaker/components/player/scripts/spine_breaker_pla
  
  @rpc("any_peer", "call_local", "reliable")
  func throw_spine_breaker_rpc():
-@@ -355,12 +501,20 @@ func throw_spine_breaker_rpc():
+@@ -355,13 +522,71 @@ func throw_spine_breaker_rpc():
  
  	if multiplayer.is_server():
  
@@ -272,22 +303,71 @@ diff --git a/minigames/spine_breaker/components/player/scripts/spine_breaker_pla
 -			throw_position.global_position, 
 -			- visuals.global_basis.z, 
 -			throw_strength, 
--			get_path()
--		)
-+		# [MP8] 同上：扔的必须是背在自己身上的那台
-+		var dev: SpineBreakerDevice = _mp8_dev()
-+		# 诊断：绑定没生效时这里会打出"回退"，一眼看出是不是扔错了机器
++		# [MP8] 2026-08-25：只认**真的骑在我身上**的那台，认不出来就**什么都不扔**。
++		var dev: SpineBreakerDevice = _mp8_dev_to_throw()
++
++		if dev == null:
++			print("[MP8] 碎骨者：%s 按扔，但背上确实没有机器 —— 不扔" % String(name))
++			return
++
 +		print("[MP8] 碎骨者：%s 按扔 → %d 号机%s" % [
-+			String(name), (dev.mp8_index if dev != null else -1),
-+			("" if mp8_current_device != null else "（⚠️ 没绑定，回退到 setup 时那台）")
++			String(name), dev.mp8_index,
++			("" if dev == mp8_current_device else "（⚠️ 绑定链断过，靠 attached_to 找回）")
 +		])
-+		if dev != null:
-+			dev.try_throw_rpc.rpc(
-+				throw_position.global_position,
-+				- visuals.global_basis.z,
-+				throw_strength,
-+				get_path()
-+			)
++		dev.try_throw_rpc.rpc(
++			throw_position.global_position,
++			- visuals.global_basis.z,
++			throw_strength,
+ 			get_path()
+ 		)
  
++
++# [MP8] ═══ 按扔时该扔哪一台（2026-08-25 用户实机报的 bug）═══
++#
++# **原来这里走 `_mp8_dev()`**，它在 `mp8_current_device` 为空时**回退到 setup 时那台** ——
++# 而那台很可能正骑在**别人**背上、或者已经在空中飞。
++#
++# 房主 8-24 那局的实测（`godot.log`，6 人）：全局按扔 **159** 次，其中 **61 次**打在
++# 没绑定的装置上；deamn 一个人按扔 76 次、空扔 58 次（**76%**），
++# 伴随 **51 次 `Device: Transition From Thrown to Thrown`** 自转移 ——
++# 那就是在反复重扔一台**已经在飞**的机器。
++#
++# ### 为什么会出现「按得下去但服务器这边没绑定」
++#
++# `has_spine_breaker`（**客机**的按扔门，`update_throwing()` 第一句）与
++# `mp8_current_device`（**服务器**记的绑定）是**两份分开的状态**，
++# 由两条**不同的 RPC** 维护：`set_spine_breaker_rpc()` 与 `mp8_bind_rpc()`。
++# 两者之间只要错开一拍（或者 bind 被后粘的那台覆盖），
++# 客机就按得下去、而服务器这边是空的。
++#
++# ### 修法：问装置本人，别猜
++#
++# `attached_to` 是 `attached_state` 在**服务器**上写的权威事实（骑在谁身上）。
++#   1. 先信 `mp8_current_device`，但**必须** `attached_to == self` 才算数；
++#   2. 对不上就扫一遍场上的机器，找 `attached_to == self` 的那台；
++#   3. 都找不到 = 背上真的没有东西 → **不扔**。
++#
++# 顺带把那 51 次自转移也解决了：已经在飞的机器 `attached_to` 是 null，扫不到，自然不会被重扔。
++#
++# ⚠️ **只能在服务器调**：客机上 `attached_to` 恒为 null
++#    （装置状态机只在服务器转，见 `spine_breaker_device.gd` 里那段注释）。
++# ⚠️ `_mp8_dev()` 的回退**保留不动** —— 死亡复位那条路（`break_spine`）还在用它，
++#    那里回退到 setup 那台是"宁可挪错也别不挪"，与这里的取舍相反。
++func _mp8_dev_to_throw() -> SpineBreakerDevice :
++
++	if mp8_current_device != null and is_instance_valid(mp8_current_device) \
++			and mp8_current_device.attached_to == self:
++		return mp8_current_device
++
++	if game_instance != null:
++		var list = game_instance.get("_mp8_devices")
++		if list is Array:
++			for d in list:
++				if is_instance_valid(d) and d.attached_to == self:
++					return d
++
++	return null
++
  @rpc("any_peer", "call_local", "reliable")
  func set_active_rpc(_active: bool):
+ 	active = _active

@@ -714,7 +714,27 @@ diff --git a/minigames/exploding_collar_race/scripts/exploding_collar_race.gd b/
  	player_scores_finalized.emit(player_scores)
  
  	await get_tree().create_timer(2.0).timeout
-@@ -275,8 +933,69 @@ func _on_countdown_expired():
+@@ -255,6 +913,19 @@ func remove_active_player_rpc(_network_id: int, remove_player_character: bool =
+ 		player_characters.erase(_network_id)
+ 
+ 	if multiplayer.is_server():
++
++		# [MP8] T44 守卫：本局还没正式开始（有人卡在加载里，闸门未放行）。
++		# `check_game_end()` 的判据是 `if not active_players.is_empty(): return`
++		# —— 开局前 active_players 就是空的，条件为假，**直接穿过去结算**。
++		#
++		# ⚠️ 守卫放在**这里**而不是 player_disconnected 里：本 RPC 有两个调用点
++		#    （掉线一处、真正跑完/被炸一处），`check_game_end()` 只经由这一句到达，
++		#    挡在这里两条路一次盖住。真死那条开局前根本走不到，所以没有行为改动。
++		# 完整分析见 T44。
++		if not is_all_player_loaded:
++			print("[MP8] 雷区：%d 离场时本局还没开始，跳过收尾检查" % _network_id)
++			return
++
+ 		check_game_end()
+ 
+ 
+@@ -275,8 +946,69 @@ func _on_countdown_expired():
  
  	state_machine.transition_to_rpc.rpc(&"Play")
  

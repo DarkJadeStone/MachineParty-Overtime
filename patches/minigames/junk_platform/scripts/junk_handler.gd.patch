@@ -1,7 +1,7 @@
 diff --git a/minigames/junk_platform/scripts/junk_handler.gd b/minigames/junk_platform/scripts/junk_handler.gd
 --- a/minigames/junk_platform/scripts/junk_handler.gd
 +++ b/minigames/junk_platform/scripts/junk_handler.gd
-@@ -11,6 +11,32 @@ const junk_scene = preload("uid://c0tipjbyg5ofd")
+@@ -11,6 +11,37 @@ const junk_scene = preload("uid://c0tipjbyg5ofd")
  @export var max_junk: int = 40
  @export var platform_radius: float = 6.0
  
@@ -26,7 +26,12 @@ diff --git a/minigames/junk_platform/scripts/junk_handler.gd b/minigames/junk_pl
 +# 修法：服务器每物理帧给每块**在场且没人拿着**的残骸记「静止了多久」，
 +# 超过 mp8_stuck_recycle_time 就走和回收区**完全同一条路**（reset_rpc + 进池），
 +# 下一个 tick 它就会被重新投放。池子恢复流通，counter 不用动。
-+@export var mp8_stuck_recycle_time: float = 60.0
++#
++# [MP8] 2026-08-24 用户定：60 → 30 秒。
++# 机制后果：平台上静止残骸的周转快一倍 —— 池子回流更快（后半局更不容易变稀），
++# 平台上的堆积也清得更勤。代价是玩家搁在地上不动的残骸 30 秒就会被收走
++#（举在手里的不算，下面 held_by 那条排除仍然生效）。
++@export var mp8_stuck_recycle_time: float = 30.0
 +# 判「没动」的速度阈值（米/秒）。静止刚体会被 Godot 挂起，速度就是 0；
 +# 给一点余量是为了容忍物理抖动。慢慢滚动的（速度高于此值）不算卡住，计时归零。
 +@export var mp8_stuck_speed_threshold: float = 0.15
@@ -34,7 +39,7 @@ diff --git a/minigames/junk_platform/scripts/junk_handler.gd b/minigames/junk_pl
  @export_category("Nodes")
  @export var junks_node: Node3D
  @export var timer: Timer
-@@ -25,6 +51,12 @@ var junk_instances: Dictionary[int, JunkCubeRigidbody]
+@@ -25,6 +56,12 @@ var junk_instances: Dictionary[int, JunkCubeRigidbody]
  var caught_junk: Array[JunkCubeRigidbody]
  var elapsed: float = 0.0
  
@@ -47,7 +52,7 @@ diff --git a/minigames/junk_platform/scripts/junk_handler.gd b/minigames/junk_pl
  func _ready() -> void :
  
  	if multiplayer.is_server():
-@@ -39,6 +71,11 @@ func _physics_process(_delta: float) -> void :
+@@ -39,6 +76,11 @@ func _physics_process(_delta: float) -> void :
  	if active:
  		elapsed += _delta
  
@@ -59,20 +64,47 @@ diff --git a/minigames/junk_platform/scripts/junk_handler.gd b/minigames/junk_pl
  	var data: Dictionary[int, Transform3D]
  	for k in junk_instances.keys():
  		if junk_instances[k].active:
-@@ -48,6 +85,12 @@ func _physics_process(_delta: float) -> void :
+@@ -46,9 +88,25 @@ func _physics_process(_delta: float) -> void :
  
+ 	updata_junk_positions_rpc.rpc(data)
+ 
++# [MP8] 2026-08-25：暂停落石必须是**处理器自己的状态**，不能只靠「把计时器停掉」。
++#
++# 老写法只在 junk_platform._mp8_apply_junk_speed() 里 `timer.stop()`，
++# 而下面 set_active(true) 是**无条件** `timer.start()` —— 新一轮一开始
++# （或处理器被重新激活），暂停就被悄悄撤销了，而 HUD 还显示着「暂停落石」。
++# 这就是「暂停保证全局生效」缺的那一块：状态得留在被控对象身上。
++var mp8_paused: bool = false
++
++
  func set_active(_active: bool):
  	active = _active
 +
 +	# [MP8] 开打/停打都把静止计时清干净，免得跨阶段累加（见 _mp8_recycle_stuck_junk）
 +	mp8_idle_time.clear()
-+	if active:
+ 	if active:
 +		mp8_stuck_recycled = 0
 +
- 	if active:
++	# [MP8] 暂停期间**不许**在这里把计时器重新点着（见 mp8_paused 上面那段）。
++	if active and not mp8_paused:
  		timer.start(spawn_interval)
  
-@@ -111,3 +154,56 @@ func _on_catcher_body_entered(body):
+ func add_spawn_point(_network_id: int, _position: Vector3):
+@@ -72,6 +130,13 @@ func updata_junk_positions_rpc(data: Dictionary[int, Transform3D]):
+ 
+ 
+ func _on_timer_timeout():
++
++	# [MP8] 兜底：正常情况下暂停时计时器是停的、根本不会走到这儿；
++	# 但只要有任何一条路把它重新点着（历史上就是 set_active 干的），这里也不放行。
++	# 注意**直接 return、不重排计时器** —— 重排等于自己把暂停解除了。
++	if mp8_paused:
++		return
++
+ 	for p in spawn_points.values():
+ 		var junk_instance: JunkCubeRigidbody
+ 		if not caught_junk.is_empty():
+@@ -111,3 +176,56 @@ func _on_catcher_body_entered(body):
  	if body is JunkCubeRigidbody:
  		body.reset_rpc.rpc()
  		caught_junk.append(body)

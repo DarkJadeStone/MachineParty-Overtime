@@ -283,7 +283,27 @@ diff --git a/minigames/burn_recycle/scripts/burn_recycle.gd b/minigames/burn_rec
  	for player in active_players.values():
  		player.reset_scores_rpc.rpc()
  
-@@ -367,6 +588,12 @@ func remove_active_player_rpc(_network_id: int):
+@@ -345,6 +566,19 @@ func player_disconnected(_network_id: int):
+ 
+ 	await get_tree().create_timer(1.0).timeout
+ 
++	# [MP8] T44 守卫：本局还没正式开始（有人卡在加载里，闸门未放行）。
++	# 判据是 `active_players.size() > 1`，开局前是 0，条件为假直接穿过去结算；
++	# `from_disconnect` 那个早退只在 >1 时才起作用，挡不住这条。
++	#
++	# ⚠️ 这里写成 `is_server() and not is_all_player_loaded`，**不能只写后半句** ——
++	#    本函数（与枪械工厂一样）**没有 is_server 提前返回，也没调 super**，
++	#    而 `is_all_player_loaded` 只在服务器侧被置 true。只写后半句会把客机那条路
++	#    **永久提前返回**，那是超出本题的行为改动。
++	# 清理照做，只不做收尾。完整分析见 T44。
++	if multiplayer.is_server() and not is_all_player_loaded:
++		print("[MP8] 人工筛选：%d 掉线时本局还没开始，跳过收尾检查" % _network_id)
++		return
++
+ 	check_game_end(true)
+ 
+ 
+@@ -367,6 +601,12 @@ func remove_active_player_rpc(_network_id: int):
  func update_timers_rpc(_time_remaining: int):
  	timer_label.text = "00:%s" % [str(_time_remaining).pad_zeros(2)]
  
@@ -296,7 +316,7 @@ diff --git a/minigames/burn_recycle/scripts/burn_recycle.gd b/minigames/burn_rec
  
  
  func _on_item_launched(_rotation: Vector3, _type: BurnRecycleMinigame.ItemTypes):
-@@ -448,3 +675,1384 @@ func _on_countdown_expired():
+@@ -448,3 +688,1384 @@ func _on_countdown_expired():
  	start_round_timer()
  
  	state_machine.transition_to_rpc.rpc(&"Play")

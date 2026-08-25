@@ -1683,7 +1683,7 @@ diff --git a/minigames/manufacture_gun/scripts/manufacture_gun.gd b/minigames/ma
  @rpc("any_peer", "call_local", "reliable")
  func request_item_sequence_rpc(network_id: int):
  	if multiplayer.is_server():
-@@ -311,9 +1886,31 @@ func receive_item_sequence_rpc(sequence: Array):
+@@ -311,16 +1886,43 @@ func receive_item_sequence_rpc(sequence: Array):
  
  
  
@@ -1717,3 +1717,36 @@ diff --git a/minigames/manufacture_gun/scripts/manufacture_gun.gd b/minigames/ma
  
  
  
+ func player_disconnected(_network_id: int):
+ 	super.player_disconnected(_network_id)
+ 
+-	var player_instance = active_players[_network_id]
++	# [MP8] T44：原版这里是 `active_players[_network_id]` —— **裸取字典**。
++	# 掉线的人不在 `active_players` 里是**常态**：加载途中掉的人从来没被 spawn 过，
++	# 已经死掉的人也早被 erase 了。那次读会报 "Invalid access to key"，
++	# 把整个函数当场打断 —— 下面的清理和收尾一句都不会执行。
++	# 改成 `get(..., null)`：取不到就是 null，而下面 `if player_instance:` 本来就在判空。
++	var player_instance = active_players.get(_network_id, null)
+ 
+ 	active_players.erase(_network_id)
+ 
+@@ -331,6 +1933,19 @@ func player_disconnected(_network_id: int):
+ 	if player_characters.has(_network_id):
+ 		player_characters.erase(_network_id)
+ 
++	# [MP8] T44 守卫：本局还没正式开始（有人卡在加载里，闸门未放行）。
++	# 此时 `spawn_players()` 还没跑过，`active_players` 是空的，
++	# `check_game_end()` 里 `active_players.size() > 1` 为假 → 直接走到结算、
++	# 广播 `transition_to_rpc("Finish")` 与音效总线归零，把一局**尚未开始**的游戏收尾。
++	#
++	# ⚠️ 这里写成 `is_server() and not is_all_player_loaded`，**不能只写后半句** ——
++	#    本函数（与其他大多数小游戏不同）**没有 `is_server` 提前返回**，
++	#    而 `is_all_player_loaded` 只在服务器侧被置 true。只写后半句会把
++	#    客机那条路**永久提前返回**，那是超出本题的行为改动。
++	if multiplayer.is_server() and not is_all_player_loaded:
++		print("[MP8] 枪械工厂：%d 掉线时本局还没开始，跳过收尾检查" % _network_id)
++		return
++
+ 	check_game_end()
+ 
+ func _on_item_assembled(network_id: int):

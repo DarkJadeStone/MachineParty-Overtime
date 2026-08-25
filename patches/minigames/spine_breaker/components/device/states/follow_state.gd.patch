@@ -1,7 +1,7 @@
 diff --git a/minigames/spine_breaker/components/device/states/follow_state.gd b/minigames/spine_breaker/components/device/states/follow_state.gd
 --- a/minigames/spine_breaker/components/device/states/follow_state.gd
 +++ b/minigames/spine_breaker/components/device/states/follow_state.gd
-@@ -3,6 +3,26 @@ extends State
+@@ -3,6 +3,54 @@ extends State
  var target: SpineBreakerPlayer
  var elapsed: float = 0.0
  
@@ -25,10 +25,38 @@ diff --git a/minigames/spine_breaker/components/device/states/follow_state.gd b/
 +var _mp8_dodge_dir: Vector3 = Vector3.ZERO
 +var _mp8_dodge_count: int = 0
 +
++# ═════════════════════════════════════════════════════════════════════════
++# [MP8] 🩸 死锁目标：盯上一个**永远扑不上的人**（2026-08-24 用户实机报的）
++# ═════════════════════════════════════════════════════════════════════════
++#
++# **用户原话**：「假如一个人身上有一个装置了，其他人往他附近扔装置，
++#   第二个装置虽然无法上身，但是会一直追着他，不会改变目标」
++#
++# **这是 T37 修双挂时我们自己引进来的。** `thrown_state` 里粘不上时的兜底是
++# `transition_to("Follow", {target: body})`，旧注释写着「他背上的机器迟早会被
++# 扔掉或杀完复位」—— **那句是错的**，因为下面这条链根本没有出口：
++#
++#   1. `update_proximity_check()` 里 `_mp8_can_take(target)` 恒为 false
++#      （`has_spine_breaker`），于是这个人被 `continue` 掉 —— 既扑不上也选不中；
++#   2. 换目标那句是 `if closest != target: if closest_distance < target_distance:`，
++#      而 `target_distance` **恒为 INF、从头到尾没人给它赋值**（原版就这样，我们没动）
++#      —— 所以只有「附近还有另一个可扑的人」时才换得掉。旁边没人 = 不换；
++#   3. `request_new_target` **只从 BreakSpine 之后的 Idle 发出**，
++#      而进 BreakSpine 的前提是先扑上 —— 扑不上就永远发不出。
++#
++# 结论：一旦盯上背着机器的人且附近没别人，这台机器就**永久绕着他转**。
++#
++# 修法：发现当前目标已经不可扑，就主动跟宿主要一个新目标
++# （走的就是杀完人之后那条现成的重派路径）。
++# 用**冷却**而不是一次性开关 —— `_mp8_pick_prey()` 有「候选全被筛掉」的
++# 合法返回 null，那时得过一会儿再问一次，否则又卡死。
++const MP8_DEADEND_RETRY: float = 4.0   # 比最长的 MP8_DEVICE_WAIT（3 秒）长，不跟重派打架
++var _mp8_deadend_cd: float = 0.0
++
  func init() -> void :
  
  	owner.navigation_update_timer.timeout.connect(_on_navigation_timer_timeout)
-@@ -21,6 +41,11 @@ func enter(_msg: Dictionary = {}) -> void :
+@@ -21,6 +69,12 @@ func enter(_msg: Dictionary = {}) -> void :
  	state_time = 0.0
  	elapsed = 0.0
  
@@ -36,11 +64,25 @@ diff --git a/minigames/spine_breaker/components/device/states/follow_state.gd b/
 +	_mp8_stuck = 0.0
 +	_mp8_dodge_left = 0.0
 +	_mp8_dodge_count = 0
++	_mp8_deadend_cd = 0.0
 +
  	var new_target = _msg.get("target", null)
  	var is_new_target: bool = _msg.get("new_target", false)
  
-@@ -48,13 +73,120 @@ func update_physics(_delta: float) -> void :
+@@ -39,6 +93,12 @@ func update(_delta: float) -> void :
+ 
+ func update_physics(_delta: float) -> void :
+ 
++	# [MP8] 放在**最开头**而不是 `update_proximity_check()` 之后：
++	# 那句会在撞上人时 `transition_to("Attached")`，而转完之后本帧剩下的代码
++	# 还会继续跑完 —— 那时 `target.has_spine_breaker` 已经被置为 true，
++	# 放后面会让**刚扑上去的机器当场误报死锁**。
++	_mp8_check_dead_end(_delta)
++
+ 	var increase_ratio = elapsed / owner.speed_increase_duration
+ 	var elapsed_speed = increase_ratio * owner.speed_increase_over_time
+ 
+@@ -48,13 +108,120 @@ func update_physics(_delta: float) -> void :
  	var current_agent_position: Vector3 = owner.global_position
  	var next_path_position: Vector3 = owner.navigation_agent.get_next_path_position()
  
@@ -162,7 +204,7 @@ diff --git a/minigames/spine_breaker/components/device/states/follow_state.gd b/
  func update_proximity_check():
  
  	var target_distance: float = INF
-@@ -62,14 +194,27 @@ func update_proximity_check():
+@@ -62,14 +229,27 @@ func update_proximity_check():
  	var closest = null
  	var closest_distance = target_distance
  	for p in owner.players_in_proximity:
@@ -196,7 +238,54 @@ diff --git a/minigames/spine_breaker/components/device/states/follow_state.gd b/
  
  			closest_distance = distance
  			closest = p
-@@ -107,6 +252,9 @@ func _on_player_attach_entered(body):
+@@ -78,6 +258,46 @@ func update_proximity_check():
+ 		if closest_distance < target_distance:
+ 			set_target(closest, false)
+ 
++# [MP8] 见文件头 MP8_DEADEND_RETRY 上那段：目标已经不可扑就跟宿主要新的。
++#
++# ⚙ 判据用 `_mp8_can_take` 而不是只看 `has_spine_breaker`：死人、失效引用
++#    同样是「永远扑不上」，一并覆盖（比如另一台先把他杀了，这台还在追尸体）。
++# ⚙ 只在服务器发：`request_new_target` 的接线在 `spine_breaker.gd` 里就包在
++#    `if multiplayer.is_server():` 内，客机发出去没人听。
++# ⚙ `not active` 时直接返回：本帧已经转出 Follow 了，不该再插一手。
++func _mp8_check_dead_end(_delta: float) -> void :
++
++	if not active:
++		return
++
++	if _mp8_deadend_cd > 0.0:
++		_mp8_deadend_cd -= _delta
++		return
++
++	if target == null:
++		return
++	if _mp8_can_take(target):
++		return
++
++	_mp8_deadend_cd = MP8_DEADEND_RETRY
++
++	if not multiplayer.is_server():
++		return
++
++	var who: String = "?"
++	var why: String = "引用已失效"
++	if is_instance_valid(target):
++		who = String(target.name)
++		if target.has_spine_breaker:
++			why = "已经背着机器"
++		elif not target.active:
++			why = "已死"
++	print("[MP8] 碎骨者：%d 号机盯着 %s 但永远扑不上（%s）—— 要新目标" % [
++		owner.mp8_index, who, why
++	])
++	owner.request_new_target.emit()
++
++
+ func set_target(_target: SpineBreakerPlayer, new_target: bool):
+ 	target = _target
+ 
+@@ -107,6 +327,9 @@ func _on_player_attach_entered(body):
  	if body is not SpineBreakerPlayer:
  		return
  

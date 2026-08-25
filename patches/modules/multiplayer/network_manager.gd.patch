@@ -11,12 +11,12 @@ diff --git a/modules/multiplayer/network_manager.gd b/modules/multiplayer/networ
 +# [MP8] mod 版本号。**发布新版就改这里**，它会被追加进 Globals.game_version，
 +# 直接决定"谁能跟谁联机"（见 _ready() 里那段版本握手）。
 +# 格式随意但要短：主菜单右下角显示的是 `原版号+本标签`，太长会顶出去。
-+const MP8_VERSION_TAG: String = "overtime-1.2"
++const MP8_VERSION_TAG: String = "overtime-1.3"
 +
  enum NetworkBackendType{
  	Enet, Steam
  }
-@@ -42,14 +47,543 @@ signal player_removed_from_join_queue(network_id)
+@@ -42,14 +47,559 @@ signal player_removed_from_join_queue(network_id)
  
  func _ready() -> void :
  
@@ -68,9 +68,12 @@ diff --git a/modules/multiplayer/network_manager.gd b/modules/multiplayer/networ
 +
 +	# [MP8] 出生点补位钩子
 +	_mp8_no_topup = args.has("mp8notopup")
-+	_mp8_no_audit = args.has("mp8noaudit")
-+	if _mp8_no_topup or _mp8_no_audit:
-+		print("[MP8] 排查开关：notopup=%s noaudit=%s" % [str(_mp8_no_topup), str(_mp8_no_audit)])
++	# [MP8] 侦察日志 opt-in：编辑器 / -debug-tools 测试台 / 显式 mp8audit 才打。
++	# 发布版双击启动什么都不传 → 天然安静。
++	var _mp8_dbg: bool = OS.has_feature("editor") or args.has("-debug-tools") or args.has("mp8audit")
++	_mp8_audit_on = _mp8_dbg and not args.has("mp8noaudit")
++	if _mp8_no_topup or _mp8_audit_on:
++		print("[MP8] 排查开关：notopup=%s audit=%s" % [str(_mp8_no_topup), str(_mp8_audit_on)])
 +	get_tree().node_added.connect(_mp8_on_node_added)
 +
 +# [MP8] UID 解析自检。逐个检查崩溃小游戏里用到的 uid://，看能不能查到路径、能不能真的载出来。
@@ -151,10 +154,19 @@ diff --git a/modules/multiplayer/network_manager.gd b/modules/multiplayer/networ
 +
 +# [MP8] A/B 开关：排查崩溃时用来隔离"是本 mod 的运行时改动造成的"还是"原版就崩"。
 +#   mp8notopup  = 不做出生点补位
-+#   mp8noaudit  = 不打侦察日志
-+# 两个都是命令行传入，缓存在 _ready() 里（每帧/每节点读 cmdline 太浪费）。
++#   mp8audit    = **打**侦察日志（下面 _mp8_audit_on）
++# 都是命令行传入，缓存在 _ready() 里（每帧/每节点读 cmdline 太浪费）。
 +var _mp8_no_topup: bool = false
-+var _mp8_no_audit: bool = false
++
++# [MP8] 2026-08-25 从**反向开关改成 opt-in**（原来是 `mp8noaudit` 才关）。
++# 🩸 起因：真人局日志实测，`[MP8-AUDIT]` 转储占 **8.1%**（14425 行里 1174 行，
++# 每加载一个小游戏打 30 行）—— 玩家从不传 `mp8noaudit`，所以**发布版一直在打**。
++# 同一份日志里碎骨者那个 `Node not found` 才占 3.0%，而我当时还跟用户说"别管它"。
++# 自己常开的诊断噪音是它的 2.7 倍，纯诊断、对玩家零价值 —— 这个才该先关。
++#
++# 现在：编辑器里、带 `-debug-tools` 的测试台、或显式传 `mp8audit` 才打；
++# 正式游玩（Steam 双击，什么都不传）天然安静。`mp8noaudit` 保留为强制关。
++var _mp8_audit_on: bool = false
 +
 +func _mp8_on_node_added(node: Node) -> void :
 +
@@ -163,7 +175,7 @@ diff --git a/modules/multiplayer/network_manager.gd b/modules/multiplayer/networ
 +		return
 +
 +	# [MP8-AUDIT] 只读侦察：小游戏进树时把出生点相关的节点/数组全打出来，不改任何东西
-+	if node is Minigame and not _mp8_no_audit:
++	if node is Minigame and _mp8_audit_on:
 +		_mp8_audit.call_deferred(node)
 +
 +	if _mp8_no_topup:
@@ -290,6 +302,10 @@ diff --git a/modules/multiplayer/network_manager.gd b/modules/multiplayer/networ
 +
 +
 +func _mp8_dump_slots(h, tag: String) -> void :
++
++	# [MP8] 2026-08-25 跟 _mp8_audit 同族的诊断转储，一起改成 opt-in。
++	if not _mp8_audit_on:
++		return
 +
 +	print("[MP8] ---- 展示位坐标（%s） ----" % tag)
 +	for i in h.players.size():

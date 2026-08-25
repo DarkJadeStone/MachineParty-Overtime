@@ -1,7 +1,7 @@
 diff --git a/minigames/duck_hunt/components/hunter_player/scripts/hunter_player.gd b/minigames/duck_hunt/components/hunter_player/scripts/hunter_player.gd
 --- a/minigames/duck_hunt/components/hunter_player/scripts/hunter_player.gd
 +++ b/minigames/duck_hunt/components/hunter_player/scripts/hunter_player.gd
-@@ -18,19 +18,365 @@ class_name DuckHuntHunterPlayer
+@@ -18,19 +18,382 @@ class_name DuckHuntHunterPlayer
  @export var hand_meshes: Array[MeshInstance3D]
  @export var laser_mesh: MeshInstance3D
  
@@ -23,12 +23,29 @@ diff --git a/minigames/duck_hunt/components/hunter_player/scripts/hunter_player.
 +#    （打完一枪到能再打的间隔，值越小越快）。真正的换弹写死在 3.8-0.95=2.85 秒，不受此表控制。
 +#
 +# 五档表（用户定稿 2026-08-14）：
-+#   人数  鸭:猎   弹夹  间隔    说明
++#   人数  鸭:猎   弹夹  cycle  说明   ⚠️ 这列是 cycle 不是间隔，间隔 = 0.5 + cycle
 +#   ≤4   3:1     10   0.80   原版基准
-+#   5    4:1     12   0.70   猎人最亏 → 加强
-+#   6    4:2      7   1.00   鸭子最亏 → 削弱
++#   5    4:1     12   0.42   猎人最亏 → 加强（0.70 是 08-14 初稿，08-15 已改 0.42）
++#   6    4:2      7   1.375  鸭子最亏 → 削弱（2026-08-24 又降了 20% 射速，见下）
 +#   7    5:2      8   0.80   仅削弱弹夹
 +#   8    6:2     10   0.80   比值回到基准，性能不变
++#
++# [MP8] 2026-08-24 用户定：6 人档射速再降 20%（cycle 1.00 → 1.375）。
++#
++# 起因：6 人档单把枪确实是全表最弱的，但**两个猎人只面对 4 只鸭**——
++# 削弱是按"单个猎人"给的，猎人却从 1 个变成 2 个，鸭子只从 3 只变成 4 只。
++# 按"每只鸭承受的持续火力"重算（含换弹，= 猎人数 × 单猎发/秒 ÷ 鸭子数）：
++#
++#   ≤4 基准 0.2103 ｜ 5 人 0.2160 ｜ 独狼 0.2169 ｜ 8 人 0.2103   ← 四档都在 0.210~0.216
++#   6 人（改前）0.2622 —— 比基准高 24.7%，**全表唯一跑偏的一档**，方向还和"鸭子最亏"正好反了
++#
++# 换句话说：那个"削弱"标签对单把枪没说错，对整局是反的。不削弱的话是 +50%，
++# 原来的削弱只补回了一半。用户实机判定"2 打 4 压力还是太大"。
++#
++# 倍率照 5 人档那套算法作用在**总间隔**上：1.50 ÷ 0.8 = 1.875 秒 → cycle = 1.875 - 0.5 = 1.375。
++# 改后单猎 0.438 发/秒（比基准慢 30.5%），每鸭承压 0.2191（+4.2%），落回上面那一簇。
++# ⚠️ 弹夹保持 7 不动：用户要的是"削弱射击间隔"，不是缩弹夹。
++# ⚠️ 7 人档同样偏高（0.2415，+14.8%），**用户 2026-08-24 明确"不动"**，别顺手一起改。
 +@export var magazine_capacity_by_player_count: Dictionary[int, int] = {
 +	4: 10,
 +	5: 12,
@@ -48,7 +65,7 @@ diff --git a/minigames/duck_hunt/components/hunter_player/scripts/hunter_player.
 +@export var cycle_time_by_player_count: Dictionary[int, float] = {
 +	4: 0.80,   # 总间隔 1.30 秒（基准）
 +	5: 0.42,   # 总间隔 0.92 秒 = 原 5 人档(1.20)的 1.3 倍射速（用户 2026-08-15 定）
-+	6: 1.00,   # 总间隔 1.50 秒
++	6: 1.375,  # 总间隔 1.875 秒 = 原 6 人档(1.50)的 0.8 倍射速（用户 2026-08-24 定）
 +	7: 0.80,   # 总间隔 1.30 秒
 +	8: 0.80,   # 总间隔 1.30 秒
  }
@@ -377,7 +394,7 @@ diff --git a/minigames/duck_hunt/components/hunter_player/scripts/hunter_player.
  @export_category("Zoom")
  @export var zoom_fovs: Array[float] = [
  	75.0, 
-@@ -158,6 +504,11 @@ func _input(event: InputEvent) -> void :
+@@ -158,6 +521,11 @@ func _input(event: InputEvent) -> void :
  	if PauseMenu.active:
  		return
  
@@ -389,7 +406,7 @@ diff --git a/minigames/duck_hunt/components/hunter_player/scripts/hunter_player.
  	if player_presence.using_joystick:
  		return
  
-@@ -330,6 +681,8 @@ func shoot():
+@@ -330,6 +698,8 @@ func shoot():
  
  	laser_scale_node.visible = false
  
@@ -398,7 +415,7 @@ diff --git a/minigames/duck_hunt/components/hunter_player/scripts/hunter_player.
  	if laser_raycast.is_colliding():
  		var collider = laser_raycast.get_collider()
  		if collider is DuckHuntHitbox:
-@@ -373,6 +726,8 @@ func shoot():
+@@ -373,6 +743,8 @@ func shoot():
  				true
  			)
  
@@ -407,7 +424,7 @@ diff --git a/minigames/duck_hunt/components/hunter_player/scripts/hunter_player.
  	recoil_progress = 0.0
  	var t = create_tween()
  	t.tween_property(
-@@ -386,25 +741,37 @@ func shoot():
+@@ -386,25 +758,37 @@ func shoot():
  	look_recoil.x += 0.025 * (-1 + (randf() * 2))
  
  	play_shoot_sound_rpc.rpc()
@@ -451,7 +468,7 @@ diff --git a/minigames/duck_hunt/components/hunter_player/scripts/hunter_player.
  	if return_to_zoom_after_shot:
  		zoom_fov_index = zoom_index
  		update_zoom(zoom_index > 0)
-@@ -414,6 +781,9 @@ func reload():
+@@ -414,6 +798,9 @@ func reload():
  	if GameManager.local_game or (multiplayer.get_unique_id() == get_multiplayer_authority()):
  		play_reload_sound_rpc.rpc()
  	can_shoot = false
@@ -461,7 +478,7 @@ diff --git a/minigames/duck_hunt/components/hunter_player/scripts/hunter_player.
  	anim_rig.play("rifle_reload_main_overwrite")
  	num_of_current_rounds_in_magazine = magazine_capacity
  	await get_tree().create_timer(3.8 - 0.95, false).timeout
-@@ -483,6 +853,15 @@ func initialize_hunter_rpc(initial_delay: float):
+@@ -483,6 +870,15 @@ func initialize_hunter_rpc(initial_delay: float):
  	if not GameManager.local_game:
  		if multiplayer.get_unique_id() != get_multiplayer_authority(): return
  
@@ -477,7 +494,7 @@ diff --git a/minigames/duck_hunt/components/hunter_player/scripts/hunter_player.
  	await get_tree().create_timer(initial_delay, false).timeout
  	anim_sensitivity_prompt.play("show")
  	await get_tree().create_timer(4, false).timeout
-@@ -530,10 +909,13 @@ func cleanup_rpc():
+@@ -530,10 +926,13 @@ func cleanup_rpc():
  func set_active_rpc(_active: bool) -> void :
  	active = _active
  
@@ -494,7 +511,7 @@ diff --git a/minigames/duck_hunt/components/hunter_player/scripts/hunter_player.
  
  @rpc("any_peer", "call_local", "reliable")
  func set_player_presence(network_id: int) -> void :
-@@ -618,9 +1000,17 @@ func set_player_presence(network_id: int) -> void :
+@@ -618,9 +1017,17 @@ func set_player_presence(network_id: int) -> void :
  		set_physics_process(false)
  
  @rpc("any_peer", "call_local", "reliable")

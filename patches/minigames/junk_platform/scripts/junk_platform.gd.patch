@@ -1,7 +1,7 @@
 diff --git a/minigames/junk_platform/scripts/junk_platform.gd b/minigames/junk_platform/scripts/junk_platform.gd
 --- a/minigames/junk_platform/scripts/junk_platform.gd
 +++ b/minigames/junk_platform/scripts/junk_platform.gd
-@@ -30,21 +30,297 @@ var finished: bool = false
+@@ -30,21 +30,368 @@ var finished: bool = false
  
  var player_count: int = 0
  
@@ -96,6 +96,8 @@ diff --git a/minigames/junk_platform/scripts/junk_platform.gd b/minigames/junk_p
 +var _mp8_junk_base_interval: float = 0.0
 +var _mp8_junk_base_min: float = 0.0
 +var _mp8_debug_canvas: CanvasLayer = null
++# [MP8] 2026-08-25 用户要的「暂停落石」可点按钮。键盘 5 仍然有效，两者走同一条 RPC。
++var _mp8_junk_btn: Button = null
 +var _mp8_id_label: Label = null
 +var _mp8_junk_label: Label = null
 +
@@ -133,9 +135,30 @@ diff --git a/minigames/junk_platform/scripts/junk_platform.gd b/minigames/junk_p
 +func _mp8_init_flags() -> void :
 +
 +	var args: Array = Array(OS.get_cmdline_args())
-+	_mp8_debug_aids = (args.has("-debug-tools") or args.has("mp8junkdebug")) \
-+		and not args.has("mp8nojunkdebug")
++	# [MP8] 2026-08-25 调整优先级：**显式传 mp8junkdebug 胜过 mp8nojunkdebug**。
++	# 原因：`play.ps1` 的 `-Clean` 会自动带上 `mp8nojunkdebug`（让测试台画面干净），
++	# 而按项目规矩 `-Clean` 是必带的 —— 老写法里 nojunk 压过一切，
++	# 于是「想在 -Clean 局里看右上角面板」这件事**根本做不到**（`-Extra mp8junkdebug` 也会被压掉）。
++	# 发布版两个开关都不传，所以正式游玩仍然天然干净，收尾要求不受影响。
++	_mp8_debug_aids = args.has("mp8junkdebug") \
++		or (args.has("-debug-tools") and not args.has("mp8nojunkdebug"))
 +	_mp8_junk_keys = _mp8_debug_aids or args.has("mp8junkkeys")
++
++	# [MP8] 视角模式（2026-08-25 用户要求做 B / C 两版对比，当天实机定案采用 C）：
++	#   不传  = **C**（MP8_VIEW_DEFAULT），下面这行注释以前写的是"原样"，
++	#           那是 B/C 定案之前的行为，已过期 —— 现在默认就是 C。
++	#   =a   = 原样：2 个朝向（0°/180°），混合双环布局，与改动前逐值一致
++	#   =b   = 4 个朝向（0/90/180/270），**布局不动**
++	#   =c   = 8 个朝向（每 45°），布局改成同半径正八边形
++	# 判据与代价见 MP8_VIEW_STEPS 上面那一大段。
++	var vm: String = _mp8_arg("mp8junkview=").to_lower()
++	_mp8_view_mode = vm if MP8_VIEW_STEPS.has(vm) else MP8_VIEW_DEFAULT
++	if vm != "" and not MP8_VIEW_STEPS.has(vm):
++		push_warning("[MP8] 残骸平台：mp8junkview=%s 不认识，按默认 C 跑（只认 a / b / c）" % vm)
++	print("[MP8] 残骸平台：视角模式 = %s（%d 个朝向，步长 %.0f°）" % [
++		("原样" if _mp8_view_mode == MP8_VIEW_VANILLA else _mp8_view_mode.to_upper()),
++		int(round(360.0 / _mp8_facing_step())), _mp8_facing_step()
++	])
 +
 +
 +# [MP8] 调试设施初始化：记基准值、建 HUD
@@ -201,7 +224,8 @@ diff --git a/minigames/junk_platform/scripts/junk_platform.gd b/minigames/junk_p
 +		lbl.offset_left = -420.0
 +		lbl.offset_top = 12.0
 +		lbl.offset_right = -16.0
-+		lbl.offset_bottom = 52.0
++		# [MP8] 2026-08-25 从 52 加高到 150：现在这块要放三行（谁 / 视角模式 / 我的朝向）
++		lbl.offset_bottom = 150.0
 +		lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
 +		_mp8_style_label(lbl, Color(1.0, 0.95, 0.4))
 +		_mp8_debug_layer().add_child(lbl)
@@ -212,10 +236,17 @@ diff --git a/minigames/junk_platform/scripts/junk_platform.gd b/minigames/junk_p
 +	if PlayerManager.player_presences.has(me):
 +		who = String(PlayerManager.player_presences[me].network_name)
 +
-+	if who == "":
-+		_mp8_id_label.text = "id %d" % me
-+	else:
-+		_mp8_id_label.text = "%s   id %d" % [who, me]
++	# [MP8] 2026-08-25：加两行视角信息 —— B/C 两版对比时全靠这个分辨自己在哪一档。
++	# 朝向是**本机**的值（每台机器各转各的），所以 8 个窗口应该显示 8 个不同的数（C 版）
++	# 或两两相同（B 版）。全都一样 = 朝向没生效，第一眼就能看出来。
++	var lines := PackedStringArray()
++	lines.append(("id %d" % me) if who == "" else ("%s   id %d" % [who, me]))
++	lines.append("视角 %s   共 %d 档" % [
++		("原样" if _mp8_view_mode == MP8_VIEW_VANILLA else _mp8_view_mode.to_upper()),
++		int(round(360.0 / _mp8_facing_step()))
++	])
++	lines.append("我的朝向 %.0f°" % _mp8_my_facing)
++	_mp8_id_label.text = "\n".join(lines)
 +
 +
 +# [MP8] 落石速度提示（只有开了调试键才显示，免得挡正式游玩的画面）
@@ -243,6 +274,40 @@ diff --git a/minigames/junk_platform/scripts/junk_platform.gd b/minigames/junk_p
 +		state = "%.0f 倍慢（%.1f 秒一批）" % [_mp8_junk_mult, _mp8_junk_base_interval * _mp8_junk_mult]
 +
 +	_mp8_junk_label.text = "[落石调试] %s    1=原速 2=2倍慢 3=5倍慢 4=10倍慢 5=暂停" % state
++
++	# [MP8] 2026-08-25 用户要求：把同一个开关做成**可点按钮**。
++	# 键盘 5 仍然有效 —— 两者走同一条 mp8_set_junk_speed_rpc，不会各记各的状态。
++	# ⚠️ 这个小游戏**没有捕获鼠标**（全工程 grep 不到它设 Input.mouse_mode），所以按钮点得到；
++	#    别的小游戏照抄之前先确认这一点，鼠标被捕获的地方按钮是死的。
++	# [MP8] 2026-08-25 用户定：**按钮只在房主出现**，客机只留数字键 5。
++	# 理由：暂停是**全局**的（真正停计时器的 `_mp8_apply_junk_speed()` 只在服务器跑），
++	# 8 个窗口各摆一个可点按钮 = 任何一个客机都能一键停掉全场落石，鼠标误触代价太大。
++	# 数字键保持所有端可用 —— 那是原有行为，而且按键不像按钮那样容易误碰。
++	if multiplayer.is_server() and _mp8_junk_btn == null:
++		var b := Button.new()
++		b.set_anchors_preset(Control.PRESET_TOP_RIGHT)
++		b.offset_left = -220.0
++		b.offset_top = 158.0
++		b.offset_right = -16.0
++		b.offset_bottom = 202.0
++		var bf = load("res://fonts/Terminal F4.ttf")
++		if bf != null:
++			b.add_theme_font_override("font", bf)
++		b.add_theme_font_size_override("font_size", 24)
++		b.pressed.connect(_mp8_toggle_junk_pause)
++		_mp8_debug_layer().add_child(b)
++		_mp8_junk_btn = b
++
++	# 客机上按钮压根没建（见上），所以这里必须判空
++	if _mp8_junk_btn != null:
++		_mp8_junk_btn.text = "继续落石" if _mp8_junk_mult <= 0.0 else "暂停落石"
++
++
++# [MP8] 按钮点一下 = 在「暂停」与「原速」之间切。
++# 走的是和数字键 5 完全同一条 RPC，所以 8 个窗口的状态永远一致，
++# 也不需要另外记一个"上次是几倍慢"——按钮只管暂停/恢复，细分速度还是用数字键。
++func _mp8_toggle_junk_pause() -> void :
++	mp8_set_junk_speed_rpc.rpc(0.0 if _mp8_junk_mult > 0.0 else 1.0)
 +
 +
 +# [MP8] 数字键切落石速度。
@@ -284,6 +349,12 @@ diff --git a/minigames/junk_platform/scripts/junk_platform.gd b/minigames/junk_p
 +	if junk_handler == null or _mp8_junk_base_interval <= 0.0:
 +		return
 +
++	# [MP8] 2026-08-25：把「暂停」写进处理器的**状态**，不能只停一下计时器。
++	# 只停计时器的话，`set_active(true)`（新一轮开始 / 处理器重新激活）会**无条件**
++	# 把它重新点着，暂停被悄悄撤销而 HUD 还显示着「暂停落石」。
++	# 这就是「暂停保证全局生效」缺的那一块 —— 状态必须留在被控对象身上。
++	junk_handler.mp8_paused = (_mp8_junk_mult <= 0.0)
++
 +	if _mp8_junk_mult <= 0.0:
 +		if junk_handler.timer != null:
 +			junk_handler.timer.stop()
@@ -299,7 +370,7 @@ diff --git a/minigames/junk_platform/scripts/junk_platform.gd b/minigames/junk_p
  func fade_in_ambience():
  	for speaker_controller in ambience_speaker_controllers:
  		speaker_controller.speaker.volume_linear = 0
-@@ -71,6 +347,638 @@ func initialize(_round_number: int, _total_rounds: int, _scores: Dictionary = {}
+@@ -71,6 +418,797 @@ func initialize(_round_number: int, _total_rounds: int, _scores: Dictionary = {}
  
  	state_machine.transition_to_rpc.rpc(&"Round", {"round": _round_number, "total": _total_rounds})
  
@@ -379,8 +450,21 @@ diff --git a/minigames/junk_platform/scripts/junk_platform.gd b/minigames/junk_p
 +
 +		# 新平台还要绕场地中心转 45°，让它的朝向和站位一致（用户要求）。
 +		# 整组一起转：绕 Y 轴旋转后再平移，组内相对关系（压缩机在正上方）保持不变。
-+		var yaw: float = deg_to_rad(MP8_NEW_YAW_DEGREES)
++		# [MP8] C 版里原版那 4 块也要搬，但**只改半径、方位角不变**，所以它们的 yaw 是 0；
++		# 只有新增的那 4 块要转 45° 让朝向和站位一致（i >= n 就是新增的）。
++		var yaw: float = deg_to_rad(MP8_NEW_YAW_DEGREES) if i >= n else 0.0
 +		_mp8_move_group(g, slots[i], yaw)
++
++	# [MP8] 记下**搬完之后**的最终位置：B/C 模式按朝向重新指认美术时要拿它做几何匹配
++	# （见 _mp8_rebind_for_facing）。g["pos"] 是搬之前的，不能用。
++	_mp8_groups_final.clear()
++	for i in all_groups.size():
++		var gg: Dictionary = all_groups[i]
++		_mp8_groups_final.append({
++			"platform": gg["platform"],
++			"nodes": gg["nodes"],
++			"pos": (slots[i] if i < slots.size() else gg["pos"]),
++		})
 +
 +	_mp8_report_gaps(slots)
 +	_mp8_check_pairing(slots)
@@ -570,6 +654,14 @@ diff --git a/minigames/junk_platform/scripts/junk_platform.gd b/minigames/junk_p
 +
 +	# 原版四角在 ±45°、±135°；新的插在 0°、90°、180°、270°
 +	var r: float = _mp8_radius()
++
++	# [MP8] C 版：原版那 4 块也搬到同一半径上，凑成正八边形（**方位角不变，只改半径**）。
++	# 这是 B/C 唯一的布局差别 —— 45° 只有在同半径时才是对称角，才可能一人一个朝向。
++	if _mp8_view_mode == "c":
++		for i in out.size():
++			var a: float = atan2(out[i].x, out[i].z)
++			out[i] = Vector3(sin(a) * r, 0.0, cos(a) * r)
++
 +	for k in 4:
 +		var angle: float = deg_to_rad(90.0 * float(k))
 +		out.append(Vector3(sin(angle) * r, 0.0, cos(angle) * r))
@@ -721,6 +813,144 @@ diff --git a/minigames/junk_platform/scripts/junk_platform.gd b/minigames/junk_p
 +		var m: Node3D = all[i]
 +		# 站在平台中心，稍微抬高一点免得卡进碰撞体
 +		m.global_position = slots[i] + Vector3(0.0, template.global_position.y, 0.0)
++
++
++# [MP8] ═══════════ 视角模式 B / C（2026-08-25 用户要求做两版对比）═══════════
++#
++# 起因：8 个人挤在 2 个朝向里，远端那几个被近端的挡住。
++#
++# ---- 为什么原版只有 2 个朝向 ----
++#
++# 转朝向时**相机和美术是一起转的**（`camera_base` + `visuals_base`），
++# 而平台的**碰撞体/逻辑节点不动**（Platform1..4 钉在 ±13）。
++# 于是 `visuals_base` 一转，原来盖在 A 平台上的那套美术就跑到别的平台头上，
++# 所以每块平台必须**重新指认此刻落在它头上的那一套** —— 原版拿
++# `platform_visuals` / `platform_visuals_flipped` 两个槽做这件事，**只有两态**。
++# 这就是 0°/180° 的全部由来。
++#
++# 🩸 **那不是硬限制，是「只准备了两态」。** 重新指认这件事可以按几何算，
++# 任意角度都算得出来 —— 前提是那个角度得把「美术组」映射回「平台位置」上，
++# 也就是**必须是平台环的对称角**。B 和 C 的差别就在这一条。
++#
++# ---- B：布局不动，4 个朝向 ----
++#
++# 现在是**混合双环**：内环 4 块 r=18.38 在 45/135/225/315°，外环 4 块 r=22.5 在 0/90/180/270°。
++#   转 90° → 内环落到内环、外环落到外环 ✅
++#   转 45° → 内环会落到外环的**角度**上，但**半径对不上** ❌
++# 所以只能 4 档。8 个人两两共用一个朝向，而共用的那两块正好是 θ±22.5° 那两块 ——
++# **都是离相机最近的，并排贴在画面下缘**，谁也挡不到谁。
++#
++# ---- C：凑成正八边形，8 个朝向 ----
++#
++# 把**原版那 4 块也搬到 r=22.5**（方位角不变，只改半径），45° 就成了对称角 → 一人一档。
++# ⚠️ 这**推翻了用户 2026-08-16「原版那 4 个一动不动」的定案**。
++#    但那条定案的目的是孤岛感/间隙，而 C 在这一点上**更好**：
++#    正八边形 r=22.5，相邻圆心距 2R·sin(22.5°) = 17.22，减两个平台半径 6 → **间隙 5.2**，
++#    比现在混合双环的 4.1 还宽（当初被否掉的同半径 18.38 只有 2.1，那才是走得过去的那版）。
++#
++# ---- 两版都不碰的东西 ----
++#
++# 相机的**位置和 fov** 仍然走原有那套（`mp8junkcam=` / `_mp8_apply_camera`），这里只改朝向。
++# 相机层级里没有别的自由挂点可用：
++#   `Camera3D.rotation`  被 `anim_camera sway`（autoplay）**每帧**写
++#   `CameraDefault`      被 `shaker_camera shake` 当 Target 写
++#   `ShakerComponent3D`  本身就是抖动件
++# **只有 `camera_base` 没人抢**，所以朝向只能转它。
++# 【用户 2026-08-25 实机定案：**用 C 版**（“看着基本没问题”）】
++# 所以默认就是 c；另外两档降为**对照用的调试旋钮**，传 mp8junkview=a / =b 才走。
++#   a = 原样（2 个朝向，混合双环，与本轮之前逐值一致）
++#   b = 4 个朝向，布局不动
++#   c = 8 个朝向，正八边形（**当前默认**）
++const MP8_VIEW_STEPS: Dictionary = {"a": 180.0, "b": 90.0, "c": 45.0}
++const MP8_VIEW_DEFAULT: String = "c"
++# 走原版那条两态路的档位（`platform_visuals` ↔ `_flipped` 开关）。
++# 其余档位一律走 `_mp8_apply_view()` 的几何重新指认。
++const MP8_VIEW_VANILLA: String = "a"
++
++var _mp8_view_mode: String = MP8_VIEW_DEFAULT
++var _mp8_my_facing: float = 0.0
++# 搬完位置之后的每组家当：{"platform":, "nodes":, "pos": 最终世界坐标}
++var _mp8_groups_final: Array = []
++
++
++func _mp8_facing_step() -> float:
++	return float(MP8_VIEW_STEPS.get(_mp8_view_mode, 180.0))
++
++
++# [MP8] 这个人该用哪个朝向。
++# 相机静止时在 +Z 侧朝 -Z 看，所以朝向 = 平台的方位角 `atan2(x, z)`，按模式步长取整。
++# ⚠️ **step=180 时与原版逐例等价**，所以三种模式可以统一走这一个函数：
++#    (±13,+13) → ±45° → 取整到 0；(±13,−13) → ±135° → 取整到 180。
++func _mp8_facing_for(pos: Vector3) -> float:
++	var step: float = _mp8_facing_step()
++	var bearing: float = rad_to_deg(atan2(pos.x, pos.z))
++	return fposmod(round(bearing / step) * step, 360.0)
++
++
++# [MP8] 按当前朝向，把每块平台指认到「此刻落在它头上」的那套美术。
++#
++# `visuals_base` 转了 deg，所以原来在 g 处的美术现在在 R(deg)·g；
++# 要找盖住平台 p 的那一组，就是找 **g ≈ R(−deg)·p**。
++#
++# ⚠️ B/C 模式下**绝不能**再走原版那句 `platform_visuals = platform_visuals_flipped`：
++#    那是两态开关，这里已经直接指认成正确的一套了，再翻一次就翻错。
++func _mp8_rebind_for_facing(deg: float) -> void :
++
++	if _mp8_groups_final.is_empty():
++		return
++
++	var inv := Basis(Vector3.UP, deg_to_rad( - deg))
++	var hit: int = 0
++
++	for g in _mp8_groups_final:
++		var pl = g["platform"]
++		if pl == null or not is_instance_valid(pl):
++			continue
++
++		var p: Vector3 = Vector3(pl.global_position.x, 0.0, pl.global_position.z)
++		var want: Vector3 = inv * p
++		var want_far: Vector3 = - want
++
++		var best: Dictionary = {}
++		var far: Dictionary = {}
++		var bd: float = INF
++		var fd: float = INF
++		for h in _mp8_groups_final:
++			var hp: Vector3 = h["pos"]
++			var d: float = Vector2(hp.x - want.x, hp.z - want.z).length()
++			if d < bd:
++				bd = d
++				best = h
++			var d2: float = Vector2(hp.x - want_far.x, hp.z - want_far.z).length()
++			if d2 < fd:
++				fd = d2
++				far = h
++
++		if best.is_empty():
++			continue
++
++		# 拿平台本体 + 那一组的家当拼一个临时组，复用已经验过的接线函数
++		_mp8_wire_platform(
++			{"platform": pl, "nodes": best["nodes"]},
++			(far if not far.is_empty() else best)
++		)
++		hit += 1
++
++	print("[MP8] 残骸平台：朝向 %.0f° → 重新指认了 %d/%d 块平台的美术" % [
++		deg, hit, _mp8_groups_final.size()
++	])
++
++
++# [MP8] B/C 模式下的整套视角切换。**本机执行，每台机器各转各的。**
++func _mp8_apply_view(deg: float) -> void :
++
++	_mp8_my_facing = deg
++	if camera_base != null:
++		camera_base.rotation_degrees.y = deg
++	if visuals_base != null:
++		visuals_base.rotation_degrees.y = deg
++	_mp8_rebind_for_facing(deg)
++	_mp8_show_id_hud()
 +
 +
 +# [MP8] ===== 相机：**按玩家单独调，能不动的一律不动**（用户 2026-08-16 提议）=====
@@ -938,7 +1168,46 @@ diff --git a/minigames/junk_platform/scripts/junk_platform.gd b/minigames/junk_p
  func spawn_players():
  
  	player_count = PlayerManager.player_presences.size()
-@@ -119,6 +1027,20 @@ func spawn_players():
+@@ -95,8 +1233,9 @@ func spawn_players():
+ 
+ 		player_character.network_id = network_id
+ 
+-		if position.z < 0:
+-			camera_rotation = 180.0
++		# [MP8] 朝向统一走 _mp8_facing_for()：不传模式时步长 180，与原版那句
++		# `if position.z < 0: camera_rotation = 180.0` **逐例等价**（判据见该函数注释）。
++		camera_rotation = _mp8_facing_for(position)
+ 
+ 		if GameManager.local_game:
+ 			camera_rotation = rad_to_deg(spawn_positions[i].basis.get_euler().y)
+@@ -106,19 +1245,39 @@ func spawn_players():
+ 			position, camera_rotation
+ 		)
+ 
+-		if not GameManager.local_game and camera_rotation > 0.0:
++		# [MP8] B/C 模式：**朝向 0 也要发**——客机要靠这一趟把 HUD 的朝向刷出来，
++		# 而且 0° 的重新指认是恒等变换，白发一趟没有副作用。
++		# 不传模式时条件与原版一模一样（`> 0.0`），走原版那条两态路。
++		if not GameManager.local_game and (_mp8_view_mode != MP8_VIEW_VANILLA or camera_rotation > 0.0):
+ 
+ 			if network_id == 1:
+-				camera_base.rotation_degrees.y = camera_rotation
+-				visuals_base.rotation_degrees.y = camera_rotation
+-				for j in platforms:
+-					j.damage_circle_parent = j.damage_circle_parent_flipped
+-					j.platform_visuals = j.platform_visuals_flipped
+-					j.assign_indicators()
+-					j.assign_flipped_compactor()
++				if _mp8_view_mode != MP8_VIEW_VANILLA:
++					_mp8_apply_view(camera_rotation)
++				else:
++					camera_base.rotation_degrees.y = camera_rotation
++					visuals_base.rotation_degrees.y = camera_rotation
++					for j in platforms:
++						j.damage_circle_parent = j.damage_circle_parent_flipped
++						j.platform_visuals = j.platform_visuals_flipped
++						j.assign_indicators()
++						j.assign_flipped_compactor()
  			else:
  				rotate_camera_rpc.rpc_id(network_id, camera_rotation)
  
@@ -959,7 +1228,7 @@ diff --git a/minigames/junk_platform/scripts/junk_platform.gd b/minigames/junk_p
  		player_character.emit_died.connect(_on_player_died)
  		player_character.event_fallen.connect(_on_player_fallen)
  
-@@ -126,6 +1048,33 @@ func spawn_players():
+@@ -126,6 +1285,33 @@ func spawn_players():
  		active_players[network_id] = player_character
  		player_scores[network_id] = 0
  
@@ -993,7 +1262,23 @@ diff --git a/minigames/junk_platform/scripts/junk_platform.gd b/minigames/junk_p
  
  func cleanup():
  
-@@ -157,14 +1106,51 @@ func check_game_end():
+@@ -141,6 +1327,15 @@ func player_disconnected(_network_id: int):
+ 	remove_player_rpc.rpc(_network_id)
+ 	await get_tree().create_timer(1.0).timeout
+ 
++	# [MP8] T44 守卫：本局还没正式开始（有人卡在加载里，闸门未放行）。
++	# 此时 `spawn_players()` 还没跑过（它由 `initialize()` 触发），场上一个人都没有，
++	# 下面那句会把一局**尚未开始**的游戏当成打完了收尾。
++	# 另一处 check_game_end() 在玩家真死时调，那条不受影响，只挡掉线这条。
++	# 清理照做，只不做收尾。完整分析见 T44。
++	if not is_all_player_loaded:
++		print("[MP8] 残骸平台：%d 掉线时本局还没开始，跳过收尾检查" % _network_id)
++		return
++
+ 	check_game_end()
+ 
+ 
+@@ -157,14 +1352,51 @@ func check_game_end():
  	for i in dead_players.size():
  		player_scores[dead_players[i]] = i
  
@@ -1048,7 +1333,22 @@ diff --git a/minigames/junk_platform/scripts/junk_platform.gd b/minigames/junk_p
  	await get_tree().create_timer(2.0).timeout
  	set_minigame_sfx_linear_volume_rpc.rpc(0.0)
  
-@@ -211,6 +1197,44 @@ func _on_countdown_expired():
+@@ -175,6 +1407,14 @@ func check_game_end():
+ 
+ @rpc("any_peer", "call_remote", "reliable")
+ func rotate_camera_rpc(_rotation: float):
++
++	# [MP8] B/C 模式：任意角度 + 按几何重新指认美术。
++	# **必须在下面那条两态路之前 return** —— 那句 `= platform_visuals_flipped`
++	# 是个两态开关，而 _mp8_apply_view 已经把正确的一套直接指认好了，再翻一次就翻错。
++	if _mp8_view_mode != MP8_VIEW_VANILLA:
++		_mp8_apply_view(_rotation)
++		return
++
+ 	camera_base.rotation_degrees.y = _rotation
+ 	visuals_base.rotation_degrees.y = _rotation
+ 	for i in platforms:
+@@ -211,6 +1451,44 @@ func _on_countdown_expired():
  
  	state_machine.transition_to_rpc.rpc(&"Play")
  

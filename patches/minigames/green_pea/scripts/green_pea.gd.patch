@@ -353,7 +353,22 @@ diff --git a/minigames/green_pea/scripts/green_pea.gd b/minigames/green_pea/scri
  	player_scores_finalized.emit(player_scores)
  
  	await get_tree().create_timer(3.0).timeout
-@@ -170,14 +498,12 @@ func _on_player_finished(_network_id: int):
+@@ -162,6 +490,14 @@ func player_disconnected(_network_id: int):
+ 	await get_tree().create_timer(1.0).timeout
+ 
+ 	if multiplayer.is_server():
++
++		# [MP8] T44 守卫：本局还没正式开始（有人卡在加载里，闸门未放行）。
++		# 吃豆子的判据是 `if active_players.size() > 0: return` —— 开局前是 0，
++		# 条件为假，**直接穿过去结算**。清理照做，只不做收尾。完整分析见 T44。
++		if not is_all_player_loaded:
++			print("[MP8] 吃豆子：%d 掉线时本局还没开始，跳过收尾检查" % _network_id)
++			return
++
+ 		check_game_end()
+ 
+ func _on_player_finished(_network_id: int):
+@@ -170,14 +506,12 @@ func _on_player_finished(_network_id: int):
  		if ach_active:
  			player_characters[_network_id].trigger_achievement_rpc.rpc()
  
@@ -371,7 +386,7 @@ diff --git a/minigames/green_pea/scripts/green_pea.gd b/minigames/green_pea/scri
  	if not finished_players.has(_network_id):
  		finished_players.append(_network_id)
  
-@@ -187,14 +513,18 @@ func _on_player_died(_network_id: int):
+@@ -187,14 +521,18 @@ func _on_player_died(_network_id: int):
  
  	if active_players.has(_network_id):
  		active_players.erase(_network_id)

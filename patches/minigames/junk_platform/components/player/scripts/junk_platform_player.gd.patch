@@ -1,0 +1,25 @@
+diff --git a/minigames/junk_platform/components/player/scripts/junk_platform_player.gd b/minigames/junk_platform/components/player/scripts/junk_platform_player.gd
+--- a/minigames/junk_platform/components/player/scripts/junk_platform_player.gd
++++ b/minigames/junk_platform/components/player/scripts/junk_platform_player.gd
+@@ -154,6 +154,21 @@ func update_interaction(_delta: float) -> void :
+ 		if DynamicInput.is_action_just_pressed(player_presence.device_id, "action_1"):
+ 
+ 			for item in in_grab_area:
++
++				# [MP8] T47 ②：**别去抓已经在别人手里的那块。**原版这里一个检查都没有，
++				# 谁按谁就本地 `held_item = item` 并广播「归我了」。后果两层：
++				#   1. 两个人都以为自己拿着，箱子只跟一个 → 另一个按扔时
++				#      `throw_rpc` 撞上 `if not held_by: return`，**空扔**
++				#      （和碎骨者那条「按扔扔出别人背上那台」同一个味道）；
++				#   2. 更隐蔽的是碰撞例外泄漏，见 cube 那边的注释。
++				# 这道门挡掉的是**常见情况**（那块已经被拿走一会儿了）。
++				# ⚠️ 真正同一帧一起按的窗口它挡不住 —— 那需要把抓取改成服务器裁决，
++				#    代价是抓东西要多等一个来回的延迟，手感损失更大。**故意不做。**
++				#    cube 那边的换手清理保证了即使撞上，也不会留下永久的碰撞例外。
++				if item.held_by_player != null and is_instance_valid(item.held_by_player) \
++						and item.held_by_player != self:
++					continue
++
+ 				held_item = item
+ 				grab_area.set_collision_layer_value(grab_layer, false)
+ 				held_item.set_held_rpc.rpc(true, get_path())

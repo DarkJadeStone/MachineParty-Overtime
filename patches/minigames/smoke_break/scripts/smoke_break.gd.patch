@@ -849,3 +849,24 @@ diff --git a/minigames/smoke_break/scripts/smoke_break.gd b/minigames/smoke_brea
  		)
  		player_character.register_camera_offset_rpc.rpc(
  			camera_offset_parent.get_path()
+@@ -147,7 +963,19 @@ func _on_player_finished(network_id: int):
+ func player_disconnected(_network_id: int):
+ 	super.player_disconnected(_network_id)
+ 
+-	var player_instance = player_characters[_network_id]
++	# [MP8] T44：原版这里是 `player_characters[_network_id]` —— **裸取字典**。
++	# 掉线的人不在 player_characters 里是常态：`spawn_players()` 由 `initialize()` 触发，
++	# 而加载途中掉的人从来没被 spawn 过。那次读会报 "Invalid access to key" 并
++	# **中断整个函数**，紧接着 `player_instance.queue_free()` 又会对 null 调方法。
++	#
++	# ⚠️ 本小游戏的 `player_disconnected` **没有调任何收尾函数**，所以它不受
++	#    T44 那条黑屏/静音链影响，**不需要 is_all_player_loaded 守卫** —— 这里只补空值。
++	var player_instance = player_characters.get(_network_id, null)
++
++	if player_instance == null:
++		print("[MP8] 吸烟小憩：%d 掉线时还没有座位实例（本局多半还没开始），只清引用" % _network_id)
++		player_characters.erase(_network_id)
++		return
+ 
+ 	active_players.erase(player_instance)
+ 

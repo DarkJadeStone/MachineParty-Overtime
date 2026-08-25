@@ -43,7 +43,8 @@ end of it:
 | **Enable Overtime** / **Switch to vanilla** | Flips between the two. Takes about a second. |
 | **Play** | Asks Steam to launch the game. Optional. |
 | **Steam repair** | Opens Steam's "verify integrity of game files". Use it if something is broken and you have no way back. |
-| **Open log** | Shows exactly what the launcher did. **Attach this when reporting a problem.** |
+| **Install log** | Shows exactly what the launcher did. **Attach this when reporting a problem.** |
+| **Game log** | Opens the folder holding the game's current `godot.log`. Attach that one when reporting an in-game bug (a crash, a black screen). It only opens a local folder — nothing is uploaded anywhere. |
 
 ## Three things you must know
 
@@ -138,7 +139,8 @@ developer or publisher of Machine Party.
 | **启用 Overtime** / **切回原版** | 在两者之间切换，大约一秒 |
 | **启动游戏** | 让 Steam 启动游戏。可有可无 |
 | **Steam 修复** | 打开 Steam 的「验证游戏文件的完整性」。出了问题又没别的办法时用它 |
-| **打开日志** | 看它到底做了什么。**报问题时请把这个一起发来** |
+| **安装日志** | 看它到底做了什么。**报安装问题时请把这个一起发来** |
+| **游戏日志** | 直接打开游戏当前 `godot.log` 所在的文件夹。报**游戏内**的 bug（崩退、黑屏）时发这个。它只打开本地文件夹，**不会上传任何东西** |
 
 ## 先说清楚三件事
 

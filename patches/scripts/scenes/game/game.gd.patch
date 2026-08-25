@@ -204,7 +204,70 @@ diff --git a/scripts/scenes/game/game.gd b/scripts/scenes/game/game.gd
  
  func update_scores(more_rounds: bool):
  
-@@ -707,15 +886,62 @@ func _on_host_overlay_minigame_selected(minigame_identifier: Globals.MinigameIde
+@@ -643,9 +822,62 @@ func _on_peer_disconnected(_network_id: int):
+ 		)
+ 		intermission_manager.screen_briefing.update_player_data_rpc.rpc(total_score_by_network_id)
+ 
++	# [MP8] 🩸 T44 第 0 项（根因）：闸门必须在有人掉线时重新求值一次。
++	#
++	# 一句话：`minigame.gd:132` 那个
++	# `players_loaded.size() == PlayerManager.player_presences.size()`
++	# **只在有人上报的那一刻求值**，而掉线让分母变小、
++	# 且从没人清理过分子 —— 于是加载途中掉一个人，
++	# `all_players_loaded()` 就再也不会触发：这一局**全程静音**
++	# （音效总线只有 `initialize()` 抬得回来）、**局末全员黑屏**
++	# （会话状态机压根没进 `MinigameStart`）。完整分析见 T44。
++	#
++	# ⚠️ 必须放在 `minigame.player_disconnected()` **之前**：
++	#    那些处理函数 `await 1 秒` 之后会去调 `check_game_end()`，
++	#    闸门先放行的话这一局已经正常开起来了，那次检查才有意义。
++	# ⚠️ 也必须放在上面 `PlayerManager.remove_player_rpc.rpc()` **之后**：
++	#    那个 RPC 是 `call_local`，所以走到这里时 `player_presences` 已经是新分母了。
++	_mp8_recheck_load_gate(_network_id)
++
+ 	if minigame:
+ 		minigame.player_disconnected(_network_id)
+ 
++# [MP8] T44 第 0 项：掉线之后重新求值一次加载闸门。
++#
++# 两种掉线时机的修法不一样，所以**剔除和重算两件都要做**：
++#   · 上报**之前**掉 → 分母减 1 后其实正好相等，光重算就够；
++#   · 上报**之后**掉 → `players_loaded` 比分母多一个，**不先剔除就永远相等不了**。
++#
++# ⚠️ `is_all_player_loaded` 当「已经放行过」的旗子用：15 个小游戏的
++#    `all_players_loaded()` 覆写都在服务器侧把它置 true（逐个核对过），所以它可信。
++#    没有这道判断的话，**开局之后**再有人掉线会把整局重新 initialize 一遍。
++# ⚠️ 只在服务器跑：闸门本体也是 `if multiplayer.is_server()` 包着的。
++func _mp8_recheck_load_gate(_network_id: int) -> void :
++
++	if not multiplayer.is_server():
++		return
++	if not is_instance_valid(minigame):
++		return
++	if minigame.is_all_player_loaded:
++		return
++
++	var before: int = minigame.players_loaded.size()
++	minigame.players_loaded.erase(_network_id)
++
++	var have: int = minigame.players_loaded.size()
++	var want: int = PlayerManager.player_presences.size()
++	var pass_now: bool = want > 0 and have >= want
++
++	print("[MP8] 掉线闸门重算：%d 掉线 → 已上报 %d（剔除前 %d）/ 在场 %d —— %s" % [
++		_network_id, have, before, want, "闸门放行" if pass_now else "还有人没上报，继续等"
++	])
++
++	if not pass_now:
++		return
++
++	minigame.all_players_loaded()
++
++
+ func _on_minigame_pick_finished(minigame_index: int):
+ 	if debug_no_shuffle:
+ 		minigame_index = 0
+@@ -707,15 +939,62 @@ func _on_host_overlay_minigame_selected(minigame_identifier: Globals.MinigameIde
  
  	load_minigame(minigame_identifier, false, 1)
  

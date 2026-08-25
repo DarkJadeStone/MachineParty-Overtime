@@ -1,7 +1,47 @@
 diff --git a/minigames/junk_platform/components/junk_cube_rigidbody/junk_platform_cube_rigidbody.gd b/minigames/junk_platform/components/junk_cube_rigidbody/junk_platform_cube_rigidbody.gd
 --- a/minigames/junk_platform/components/junk_cube_rigidbody/junk_platform_cube_rigidbody.gd
 +++ b/minigames/junk_platform/components/junk_cube_rigidbody/junk_platform_cube_rigidbody.gd
-@@ -124,6 +124,22 @@ func reset_rpc():
+@@ -111,8 +111,38 @@ func throw_rpc(_position: Vector3, _direction: Vector3, _strength: float, _throw
+ 
+ @rpc("any_peer", "call_local", "reliable")
+ func set_held_rpc(held: bool, _held_by: NodePath):
++
++	# [MP8] T47 ②：**换手之前必须先摘掉上一个人的碰撞例外，否则永久泄漏。**
++	#
++	# 原版这里无条件 `add_collision_exception_with(held_by_player)`，
++	# 而全文件**只有一处 `remove`**（`throw_rpc` 里，摘的是**当时**那个 `held_by_player`）。
++	# 于是两人同帧抢同一块时：两条 `set_held_rpc` 各 add 一次、后到的把 `held_by_player` 覆盖掉，
++	# 之后 throw 只摘得掉最后那个 —— **抢输的那个人和这块残骸之间的例外再也不会被移除，
++	# 那块残骸从此穿过他**，而且是永久的，玩得越久越糟。
++	#
++	# ⚠️ 掉落/死亡那条路不受影响：`drop_item_rpc` 走的是 `throw_rpc`，会正常摘。
++	#    **唯一的泄漏口就是这里的换手。**
++	#
++	# ⚠️ 这里**不做「已经被别人拿着就拒绝」**：本 RPC 是各客机广播的，
++	#    不同端的到达顺序可能不同，按「先到先得」拒绝会让各端选出**不同的赢家**，
++	#    比现在的「后到者接管」更糟。真要根治得把抓取改成服务器裁决，
++	#    代价是抓东西多等一个来回的延迟。**常见情况已经在玩家那侧挡掉了**
++	#    （`junk_platform_player.gd` 抓取循环里跳过已被别人拿着的），
++	#    这里只保证**即使撞上同帧窗口，也不留下永久的碰撞例外**。
++	var claimer: Node = get_node_or_null(_held_by)
++	if claimer == null:
++		push_warning("[MP8] 残骸平台：set_held_rpc 收到找不到的路径 %s，忽略" % String(_held_by))
++		return
++
++	if held_by_player != null and is_instance_valid(held_by_player) and held_by_player != claimer:
++		remove_collision_exception_with(held_by_player)
++		if multiplayer.is_server():
++			print("[MP8] 残骸平台：残骸换手 %s → %s（同帧抢同一块，已摘掉旧的碰撞例外）" % [
++				String(held_by_player.name), String(claimer.name)
++			])
++
+ 	visible = false
+-	held_by_player = get_node(_held_by)
++	held_by_player = claimer
+ 	add_collision_exception_with(held_by_player)
+ 	held_by = held_by_player.grab_position
+ 	freeze = held
+@@ -124,6 +154,22 @@ func reset_rpc():
  	active = false
  	freeze = true
  

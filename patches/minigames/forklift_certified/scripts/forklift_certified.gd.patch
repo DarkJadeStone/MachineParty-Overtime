@@ -313,7 +313,20 @@ diff --git a/minigames/forklift_certified/scripts/forklift_certified.gd b/miniga
  func cleanup():
  
  	if is_multiplayer_authority():
-@@ -143,21 +371,27 @@ func player_disconnected(_network_id: int):
+@@ -139,25 +367,40 @@ func player_disconnected(_network_id: int):
+ 	disconnect_player_rpc.rpc(_network_id)
+ 	await get_tree().create_timer(1.0).timeout
+ 
++	# [MP8] T44 守卫：本局还没正式开始（有人卡在加载里，闸门未放行）。
++	# 此时 `spawn_players()` 还没跑过（它由 `initialize()` 触发），场上一个人都没有，
++	# 下面那句会把一局**尚未开始**的游戏当成打完了收尾。
++	# 判据是 _mp8_active_team_count() > 1，开局前是 0 队，条件为假；from_disconnect 那个早退只在 >1 时才起作用，挡不住这条。
++	# 清理照做，只不做收尾。完整分析见 T44。
++	if not is_all_player_loaded:
++		print("[MP8] 叉车认证：%d 掉线时本局还没开始，跳过收尾检查" % _network_id)
++		return
++
+ 	check_game_end(true)
  
  func check_game_end(from_disconnect: bool = false):
  
@@ -345,7 +358,7 @@ diff --git a/minigames/forklift_certified/scripts/forklift_certified.gd b/miniga
  	await get_tree().create_timer(2.0).timeout
  	set_minigame_sfx_linear_volume_rpc.rpc(0.0)
  
-@@ -204,11 +438,15 @@ func remove_zero_scoring_players():
+@@ -204,11 +447,15 @@ func remove_zero_scoring_players():
  
  		if delivery_area.crates_in_area.size() == 0:
  			zero_scoring_areas.append(delivery_area)
@@ -362,7 +375,7 @@ diff --git a/minigames/forklift_certified/scripts/forklift_certified.gd b/miniga
  		player_scores[network_id] = dead_players.size()
  		players_removed.append(network_id)
  
-@@ -221,7 +459,8 @@ func remove_zero_scoring_players():
+@@ -221,7 +468,8 @@ func remove_zero_scoring_players():
  
  func calculate_results():
  
@@ -372,7 +385,7 @@ diff --git a/minigames/forklift_certified/scripts/forklift_certified.gd b/miniga
  		return
  
  
-@@ -236,10 +475,14 @@ func calculate_results():
+@@ -236,10 +484,14 @@ func calculate_results():
  
  	var player_ids_by_score: Dictionary
  	for delivery_area in active_delivery_areas:
@@ -389,7 +402,7 @@ diff --git a/minigames/forklift_certified/scripts/forklift_certified.gd b/miniga
  
  	var lowest_score: int = player_ids_by_score.keys().min()
  	var heighest_score: int = player_ids_by_score.keys().max()
-@@ -252,7 +495,7 @@ func calculate_results():
+@@ -252,7 +504,7 @@ func calculate_results():
  			player_scores[player_id] = dead_players.size()
  			players_removed.append(player_id)
  			for delivery_area in all_delivery_areas:
@@ -398,7 +411,7 @@ diff --git a/minigames/forklift_certified/scripts/forklift_certified.gd b/miniga
  					delivery_area.set_owner_rpc.rpc(set_inactive_area_to)
  
  	for score in player_ids_by_score.keys():
-@@ -265,7 +508,7 @@ func calculate_results():
+@@ -265,7 +517,7 @@ func calculate_results():
  				player_scores[network_id] = dead_players.size()
  				players_removed.append(network_id)
  				for delivery_area in all_delivery_areas:
@@ -407,7 +420,7 @@ diff --git a/minigames/forklift_certified/scripts/forklift_certified.gd b/miniga
  						delivery_area.set_owner_rpc.rpc(set_inactive_area_to)
  
  	for pid in players_removed:
-@@ -318,20 +561,38 @@ func disconnect_player_rpc(_network_id: int):
+@@ -318,20 +570,38 @@ func disconnect_player_rpc(_network_id: int):
  		active_players[_network_id].queue_free()
  		active_players.erase(_network_id)
  
@@ -455,7 +468,7 @@ diff --git a/minigames/forklift_certified/scripts/forklift_certified.gd b/miniga
  @rpc("authority", "call_local", "reliable")
  func remove_active_player_rpc(_network_id: int):
  
-@@ -341,9 +602,9 @@ func remove_active_player_rpc(_network_id: int):
+@@ -341,9 +611,9 @@ func remove_active_player_rpc(_network_id: int):
  
  		if multiplayer.is_server():
  			var blood_decal_position = Vector3(
@@ -468,7 +481,7 @@ diff --git a/minigames/forklift_certified/scripts/forklift_certified.gd b/miniga
  			)
  			spawn_blood_rpc.rpc(blood_decal_position)
  		active_players.erase(_network_id)
-@@ -351,9 +612,27 @@ func remove_active_player_rpc(_network_id: int):
+@@ -351,9 +621,27 @@ func remove_active_player_rpc(_network_id: int):
  @rpc("authority", "call_local", "reliable")
  func spawn_blood_rpc(_at_pos: Vector3):
  
@@ -499,7 +512,7 @@ diff --git a/minigames/forklift_certified/scripts/forklift_certified.gd b/miniga
  	decal.global_position = _at_pos
  	decal.global_rotation = Vector3(decal.global_rotation.x, randf_range(0, 360), decal.global_rotation.z)
  
-@@ -368,23 +647,26 @@ func _on_crate_numbers_changed():
+@@ -368,23 +656,26 @@ func _on_crate_numbers_changed():
  
  	var highest_score: int = 0
  	for da in delivery_areas:
@@ -532,7 +545,7 @@ diff --git a/minigames/forklift_certified/scripts/forklift_certified.gd b/miniga
  		return
  
  	for da in delivery_areas:
-@@ -392,12 +674,31 @@ func _on_crate_numbers_changed():
+@@ -392,12 +683,31 @@ func _on_crate_numbers_changed():
  		if da.belongs_to_id <= check_id_threshold:
  			continue
  
@@ -570,7 +583,7 @@ diff --git a/minigames/forklift_certified/scripts/forklift_certified.gd b/miniga
  
  func _on_round_timer_timeout():
  
-@@ -426,3 +727,582 @@ func _on_player_died(_network_id: int):
+@@ -426,3 +736,582 @@ func _on_player_died(_network_id: int):
  	await get_tree().create_timer(1.0).timeout
  
  	check_game_end()

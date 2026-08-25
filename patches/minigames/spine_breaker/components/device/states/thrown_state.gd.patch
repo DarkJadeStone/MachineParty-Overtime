@@ -23,7 +23,7 @@ diff --git a/minigames/spine_breaker/components/device/states/thrown_state.gd b/
  		})
  
  func clear_thrower_exception(delay):
-@@ -104,6 +110,56 @@ func clear_thrower_exception(delay):
+@@ -104,6 +110,62 @@ func clear_thrower_exception(delay):
  
  	owner.thrown_collision_exceptions.clear()
  
@@ -62,8 +62,14 @@ diff --git a/minigames/spine_breaker/components/device/states/thrown_state.gd b/
 +# 与 `follow_state._mp8_can_take` **保持同一套**（那边是接触判定，这边是投掷命中，
 +# 语义相同就该用同一条判据）：不是玩家 / 引用失效 / 已经死了 / 已经背着机器 —— 都不粘。
 +#
-+# ⚠️ 粘不上时**不要**让它停在空中：转 Follow 去追这个人（他背上的机器迟早会被扔掉或杀完复位），
-+# 直接 return 会让扔出去的机器僵在原地，比原 bug 更难看。
++# ⚠️ 粘不上时**不要**让它停在空中：直接 return 会让扔出去的机器僵在原地，比原 bug 更难看。所以仍然转 Follow。
++#
++# 🩸 **2026-08-24 更正：这里原本写着「他背上的机器迟早会被扔掉或杀完复位」，那句是错的。**
++# Follow 进去之后根本没有出口：这个人 `_mp8_can_take()` 恒为 false，
++# 既扑不上也选不中，而换目标只在「附近还有别人」时才发生 ——
++# 旁边没人就永久绕着他转（用户 2026-08-24 实机报的）。
++# 现在由 `follow_state._mp8_check_dead_end()` 兽尾：进去第一帧就会发现
++# 目标不可扑，向宿主要新目标。**完整分析写在那个常量上面。**
 +func _mp8_can_attach(p) -> bool :
 +
 +	if p == null or not is_instance_valid(p):
@@ -80,7 +86,7 @@ diff --git a/minigames/spine_breaker/components/device/states/thrown_state.gd b/
  func _on_player_attach_entered(body):
  
  	if not active:
-@@ -115,6 +171,19 @@ func _on_player_attach_entered(body):
+@@ -115,6 +177,19 @@ func _on_player_attach_entered(body):
  	if owner.thrown_collision_exceptions.has(body):
  		return
  

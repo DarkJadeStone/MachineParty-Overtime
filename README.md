@@ -37,6 +37,57 @@ eight.*</sub>
 
 ## 更新日志
 
+### 1.3 —— 加载期间掉线，以及多人局中的实际游玩问题
+
+- **联机掉线**：修复玩家在小游戏加载过程中掉线后，本局全程静音、结束时全员黑屏的问题；
+  同时为 12 个小游戏补上异常收尾保护，并修正枪械工厂、吸烟小憩在该时机可能出现的清理报错。
+- **碎骨者**：修复正对玩家时无法投掷、第二台装置持续追踪已经背着装置的玩家，
+  以及投掷时误选别人背上或已经飞出的装置、导致投掷落空的问题。
+- **残骸平台**：调整场地与摄像机，8 人局中每名玩家使用独立的 45° 视角，减少互相遮挡；
+  静止残骸回收时间由 60 秒缩短至 30 秒。
+- **残骸平台**：修复多人争抢同一块残骸后，残骸可能永久穿过其中一名玩家的问题。
+- **猎鸭**：6 人局猎人射速降低 20%；修复 7 人独狼回合错误显示为「猎人削弱」的问题。
+- **猎鸭**：修复两名猎人同时命中同一只鸭时，死亡动画、血和音效可能重复触发的问题；计分本身不会重复。
+- **启动器**：新增「游戏日志」按钮，可以直接找到当前的 `godot.log`；原「打开日志」更名为「安装日志」。
+  按钮只打开本地文件夹，不会自动上传日志。
+- **日志清理**：开发用的 `[MP8-AUDIT]` 侦察日志改为按需开启，正式游玩时不再默认输出大量无用诊断信息。
+- **安装说明**：补充说明 Overtime 暂不兼容 MachinePartyModLoader，以及其他会修改游戏 PCK 的 Mod。
+  该限制并非 1.3 新增。
+
+⚠️ **1.3 与 1.2 不能互通**，同一房间的所有玩家都需要更新至 1.3。
+（主菜单右下角会显示 `v2.1.2+overtime-1.3`，一眼能对。）
+
+> **English — 1.3: a disconnect during loading, plus issues that actually show up in multiplayer.**
+>
+> - **Disconnects**: fixed a player dropping *during minigame loading* leaving the whole round
+>   silent and every player on a black screen at the end. Twelve minigames also got a guard
+>   against running end-of-round logic before the round started, and cleanup errors in
+>   Manufacture Gun and Smoke Break at that same moment are fixed.
+> - **Spine Breaker**: fixed being unable to throw while facing a player directly; a second
+>   device endlessly chasing someone who was already carrying one; and throws picking a device
+>   on someone else's back — or one already in flight — instead of your own, so the throw did nothing.
+> - **Debris Platforms**: arena and cameras reworked so each of the 8 players gets their own
+>   45° view, greatly reducing players blocking each other. Idle debris is now recycled after
+>   30 seconds instead of 60.
+> - **Debris Platforms**: fixed debris being able to pass through a player permanently after
+>   several players contested the same piece.
+> - **Duck Hunt**: hunter fire rate reduced by 20% in 6-player rounds; fixed the 7-player
+>   lone-hunter round showing "HUNTER NERFED" when the hunter is actually buffed.
+> - **Duck Hunt**: fixed the death animation, blood and sound effects firing twice when two
+>   hunters hit the same duck simultaneously. Scoring itself never double-counted.
+> - **Launcher**: new "Game log" button that takes you straight to the current `godot.log`;
+>   the old "Open log" is now "Install log". The buttons only open a local folder —
+>   nothing is uploaded.
+> - **Log cleanup**: the developer `[MP8-AUDIT]` diagnostic dump is now opt-in, so normal play
+>   no longer floods the log with diagnostics nobody needs.
+> - **Install notes**: documented that Overtime is not currently compatible with
+>   MachinePartyModLoader, or with any other mod that modifies the game's PCK.
+>   This is not new in 1.3.
+>
+> ⚠️ **1.3 is not compatible with 1.2** — everyone in the lobby has to update to 1.3.
+
+---
+
 ### 1.2 —— 修好了两个会卡死整局的 bug，顺带把重复音效压下去
 
 **内部暗手：拿到针筒的人再拿到一支，整局会卡死。**

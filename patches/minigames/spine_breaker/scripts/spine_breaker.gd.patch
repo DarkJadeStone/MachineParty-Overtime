@@ -376,7 +376,23 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
  
  func cleanup():
  
-@@ -144,17 +454,33 @@ func check_game_end():
+@@ -131,6 +441,15 @@ func player_disconnected(_network_id: int):
+ 	remove_player_rpc.rpc(_network_id)
+ 	await get_tree().create_timer(1.0).timeout
+ 
++	# [MP8] T44 守卫：本局还没正式开始（有人卡在加载里，闸门未放行）。
++	# 此时 `spawn_players()` 还没跑过（它由 `initialize()` 触发），场上一个人都没有，
++	# 下面那句会把一局**尚未开始**的游戏当成打完了收尾。
++	# 碎骨者是纯淘汰制（只剩 1 人才结束），空的 active_players 会被当成「只剩 0 人」直接结算。
++	# 清理照做，只不做收尾。完整分析见 T44。
++	if not is_all_player_loaded:
++		print("[MP8] 碎骨者：%d 掉线时本局还没开始，跳过收尾检查" % _network_id)
++		return
++
+ 	check_game_end()
+ 
+ func check_game_end():
+@@ -144,17 +463,33 @@ func check_game_end():
  	finished = true
  
  	set_playing_rpc.rpc(false)
@@ -412,7 +428,7 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
  	player_scores_finalized.emit(player_scores)
  
  	await get_tree().create_timer(2.0).timeout
-@@ -172,7 +498,11 @@ func remove_player_rpc(_network_id: int):
+@@ -172,7 +507,11 @@ func remove_player_rpc(_network_id: int):
  	if player_instance:
  
  		if multiplayer.is_server():
@@ -425,7 +441,7 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
  
  		player_instance.queue_free()
  		players.erase(_network_id)
-@@ -187,18 +517,127 @@ func set_playing_rpc(_playing: bool):
+@@ -187,18 +526,127 @@ func set_playing_rpc(_playing: bool):
  func _on_countdown_tick(time_left: int):
  	super._on_countdown_tick(time_left)
  
@@ -441,7 +457,12 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
  
 -	var random_player = active_players.values().pick_random()
 +	var list: Array = ([which] if which != null else _mp8_devices)
-+
+ 
+-	device.state_machine.transition_to(&"Follow", {
+-		"target": random_player, 
+-		"new_target": true
+-	})
+-	device.start_timer()
 +	for d in list:
 +
 +		if not is_instance_valid(d):
@@ -550,17 +571,12 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
 +			continue
 +		if _mp8_hunting(d) == p:
 +			return true
- 
--	device.state_machine.transition_to(&"Follow", {
--		"target": random_player, 
--		"new_target": true
--	})
--	device.start_timer()
++
 +	return false
  
  func _on_countdown_expired():
  	super._on_countdown_expired()
-@@ -211,14 +650,19 @@ func _on_countdown_expired():
+@@ -211,14 +659,19 @@ func _on_countdown_expired():
  
  	set_playing_rpc.rpc(true)
  
@@ -584,7 +600,7 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
  
  func _on_player_died(_network_id: int):
  
-@@ -226,6 +670,932 @@ func _on_player_died(_network_id: int):
+@@ -226,6 +679,932 @@ func _on_player_died(_network_id: int):
  		active_players.erase(_network_id)
  		dead_players.append(_network_id)
  
