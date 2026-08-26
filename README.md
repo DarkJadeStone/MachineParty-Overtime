@@ -37,6 +37,50 @@ eight.*</sub>
 
 ## 更新日志
 
+### 1.3.1 —— 只换启动器：修好「明明没开游戏，却说游戏正在运行」
+
+⚠️ **这一版只改启动器，游戏内容一个字节都没变。**
+
+- **已经装好 1.3 的人不用做任何事**，主菜单右下角仍然是 `v2.1.2+overtime-1.3`；
+- **1.3.1 和 1.3 能一起玩**，不需要全房间同步更新；
+- 只有**装不上**的人才需要下这一版。
+
+- **修复**：少数玩家点「启用 Overtime」时必定弹出「游戏正在运行，先完全退出」，
+  但游戏其实根本没开，重启电脑、重装游戏都没用，等于永远装不上。
+  原因是旧版只按**进程名**判断游戏在不在跑 —— 系统里只要存在任何一个叫
+  `Machine Party.exe` 的进程（上次没退干净的残留进程、崩溃后被系统挂住的进程、
+  或者别的目录下一个同名程序），就会被拦下。现在改为**直接检查游戏数据包本身有没有被占用**，
+  并且只有当同名进程**确实位于你选中的那个游戏目录里**时才拦截。
+- **提示更清楚**：真的被占用时，弹窗会直接列出占用进程的 PID 和完整路径，
+  照着去任务管理器结束它就行，不用再猜是什么东西占着。
+- **安装日志**：修复同一批记录被写进文件两遍、以及每次启动多记一行的问题，日志现在干净可读。
+- **界面**：右上角多显示一行「安装器」版本号，反馈问题时能一眼说清自己用的是哪一版。
+
+> **English — 1.3.1: launcher only — fixes "the game is running" when it isn't.**
+>
+> ⚠️ **This release changes the launcher only. Not one byte of game content changed.**
+>
+> - **If you already have 1.3 installed, do nothing** — the main menu still reads `v2.1.2+overtime-1.3`;
+> - **1.3.1 and 1.3 play together**, so a lobby does not have to update in lockstep;
+> - Only download this if the installer refused to work for you.
+>
+> - **Fixed**: for a few players, "Enable Overtime" always popped up "The game is running.
+>   Fully exit it first" even though the game was closed — and neither rebooting nor
+>   reinstalling the game helped, making it impossible to install at all.
+>   The old check went purely by **process name**: any process called `Machine Party.exe`
+>   anywhere on the system (a leftover process that never exited, one Windows kept alive after
+>   a crash, or an unrelated program with the same name) would block it. It now **checks whether
+>   the game's PCK is actually locked**, and only treats a same-named process as the game when
+>   it really lives inside the game folder you picked.
+> - **Clearer message**: when something genuinely is holding the file, the dialog now lists the
+>   PID and full path of that process, so you can end it in Task Manager directly.
+> - **Install log**: fixed the same batch of lines being written to the file twice, plus one
+>   redundant line per launch. The log is readable now.
+> - **UI**: the top right corner now also shows an "installer" build number, which makes bug
+>   reports much easier to place.
+
+---
+
 ### 1.3 —— 加载期间掉线，以及多人局中的实际游玩问题
 
 - **联机掉线**：修复玩家在小游戏加载过程中掉线后，本局全程静音、结束时全员黑屏的问题；

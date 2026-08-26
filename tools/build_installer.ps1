@@ -26,7 +26,18 @@ $nm = Get-Content (Join-Path $patch "modules\multiplayer\network_manager.gd") -R
 $m  = [regex]::Match($nm, 'MP8_VERSION_TAG\s*:\s*String\s*=\s*"([^"]+)"')
 if (-not $m.Success) { throw "从 network_manager.gd 里读不出 MP8_VERSION_TAG" }
 $tag = $m.Groups[1].Value
-Write-Host "[1/4] 版本 = $tag"
+
+# 安装器自己的发布号（Installer.cs 的 ReleaseNum）。跟 mod 版本分开的原因：
+# 「只修安装器」那种发布（1.3 → 1.3.1）mod 版本不变、pck 字节不变，老玩家不用
+# 重装、也不影响联机握手；但输出目录必须分开，否则下面那句 Remove-Item 会把
+# 已经发出去的 dist\overtime-1.3\ 连 zip 一起删掉。
+$cs  = Get-Content $src -Raw
+$mr  = [regex]::Match($cs, 'ReleaseNum\s*=\s*"([^"]+)"')
+if (-not $mr.Success) { throw "从 Installer.cs 里读不出 ReleaseNum" }
+# 变量名别用 $rel：下面那个内嵌资源循环里已经有个 $rel（补丁的相对路径），
+# 撞名字会把输出目录带到 dist\overtime-scripts\scenes\... 去。
+$instRev = $mr.Groups[1].Value
+Write-Host "[1/4] mod 版本 = $tag    安装器发布号 = $instRev"
 
 # 新鲜度：patch\ 里有谁比 patch_gdc\ 新 = build.ps1 没重跑
 $sources = Get-ChildItem $patch -Recurse -Filter "*.gd" -File
@@ -72,7 +83,7 @@ $resArgs += "/resource:$verFile,mp8.version"
 
 # ── 编译 ────────────────────────────────────────────────────────────
 # 每次重建都从空目录开始：残留上一版的文件会让"发给朋友的到底是哪一版"变成糊涂账
-$outDir = Join-Path $root "dist\$tag"
+$outDir = Join-Path $root "dist\overtime-$instRev"
 if (Test-Path $outDir) { Remove-Item $outDir -Recurse -Force }
 New-Item -ItemType Directory -Force $outDir | Out-Null
 
@@ -118,7 +129,7 @@ Remove-Item $work -Recurse -Force
 # 用户 2026-08-18 定：**玩家只该看到一个程序**。
 # 控制台版仍然编（自己排查、脚本化安装、以及从源码构建的人要用），
 # 但**不进发布包** —— 两个 exe 摆在一起只会让玩家纠结该点哪个。
-$zipName = "Machine-Party-Overtime-$($tag -replace '^overtime-', '').zip"
+$zipName = "Machine-Party-Overtime-$instRev.zip"
 $zip     = Join-Path $outDir $zipName
 $stage   = Join-Path $env:TEMP "ot_zip_stage"
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }

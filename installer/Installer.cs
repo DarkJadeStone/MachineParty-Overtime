@@ -59,6 +59,16 @@ static class Core
     public const string VanillaSha  = "326CC3988D3AC554D1F288BED89B1F89D450F78EC9D4470F88558975753DFA8E";
     public const long   VanillaSize = 634798100L;
 
+    // ── 安装器自己的发布号（与 mod 版本是两件事）────────────────────────
+    // ModTag()（来自 network_manager.gd 的 MP8_VERSION_TAG）= 打进 pck 的 mod 版本，
+    //   它决定谁能跟谁联机，一改就是所有人都得重装；
+    // ReleaseNum = 这个 exe 自己的发布号，不进 pck、不进联机握手串，只是标识。
+    // 1.3.1 就是「只修安装器」的一次发布：mod 仍是 overtime-1.3，pck 字节一个没变，
+    // 已装 1.3 的人不用动，1.3 与 1.3.1 的人照样同房。
+    // 它同时决定 dist\ 下的输出目录名与发布包名（见 tools\build_installer.ps1），
+    // 免得重建时把已经发出去的 dist\overtime-1.3\ 连 zip 一起覆盖掉。
+    public const string ReleaseNum = "1.3.1";
+
     public const string AppId   = "4108000";
     public const string GameRel = @"steamapps\common\party project\Machine Party_Windows";
     public const string PckName = "Machine Party.pck";
@@ -95,13 +105,20 @@ static class Core
 
     public static void FlushLog()
     {
+        // 缓冲空就别写：否则每按一次「安装日志」都往文件里插一个空段落头
+        if (logBuf.Count == 0) return;
         try
         {
             var sb = new StringBuilder();
             sb.AppendLine("──── " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") +
-                          "  mod " + ModTag() + "  游戏 " + GameVersion + " ────");
+                          "  mod " + ModTag() + "  安装器 " + ReleaseNum +
+                          "  游戏 " + GameVersion + " ────");
             foreach (string s in logBuf) sb.AppendLine(s);
             File.AppendAllText(LogPath, sb.ToString(), Encoding.UTF8);
+            // 写出去就清掉。1.3 少了这一句：「安装日志」按钮 flush 一次、关窗再
+            // flush 一次，同一批行被原样写进文件两遍 —— 玩家看到的是一整屏
+            // 完全相同的行，反倒以为自己的日志坏了。
+            logBuf.Clear();
         }
         catch { }
     }
@@ -162,10 +179,115 @@ static class Core
         return found;
     }
 
-    public static bool IsGameRunning()
+    // ── 「现在能不能动这个包」───────────────────────────────────────────
+    //
+    // 1.3 之前这里只问一句：进程列表里有没有叫 "Machine Party" 的进程。
+    // 那个判据错在只比名字 —— 不看路径、不看是不是当前选中的这个游戏目录。
+    // 线上真出了事：有玩家机器上常驻一个同名进程（退不干净的僵尸、崩溃后被
+    // WerFault 挂住、或者别处一个同名 exe），于是被永久拦在门外，重启电脑、
+    // 重装游戏全都没用 —— 这两样都动不了「进程叫什么名字」这件事 ——
+    // 而弹窗一个线索都不给。
+    //
+    // 现在拆成两条判据，各管一段：
+    //   ① pck 能不能用 FileShare.None 独占打开 —— 权威。直接问文件系统
+    //      「有没有人占着这个文件」，管它进程叫什么名字；
+    //   ② 同名进程**且**其 exe 路径就落在这个游戏目录里 —— 补 ① 的漏：
+    //      Godot 的 FileAccessPack 是「读一个资源开一次句柄」，游戏停在主菜单
+    //      发呆时可能一个 pck 句柄都不持有，那时 ① 探不出来。
+    // 路径拿不到、或路径在别处的同名进程一律**不拦**，只记进日志 ——
+    // 那正是 1.3 把玩家锁死的那一支。
+
+    public sealed class Holder
     {
-        try { return Process.GetProcessesByName("Machine Party").Length > 0; }
-        catch { return false; }
+        public int    Pid;
+        public string ExePath = "";   // 取不到就是空串（权限 / 位数不匹配）
+        public bool   InGameDir;      // 路径确认落在当前这个游戏目录里
+    }
+
+    // 同名进程一览。只用来解释「为什么拦你」，不单独作为判据。
+    public static List<Holder> FindGameProcesses(string gameDir)
+    {
+        var list = new List<Holder>();
+        string root = "";
+        try { root = Path.GetFullPath(gameDir).TrimEnd('\\') + "\\"; }
+        catch { }
+
+        Process[] ps;
+        try { ps = Process.GetProcessesByName("Machine Party"); }
+        catch { return list; }
+
+        foreach (var p in ps)
+        {
+            var h = new Holder();
+            try { h.Pid = p.Id; } catch { h.Pid = -1; }
+            // MainModule 会因为权限或 32/64 位不匹配抛异常。抛了就当路径未知，
+            // 而路径未知**不拦人**（见上面那段）。
+            try { h.ExePath = p.MainModule.FileName; } catch { h.ExePath = ""; }
+            h.InGameDir = root.Length > 0 && h.ExePath.Length > 0 &&
+                          h.ExePath.StartsWith(root, StringComparison.OrdinalIgnoreCase);
+            list.Add(h);
+            try { p.Dispose(); } catch { }
+        }
+        return list;
+    }
+
+    // 能动 → 返回 null；不能动 → 返回该原样显示给玩家的原因。
+    public static string BusyReason(string gameDir)
+    {
+        // ② 先查进程：命中时这条的文案比 ① 有用得多（能指名道姓报 PID 和路径）
+        var mine = new List<Holder>();
+        foreach (var h in FindGameProcesses(gameDir))
+        {
+            if (h.InGameDir) mine.Add(h);
+            else Log(string.Format("同名进程，不拦（路径{0}）：PID {1}  {2}",
+                                   h.ExePath.Length == 0 ? "取不到" : "不在本目录",
+                                   h.Pid, h.ExePath.Length == 0 ? "-" : h.ExePath));
+        }
+        if (mine.Count > 0)
+        {
+            var sb = new StringBuilder();
+            sb.Append(L.T("游戏正在运行，先完全退出。\n\n占用它的进程：\n",
+                          "The game is running. Fully exit it first.\n\nProcesses:\n"));
+            foreach (var h in mine)
+            {
+                sb.AppendLine("    PID " + h.Pid + "    " + h.ExePath);
+                Log("拦下：PID " + h.Pid + "  " + h.ExePath);
+            }
+            sb.Append(L.T("\n窗口已经关了还报这个，就是进程没退干净：\n" +
+                          "任务管理器 →「详细信息」→ 找到上面这个 PID → 结束任务。",
+                          "\nIf the window is already closed, the process did not exit:\n" +
+                          "Task Manager -> Details -> find that PID -> End task."));
+            return sb.ToString();
+        }
+
+        // ① 再问文件系统。杀软扫描、Steam 校验会瞬时占一下，给几次重试再判死。
+        string pck = Path.Combine(gameDir, PckName);
+        if (!File.Exists(pck)) return null;      // 包都不在，让后面的流程去报这个错
+        for (int i = 0; i < 5; i++)
+        {
+            try
+            {
+                using (new FileStream(pck, FileMode.Open, FileAccess.ReadWrite, FileShare.None)) { }
+                return null;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // 权限不是占用，交给 PreflightWritable 去报 —— 它那条文案更准
+                return null;
+            }
+            catch (IOException) { }
+            // using System.Threading 只在 GUI 分支里，控制台版编不到，这里写全名
+            if (i < 4) System.Threading.Thread.Sleep(200);
+        }
+        Log("pck 独占打开失败：" + pck);
+        return L.T(
+            "数据包正被占用，现在动不了。\n\n" +
+            "常见原因：游戏没退干净；Steam 正在更新或校验这个游戏；杀毒软件正在扫描它。\n" +
+            "处理：完全退出游戏和 Steam，等几秒再试；仍然不行就重启一次电脑再来。",
+            "The PCK is locked by another process.\n\n" +
+            "Usual causes: the game did not exit cleanly; Steam is updating or verifying it; " +
+            "an antivirus is scanning it.\n" +
+            "Fix: fully exit the game and Steam, wait a few seconds, then retry; reboot if it persists.");
     }
 
     public static string ModTag()
@@ -964,7 +1086,8 @@ static class Installer
         Line(L.T("Machine Party-Overtime（8 人联机 + 全面重平衡）",
                  "Machine Party-Overtime - 8 players & rebalance"), ConsoleColor.Green);
         Console.WriteLine(L.T("适用游戏版本：", "Target game version: ") + Core.GameVersion +
-                          L.T("        mod 版本：", "        mod version: ") + Core.ModTag());
+                          L.T("        mod 版本：", "        mod version: ") + Core.ModTag() +
+                          L.T("        安装器：", "        installer: ") + Core.ReleaseNum);
         Console.WriteLine();
 
         try
@@ -987,8 +1110,8 @@ static class Installer
 
             if (status) { PrintStatus(gameDir); return Done(0); }
 
-            if (Core.IsGameRunning())
-                return Fail(L.T("游戏正在运行，先完全退出再操作。", "The game is running. Fully exit it first."));
+            string busy = Core.BusyReason(gameDir);
+            if (busy != null) return Fail(busy);
 
             if (uninstall) Core.Uninstall(gameDir, Say);
             else           Core.Install(gameDir, force, Say);
@@ -1226,12 +1349,17 @@ class MainForm : Form
         header.Controls.Add(sub);
 
         var ver = new Label();
-        ver.Text = Core.ModTag() + "\n" + L.T("游戏 ", "game ") + Core.GameVersion;
+        // 三行：mod 版本 / 安装器发布号 / 游戏版本。安装器那行是给排障用的 ——
+        // 只修安装器的发布（如 1.3.1）ModTag() 不变，没有这一行就分不出玩家手上
+        // 是修好的那版还是出事的那版，而我们能拿到的往往只有一张截图。
+        ver.Text = Core.ModTag() + "\n"
+                 + L.T("安装器 ", "installer ") + Core.ReleaseNum + "\n"
+                 + L.T("游戏 ", "game ") + Core.GameVersion;
         ver.Font = F(8.5f, FontStyle.Regular);
         ver.ForeColor = InkSub;
         ver.TextAlign = ContentAlignment.MiddleRight;
         ver.AutoSize = false;
-        ver.SetBounds(370, 20, 186, 38);
+        ver.SetBounds(370, 14, 186, 52);   // 三行；顶栏高 78，到 66 为止还有余量
         header.Controls.Add(ver);
 
         // ── 游戏目录 ───────────────────────────────────────────────────
@@ -1348,8 +1476,11 @@ class MainForm : Form
         FormClosed += delegate { Core.FlushLog(); };
 
         foreach (string d in Core.FindGameDirs()) dirBox.Items.Add(d);
+        // 给 SelectedIndex 赋值会触发 SelectedIndexChanged → Refresh2()，
+        // 所以只有「一个目录都没找到」时才需要自己补一次。1.3 是两边都调，
+        // 于是每开一次启动器就往日志里记两行一模一样的 detect。
         if (dirBox.Items.Count > 0) dirBox.SelectedIndex = 0;
-        Refresh2();
+        else Refresh2();
 
         // 开局别让焦点落在下拉框上：DropDownList 一旦获得焦点，选中项会整行刷成
         // 系统高亮蓝，界面第一眼就被那条蓝杠抢走。焦点给主按钮，顺便回车即可执行。
@@ -1469,10 +1600,15 @@ class MainForm : Form
     void Toggle()
     {
         if (Dir == null) return;
-        if (Core.IsGameRunning())
+        // 别叫 busy：MainForm 已经有个 bool busy 字段（「处理中」标志），
+        // 局部同名会把它遮住，后面那句 busy = true 就直接编译不过。
+        string blocked = Core.BusyReason(Dir);
+        if (blocked != null)
         {
-            MessageBox.Show(L.T("游戏正在运行，先完全退出。", "The game is running. Fully exit it first."),
-                            Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            // 拦下的理由（PID / 路径）刚写进缓冲，立刻落盘 —— 玩家点「安装日志」
+            // 时得看得见，否则又是一份只有 detect、看不出所以然的日志。
+            Core.FlushLog();
+            MessageBox.Show(blocked, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
 
