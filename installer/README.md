@@ -4,6 +4,8 @@ Raises the multiplayer cap from **4 to 8 players** — and reworks arenas, scori
 mechanics per minigame so that eight actually works. Free and open source.
 **Game version: v2.1.2 (Steam).**
 
+🎬 **See it in action**: https://www.bilibili.com/video/BV1Lo8b6QEh7/
+
 > ## ⚠️ This mod is completely FREE. If you paid for it, you were scammed.
 > Get it only from the official Releases page. Nobody is authorised to sell it.
 
@@ -104,6 +106,8 @@ developer or publisher of Machine Party.
 
 把联机上限提到 **8 人** —— 并且逐个小游戏重做了场地、算分与部分玩法，不只是改大人数常量。
 免费、开源。**适用游戏版本：v2.1.2（Steam）。**
+
+🎬 **演示视频（B 站）**：https://www.bilibili.com/video/BV1Lo8b6QEh7/
 
 > ## ⚠️ 本 mod 完全免费。如果你为它花过钱，说明你被骗了。
 > 只从官方 Releases 页面下载。任何人都无权拿它收费。

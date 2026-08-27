@@ -11,7 +11,7 @@ diff --git a/modules/multiplayer/network_manager.gd b/modules/multiplayer/networ
 +# [MP8] mod 版本号。**发布新版就改这里**，它会被追加进 Globals.game_version，
 +# 直接决定"谁能跟谁联机"（见 _ready() 里那段版本握手）。
 +# 格式随意但要短：主菜单右下角显示的是 `原版号+本标签`，太长会顶出去。
-+const MP8_VERSION_TAG: String = "overtime-1.3"
++const MP8_VERSION_TAG: String = "overtime-1.4"
 +
  enum NetworkBackendType{
  	Enet, Steam

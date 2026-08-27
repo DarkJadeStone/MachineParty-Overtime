@@ -1,0 +1,75 @@
+diff --git a/minigames/junk_platform/scripts/junk_platform_compactor.gd b/minigames/junk_platform/scripts/junk_platform_compactor.gd
+--- a/minigames/junk_platform/scripts/junk_platform_compactor.gd
++++ b/minigames/junk_platform/scripts/junk_platform_compactor.gd
+@@ -20,9 +20,69 @@ func slam():
+ 	cam_shaker.force_stop_shake()
+ 	cam_shaker.play_shake()
+ 
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] 🩸 T49：压缩机杀人必须由服务器裁决（2026-08-27，玩家报 + 本机 8 开复现）
++# ═══════════════════════════════════════════════════════════════════════════
++#
++# **症状**：8 人局玩到后面**局永不结束** —— 人都没了，垃圾一直掉，帧数一路崩，只能强退。
++# 诊断日志里 4 个"存活"玩家全部停在 `(0, -999, 0)`、`active=false`
++# —— 那正是 `kill_rpc()` 干的事，**人被杀了，但服务器的账没销**。
++#
++# ---- 原版这三行为什么是个引信 ----
++#
++#     body.kill_rpc.rpc()                                    # RPC：全网执行
++#     body.emit_died.emit(body.player_presence.network_id)   # 本地信号：只在本机发
++#
++# `kill_rpc` 是 RPC，`emit_died` 是**普通信号**。而 `emit_died` 的监听方
++# （`junk_platform.gd::_on_player_died`，负责把人移出 `active_players`）是在
++# `spawn_players()` 里接的，那个函数**只在服务器跑**（`all_players_loaded()` 客机直接 return）。
++#
++# 于是只要**这段是在客机上跑的**：`kill_rpc` 把人全网杀掉，`emit_died` 在客机上
++# 发给空气 —— 服务器永远不知道这个人死了，`active_players` 少不下去，
++# `check_game_end()` 永远等不到 `<= 1`。**本局没有任何超时兜底，这就是永久卡死。**
++#
++# ---- 为什么 1.2 不犯、1.3 才犯（这条是关键，别读成"原版 bug"）----
++#
++# 压缩机同时背着两个身份：**美术**与**判定**。
++# `visuals_base` 一转，原来盖在 A 平台上的那套美术就跑到别的平台头上，所以每块平台
++# 必须重新指认"此刻落在它头上的那一套"——`_mp8_wire_platform()` 里那句
++# `p.compactor = own_compactor` 就是干这个的，**而它用的是每台机器自己的朝向**。
++#
++#   1.2 = 视角 a 档，**2 个朝向**，走原版自带的两态开关（`compactor` ↔ `_flipped`），
++#         服务器与客机对"哪台压缩机归哪块平台"始终一致 → 撞不出来；
++#   1.3 = 视角 c 档（用户 2026-08-25 定案设为默认），**8 个朝向**，
++#         8 台机器各算各的 → **每台机器上"平台 i 该砸哪台压缩机"的答案都不一样**。
++#         平台塌陷走 `collapse_rpc`（全网执行），于是每台机器各砸自己那台，
++#         落下来的 kill 区在不同机器上罩着**不同的人**。
++#         实测日志：两台机器分别是朝向 225° 与 270°，各自"重新指认了 8/8 块平台"。
++#
++# **美术必须按客机朝向转（不转就画面错位，C 视角的前提），判定绝不能。**
++# 1.3 把这两个身份一起转了 —— 引信是原版留的，接上去的是我们。
++#
++# ---- 判定归服务器之后 ----
++#
++# 客机的 Area 照常触发，只是不再动手；杀人仍然通过 `kill_rpc.rpc()` 广播到全网，
++# 表现一模一样。写法与摔落那条路一致：`fall_rpc` 的 tween 回调里就是 `if multiplayer.is_server():`。
++#
++# ⚠️ 本条**没有**修掉「同一个人被判死两次」—— 改完之后实测重复照旧。
++#    那是另一回事（同一台压缩机的 kill 区被重复 enter），由下面那道 `body.active` 守卫堵。
+ func on_body_entered(body):
+ 	if body is JunkPlatformPlayer:
++
++		# [MP8] 淘汰只由服务器裁决。客机到此为止 —— 它的压缩机在它自己的朝向下，
++		# 罩着的很可能根本不是服务器眼里的那个人。
++		if not multiplayer.is_server():
++			return
++
++		# [MP8] 同一条命只判一次。
++		# 实测（2026-08-27 修好压缩机绑定之后那一局）每个人仍然判死两次，间隔 40~60ms ——
++		# `slam()` 把 `visual` 往下拽的过程中，同一个身体在 kill 区里 enter → 被推开 → 又 enter。
++		# `_on_player_died` 有 `active_players.has()` 守卫，所以重复本身不改分数、不改名次，
++		# **但它会让以后读日志的人误以为撞上了网络竞态**。从源头堵掉，日志才干净。
++		# `kill_rpc()` 一定会把 active 置 false，所以这条判据对两条判死路都成立。
++		if not body.active:
++			return
++
+ 		body.kill_rpc.rpc()
+ 		body.emit_died.emit(body.player_presence.network_id)
+-		if multiplayer.is_server():
+-			manager.junk_handler.remove_spawn_point(body.player_presence.network_id)
++		manager.junk_handler.remove_spawn_point(body.player_presence.network_id)

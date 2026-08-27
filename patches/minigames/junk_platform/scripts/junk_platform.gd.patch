@@ -1,7 +1,7 @@
 diff --git a/minigames/junk_platform/scripts/junk_platform.gd b/minigames/junk_platform/scripts/junk_platform.gd
 --- a/minigames/junk_platform/scripts/junk_platform.gd
 +++ b/minigames/junk_platform/scripts/junk_platform.gd
-@@ -30,21 +30,368 @@ var finished: bool = false
+@@ -30,21 +30,399 @@ var finished: bool = false
  
  var player_count: int = 0
  
@@ -101,6 +101,34 @@ diff --git a/minigames/junk_platform/scripts/junk_platform.gd b/minigames/junk_p
 +var _mp8_id_label: Label = null
 +var _mp8_junk_label: Label = null
 +
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8-DIAG] 残骸平台常备诊断（T49 建起来的，**opt-in，发布版不写**）
++# ═══════════════════════════════════════════════════════════════════════════
++#
++# 现象（玩家报 + 本机 8 开复现）：人都掉下去了，局不结算，垃圾一直掉，帧数崩。
++# 已知：`[MP8] 残骸平台结算` 一次都没打过 → check_game_end() 从没越过
++#       `active_players.size() > 1`，即**有人没被判死**。
++#
++# 要分的就一件事：
++#   A. `event_fallen` 打了、`emit_died` 没打  → 坠落触发了，但那条 1.5 秒 tween
++#      到不了终点（判死链断在后半段）；
++#   B. 两个都没打                              → 坠落**根本没触发**，人落在某个
++#      碰撞面上站住了（probe72 量到 45°/135°/225°/315° 方位 r=14~24.5 有一层
++#      y=-0.06 的面，高于虚空平面 y=-2.00）。周期快照里的 **y 值**直接给答案。
++#
++# ⚠️ 写**每个实例一份文件**（user://mp8_diag_<peer>.log）：8 开时所有实例共用一个
++#    godot.log，互相盖字，那份日志是花的、读不出来。这条是本诊断存在的主要理由。
++# ⚠️ **每行 flush**：卡死的局是被强杀的，不 flush 缓冲里的东西全丢。
++#
++# 【2026-08-27 用户定：留下转常备，不删】T49 那次就是靠快照里
++# 「y=-999 且 active=false」一眼定的性 —— 那是 `kill_rpc()` 的指纹，
++# 直接把「人被杀了但账没销」和「人根本没死」两种情况分开了。
++# 开关跟侦察日志同一个规矩（`-debug-tools` / `mp8diag` / 编辑器），
++# **发布版玩家双击启动什么都不传 → 一个字节都不写**。
++var _mp8_diag_on: bool = false
++var _mp8_diag_f: FileAccess = null
++var _mp8_diag_timer: Timer = null
++
 +
  func _ready() -> void :
  	super._ready()
@@ -108,6 +136,9 @@ diff --git a/minigames/junk_platform/scripts/junk_platform.gd b/minigames/junk_p
 +	# [MP8] ⚠️ 开关必须在 _mp8_expand_platforms() **之前**算好：
 +	# 平台头顶名牌是在扩平台那一步里建的，晚了就来不及拦。
 +	_mp8_init_flags()
++
++	_mp8_diag_start()
++	_mp8_sweep_start()
 +
  	camera.current = true
  
@@ -370,7 +401,7 @@ diff --git a/minigames/junk_platform/scripts/junk_platform.gd b/minigames/junk_p
  func fade_in_ambience():
  	for speaker_controller in ambience_speaker_controllers:
  		speaker_controller.speaker.volume_linear = 0
-@@ -71,6 +418,797 @@ func initialize(_round_number: int, _total_rounds: int, _scores: Dictionary = {}
+@@ -71,6 +449,864 @@ func initialize(_round_number: int, _total_rounds: int, _scores: Dictionary = {}
  
  	state_machine.transition_to_rpc.rpc(&"Round", {"round": _round_number, "total": _total_rounds})
  
@@ -734,14 +765,39 @@ diff --git a/minigames/junk_platform/scripts/junk_platform.gd b/minigames/junk_p
 +
 +
 +# [MP8] 把一个平台的引用全部指回它自己那套家当，flipped 指向对角那套
-+func _mp8_wire_platform(own: Dictionary, partner: Dictionary) -> void :
++# [MP8] 🩸 T49（2026-08-27）：**这四类不是同一种东西，不能一起按朝向重指认。**
++#
++# probe73 把它们各自挂在哪量清楚了：
++#
++#   damage indicator (37 个)      → `visuals base` 底下        ✅ 跟着 visuals_base 转
++#   platform main    (4 个)       → `visuals base` 底下        ✅ 跟着转
++#   compactor        (35 个)      → `junk platform compactors` ❌ **根的子节点，不转**
++#   speaker_indicator alarm (4 个)→ 根的 alarm1..4             ❌ **不转**
++#
++# 重指认的**前提**是「这东西跟着 visuals_base 转走了，所以要找此刻落在我头上的那一套」。
++# 后两类根本不转 —— 对它们做重指认，等于让平台去驱动一台**物理上不在它头上**的压缩机。
++#
++# 三个症状全是这么来的（用户 2026-08-27 实测）：
++#   · 「残骸超过五个了还不落下压缩机」 —— 这块平台驱动的那台在别处；
++#   · 「有的玩家被压缩机砸了还能看见」 —— 每台机器朝向不同 → 各砸各的，
++#      你这台砸下来的那个人，服务器根本没砸（判定已经归服务器独裁了）；
++#   · 局结束不了 —— 该死的人不死。
++#
++# 所以 `fixed` 这个参数存在的意义就一句：**压缩机和警报音必须永远绑自己那一组**，
++# 那是几何决定的、每台机器算出来都一样，不掺朝向。
++# 不传 fixed 时退回 own（布局阶段的初次接线，两者本来就是同一组）。
++func _mp8_wire_platform(own: Dictionary, partner: Dictionary, fixed = null) -> void :
 +
 +	var p: JunkPlatformPlatform = own["platform"]
 +
++	# 跟着转的两类：按朝向重指认（own = 此刻落在这块平台头上的那一组）
 +	var own_indicator: Node3D = _mp8_pick(own, "damage indicator")
 +	var own_visual: Node3D = _mp8_pick(own, "platform main")
-+	var own_compactor = _mp8_pick(own, "compactor")
-+	var own_alarm = _mp8_pick(own, "speaker_indicator alarm")
++
++	# 不跟着转的两类：永远取**自己那一组**，与朝向无关
++	var src_fixed: Dictionary = own if fixed == null else fixed
++	var own_compactor = _mp8_pick(src_fixed, "compactor")
++	var own_alarm = _mp8_pick(src_fixed, "speaker_indicator alarm")
 +
 +	var far_indicator: Node3D = _mp8_pick(partner, "damage indicator")
 +	var far_visual: Node3D = _mp8_pick(partner, "platform main")
@@ -872,6 +928,31 @@ diff --git a/minigames/junk_platform/scripts/junk_platform.gd b/minigames/junk_p
 +# 搬完位置之后的每组家当：{"platform":, "nodes":, "pos": 最终世界坐标}
 +var _mp8_groups_final: Array = []
 +
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] 🩸 T49 兜底闸：把「已经被杀、但账没销」的人清出 active_players
++# ═══════════════════════════════════════════════════════════════════════════
++#
++# 这道闸**不是为某一个 bug 加的**，是结构性的：
++# 本局是纯淘汰制（`active_players.size() <= 1` 才结束），而**没有任何超时兜底** ——
++# 少销一个人 = 这一小局永久卡死：垃圾一直掉、残骸越堆越多、帧数一路崩，玩家只能强退。
++# T49 那次就是压缩机在客机上把人 `kill_rpc` 掉了、`emit_died` 却没在服务器上发出来
++#（根因已在 `junk_platform_compactor.gd` 修掉）。以后再冒出别的「杀了但没销账」的
++# 路径，最多晚几秒，不会再卡死整局。
++#
++# 判据用 `active == false`：`kill_rpc()` 一定会把它置 false（那是判死的唯一表现），
++# 活人恒为 true。**不用坐标判据**（`y < -100` 之类）—— 那是症状不是本质，换个杀法就漏。
++#
++# ⚠️ **宽限期必须长过 `fall_rpc` 那条 1.5 秒 tween**：摔落是先 `active = false`、
++#    1.5 秒之后才 `emit_died`。宽限期短了会把**正在坠落的人**提前销账 ——
++#    名次会乱，还可能在人还在空中时就结算。
++# ⚠️ **只在 `junk_handler.active` 时扫**：开局之前全场 `active` 都是 false
++#    （`set_active_rpc(true)` 与 `junk_handler.set_active(true)` 是同一时刻发的），
++#    少了这道门，倒计时阶段就会把所有人一次清空。
++const MP8_SWEEP_TICK: float = 1.0
++const MP8_SWEEP_GRACE: float = 3.0
++var _mp8_dead_since: Dictionary[int, float] = {}
++var _mp8_sweep_timer: Timer = null
++
 +
 +func _mp8_facing_step() -> float:
 +	return float(MP8_VIEW_STEPS.get(_mp8_view_mode, 180.0))
@@ -901,6 +982,13 @@ diff --git a/minigames/junk_platform/scripts/junk_platform.gd b/minigames/junk_p
 +
 +	var inv := Basis(Vector3.UP, deg_to_rad( - deg))
 +	var hit: int = 0
++	# [MP8] 单射自检（T49 顺手加的）：本函数是**逐块独立取最近**，没有任何机制
++	# 保证两块平台不会指到同一组美术。真撞上的后果是「一台压缩机被两块平台共用、
++	# 另一台没人用」—— 肉眼极难看出来，只会表现成「那块平台的压缩机怎么不下来」。
++	# 正八边形 + 45° 整数倍理论上是干净的置换，所以这里**不修正、只报**：
++	# 一旦响了就说明槽位摆得不对称，该去查布局而不是在这里打补丁。
++	# （翻转配对那边有 `_mp8_check_pairing()` 查对合，这条路一直缺同等的校验。）
++	var taken: Dictionary = {}
 +
 +	for g in _mp8_groups_final:
 +		var pl = g["platform"]
@@ -929,10 +1017,20 @@ diff --git a/minigames/junk_platform/scripts/junk_platform.gd b/minigames/junk_p
 +		if best.is_empty():
 +			continue
 +
-+		# 拿平台本体 + 那一组的家当拼一个临时组，复用已经验过的接线函数
++		var key: String = str(best.get("pos", Vector3.ZERO))
++		if taken.has(key):
++			print("[MP8] 残骸平台：⚠️ 朝向 %.0f° 重指认撞车 —— 平台 %s 和 %s 都指到了 %s 那组美术（压缩机会被两块平台共用）" % [
++				deg, String(pl.name), String(taken[key]), key
++			])
++		taken[key] = String(pl.name)
++
++		# 拿平台本体 + 那一组的家当拼一个临时组，复用已经验过的接线函数。
++		# 第三个参数 `g` = **这块平台自己那一组** —— 压缩机与警报音只认它，
++		# 不跟着朝向走（理由见 _mp8_wire_platform 头上那段）。
 +		_mp8_wire_platform(
 +			{"platform": pl, "nodes": best["nodes"]},
-+			(far if not far.is_empty() else best)
++			(far if not far.is_empty() else best),
++			g
 +		)
 +		hit += 1
 +
@@ -1168,7 +1266,7 @@ diff --git a/minigames/junk_platform/scripts/junk_platform.gd b/minigames/junk_p
  func spawn_players():
  
  	player_count = PlayerManager.player_presences.size()
-@@ -95,8 +1233,9 @@ func spawn_players():
+@@ -95,8 +1331,9 @@ func spawn_players():
  
  		player_character.network_id = network_id
  
@@ -1180,7 +1278,7 @@ diff --git a/minigames/junk_platform/scripts/junk_platform.gd b/minigames/junk_p
  
  		if GameManager.local_game:
  			camera_rotation = rad_to_deg(spawn_positions[i].basis.get_euler().y)
-@@ -106,19 +1245,39 @@ func spawn_players():
+@@ -106,26 +1343,77 @@ func spawn_players():
  			position, camera_rotation
  		)
  
@@ -1228,7 +1326,11 @@ diff --git a/minigames/junk_platform/scripts/junk_platform.gd b/minigames/junk_p
  		player_character.emit_died.connect(_on_player_died)
  		player_character.event_fallen.connect(_on_player_fallen)
  
-@@ -126,6 +1285,33 @@ func spawn_players():
++		# [MP8-DIAG] 额外接一份，只记录不改行为（bind 的参数追加在信号自带参数**后面**）
++		player_character.event_fallen.connect(_mp8_diag_fallen.bind(network_id, player_character))
++		player_character.emit_died.connect(_mp8_diag_died)
++
+ 		players[network_id] = player_character
  		active_players[network_id] = player_character
  		player_scores[network_id] = 0
  
@@ -1262,7 +1364,7 @@ diff --git a/minigames/junk_platform/scripts/junk_platform.gd b/minigames/junk_p
  
  func cleanup():
  
-@@ -141,6 +1327,15 @@ func player_disconnected(_network_id: int):
+@@ -141,6 +1429,15 @@ func player_disconnected(_network_id: int):
  	remove_player_rpc.rpc(_network_id)
  	await get_tree().create_timer(1.0).timeout
  
@@ -1278,7 +1380,16 @@ diff --git a/minigames/junk_platform/scripts/junk_platform.gd b/minigames/junk_p
  	check_game_end()
  
  
-@@ -157,14 +1352,51 @@ func check_game_end():
+@@ -150,21 +1447,60 @@ func check_game_end():
+ 		return
+ 
+ 	if active_players.size() > 1:
++		_mp8_diag("check_game_end 被挡：还有 %d 人没死" % active_players.size())
+ 		return
+ 
++	_mp8_diag("★★ check_game_end 放行，开始结算 ★★")
+ 	finished = true
+ 
  	for i in dead_players.size():
  		player_scores[dead_players[i]] = i
  
@@ -1333,7 +1444,7 @@ diff --git a/minigames/junk_platform/scripts/junk_platform.gd b/minigames/junk_p
  	await get_tree().create_timer(2.0).timeout
  	set_minigame_sfx_linear_volume_rpc.rpc(0.0)
  
-@@ -175,6 +1407,14 @@ func check_game_end():
+@@ -175,6 +1511,14 @@ func check_game_end():
  
  @rpc("any_peer", "call_remote", "reliable")
  func rotate_camera_rpc(_rotation: float):
@@ -1348,7 +1459,7 @@ diff --git a/minigames/junk_platform/scripts/junk_platform.gd b/minigames/junk_p
  	camera_base.rotation_degrees.y = _rotation
  	visuals_base.rotation_degrees.y = _rotation
  	for i in platforms:
-@@ -211,6 +1451,44 @@ func _on_countdown_expired():
+@@ -211,6 +1555,44 @@ func _on_countdown_expired():
  
  	state_machine.transition_to_rpc.rpc(&"Play")
  
@@ -1393,3 +1504,172 @@ diff --git a/minigames/junk_platform/scripts/junk_platform.gd b/minigames/junk_p
  func _on_player_died(_network_id: int):
  
  	if active_players.has(_network_id):
+@@ -235,3 +1617,168 @@ func _on_player_fallen(last_hit_by_network_id: int):
+ 			players[last_hit_by_network_id].trigger_achievement_rpc.rpc()
+ 
+ 	pass
++
++
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8-DIAG] 临时诊断实现（定位完整段删除）
++# ═══════════════════════════════════════════════════════════════════════════
++
++func _mp8_diag_start() -> void :
++
++	var args := Array(OS.get_cmdline_args())
++	# opt-in：跟侦察日志同一个规矩，发布版双击启动什么都不传 → 天然不写
++	_mp8_diag_on = OS.has_feature("editor") or args.has("-debug-tools") or args.has("mp8diag")
++	if not _mp8_diag_on:
++		return
++
++	var peer: int = multiplayer.get_unique_id()
++	var path: String = "user://mp8_diag_%d.log" % peer
++	_mp8_diag_f = FileAccess.open(path, FileAccess.WRITE)
++
++	_mp8_diag("═══ 残骸平台诊断 peer=%d 服务器=%s ═══" % [peer, str(multiplayer.is_server())])
++	_mp8_diag("虚空平面 y=-2.00；probe72 量到 45/135/225/315° 方位 r=14~24.5 有一层 y=-0.06")
++
++	# 2 秒一拍的存活快照。用运行时 Timer 而不是 _process：
++	# 本脚本没有 _process，加一个会盖掉基类的（基类 Minigame 有没有得单独查），
++	# Timer 没这个风险。
++	_mp8_diag_timer = Timer.new()
++	_mp8_diag_timer.wait_time = 2.0
++	_mp8_diag_timer.autostart = true
++	_mp8_diag_timer.timeout.connect(_mp8_diag_tick)
++	add_child(_mp8_diag_timer)
++
++
++func _mp8_diag(s: String) -> void :
++
++	if not _mp8_diag_on:
++		return
++	var line: String = "[%8.2f] %s" % [float(Time.get_ticks_msec()) / 1000.0, s]
++	print("[MP8-DIAG] " + line)
++	if _mp8_diag_f != null:
++		_mp8_diag_f.store_line(line)
++		_mp8_diag_f.flush()          # 卡死的局是被强杀的，不 flush 就什么都不剩
++
++
++func _mp8_diag_name(nid: int) -> String :
++	if PlayerManager.player_presences.has(nid):
++		return String(PlayerManager.player_presences[nid].network_name)
++	return "id%d" % nid
++
++
++# 每 2 秒一张存活快照。**y 值是关键**：站在 -0.06 那层上 = 坠落判定永远不触发。
++func _mp8_diag_tick() -> void :
++
++	if not _mp8_diag_on or finished:
++		return
++
++	var parts: PackedStringArray = []
++	for nid in active_players.keys():
++		var pl = active_players[nid]
++		if not is_instance_valid(pl):
++			parts.append("%s:引用失效" % _mp8_diag_name(nid))
++			continue
++		var gp: Vector3 = pl.global_position
++		var r: float = Vector2(gp.x, gp.z).length()
++		var ang: float = rad_to_deg(atan2(gp.x, gp.z))
++		if ang < 0.0:
++			ang += 360.0
++		parts.append("%s y=%.2f r=%.1f 方位%.0f° active=%s onfloor=%s" % [
++			_mp8_diag_name(nid), gp.y, r, ang, str(pl.active), str(pl.is_on_floor())
++		])
++
++	var np: int = -1
++	if junk_handler != null:
++		np = junk_handler.spawn_points.size()
++
++	_mp8_diag("存活 %d 人｜落点 %d 个｜%s" % [
++		active_players.size(), np, "  ||  ".join(parts)])
++
++
++# 坠落触发了（fall_rpc 第一句就发这个信号）。它打了但后面没有「判死」= 判死链断在 tween。
++func _mp8_diag_fallen(_last_hit_by: int, nid: int, who) -> void :
++
++	var pos: String = "?"
++	if is_instance_valid(who):
++		var gp: Vector3 = who.global_position
++		pos = "(%.1f, %.2f, %.1f) r=%.1f" % [gp.x, gp.y, gp.z, Vector2(gp.x, gp.z).length()]
++	_mp8_diag("★ 开始坠落 %s 位置=%s" % [_mp8_diag_name(nid), pos])
++
++
++# 真正判死（fall_rpc 那条 1.5 秒 tween 跑完 → kill_rpc + emit_died）
++func _mp8_diag_died(nid: int) -> void :
++
++	_mp8_diag("☠ 判死 %s（此刻 active_players=%d）" % [
++		_mp8_diag_name(nid), active_players.size()])
++
++
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] T49 兜底闸实现 —— 完整理由见上面 MP8_SWEEP_GRACE 那段
++# ═══════════════════════════════════════════════════════════════════════════
++
++func _mp8_sweep_start() -> void :
++
++	# 销账是服务器的事（`active_players` 只有服务器填），客机不用起这个定时器
++	if not multiplayer.is_server():
++		return
++
++	_mp8_sweep_timer = Timer.new()
++	_mp8_sweep_timer.wait_time = MP8_SWEEP_TICK
++	_mp8_sweep_timer.autostart = true
++	_mp8_sweep_timer.timeout.connect(_mp8_sweep_dead)
++	add_child(_mp8_sweep_timer)
++
++
++func _mp8_sweep_dead() -> void :
++
++	if finished or not multiplayer.is_server():
++		return
++
++	# 没在游玩中就别扫，并且把计时清干净 —— 开局前全场 active 都是 false
++	if junk_handler == null or not junk_handler.active:
++		_mp8_dead_since.clear()
++		return
++
++	var stale: Array = []
++
++	for nid in active_players.keys():
++
++		var pl = active_players[nid]
++
++		if not is_instance_valid(pl):
++			stale.append(nid)          # 引用都没了，不用等宽限期
++			continue
++
++		if pl.active:
++			_mp8_dead_since.erase(nid)
++			continue
++
++		var t: float = float(_mp8_dead_since.get(nid, 0.0)) + MP8_SWEEP_TICK
++		_mp8_dead_since[nid] = t
++		if t >= MP8_SWEEP_GRACE:
++			stale.append(nid)
++
++	if stale.is_empty():
++		return
++
++	for nid in stale:
++
++		_mp8_dead_since.erase(nid)
++		if not active_players.has(nid):
++			continue
++
++		active_players.erase(nid)
++		# 名次按 dead_players 的先后算，销账的人也得进去，否则他不参与名次、
++		# 而幸存者的分数是拿 dead_players.size() 推的，会一起算错
++		if not dead_players.has(nid):
++			dead_players.append(nid)
++		if junk_handler != null:
++			junk_handler.remove_spawn_point(nid)
++
++		var nm: String = "id%d" % nid
++		if PlayerManager.player_presences.has(nid):
++			nm = String(PlayerManager.player_presences[nid].network_name)
++		print("[MP8] 残骸平台：⚠️ 兜底销账 —— %s 已被杀但 emit_died 没到服务器，剩 %d 人" % [
++			nm, active_players.size()
++		])
++
++	check_game_end()

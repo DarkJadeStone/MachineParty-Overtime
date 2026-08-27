@@ -3,6 +3,8 @@
 把《Machine Party》（机械狂欢）的联机上限提到 **8 人** —— 并且逐个小游戏重做了场地、算分
 与部分玩法，不只是把人数常量改大。免费、开源、可自己编译。
 
+🎬 **演示视频（B 站）**：https://www.bilibili.com/video/BV1Lo8b6QEh7/
+
 > ## ⚠️ 本 mod 完全免费。如果你为它花过钱，说明你被骗了。
 > **This mod is completely FREE. If you paid for it, you were scammed.**
 > 只从本仓库的 [Releases](../../releases) 页面下载；任何人都无权拿它收费。
@@ -12,6 +14,7 @@
 > must own a legitimate copy. Download the installer from the
 > [Releases](../../releases) page, run it, and it patches your local copy (with an automatic
 > backup and one-command uninstall). Everyone in a lobby must install the **same** version.
+> See it in action: https://www.bilibili.com/video/BV1Lo8b6QEh7/
 > See [`docs/MINIGAMES.en.md`](docs/MINIGAMES.en.md) for a per-minigame changelog and
 > [`docs/BUILD.md`](docs/BUILD.md) to build it yourself. Not affiliated with or endorsed by
 > the game's developer or publisher.
@@ -36,6 +39,57 @@ eight.*</sub>
 ---
 
 ## 更新日志
+
+### 1.4 —— 残骸平台：修好 8 人局无法结束
+
+本次更新只修改了「残骸平台」，其他小游戏没有改动。
+
+- 修复 8 人局无法结束的问题：场上玩家已经全部消失，游戏却不结算，垃圾仍不断掉落并持续拖低帧数。
+- 修复压缩机与平台错配：部分平台堆满残骸后压缩机不下来，反而是其他位置的压缩机被触发。
+- 压缩机淘汰现在统一由房主判定，避免不同客户端按各自视角分别处理玩家死亡，并防止同一名玩家被重复判死。
+- 增加结算保险：如果以后再次出现「玩家已经出局，但房主没有登记」的情况，大约 3 秒后会自动修正，
+  不再让整局永久卡死。
+
+这个问题是 1.3 加入 8 方位独立视角时引入的：当时压缩机被错误地跟着摄像机一起重新分配了，
+现在已经把画面与玩法判定彻底分开。已通过本机 8 实例复现旧问题，并确认修复后能够正常进入结算。
+
+如果你还在使用 1.3，1.4 的启动器也已经包含 1.3.1 的「误判游戏正在运行」修复。
+
+另外，评论区反馈的「碎骨者只剩最后两人时无法投掷」未包含在本次更新，仍在排查。
+
+⚠️ **1.4 与 1.3、1.3.1 均不能互通**，同一房间的所有玩家都需要更新至 1.4。
+（主菜单右下角会显示 `v2.1.2+overtime-1.4`，一眼能对。）
+
+> **English — 1.4: Debris Platforms rounds that could never end.**
+>
+> This update changes **Debris Platforms only**. No other minigame was touched.
+>
+> - **Fixed 8-player rounds that could not end**: every player on the field was already gone, yet
+>   the round never settled — junk kept falling and the frame rate kept dropping.
+> - **Fixed compactors being matched to the wrong platform**: some platforms would pile up with
+>   debris while the compactor above them never came down, and a compactor somewhere else fired
+>   instead.
+> - **Compactor eliminations are now decided by the host**, so clients no longer each resolve a
+>   player's death according to their own camera angle, and the same player can no longer be
+>   counted out twice.
+> - **Added a settlement safety net**: if a player ever ends up "out, but not registered by the
+>   host" again, it is corrected automatically after about 3 seconds instead of hanging the whole
+>   round forever.
+>
+> This was introduced in 1.3 together with the 8-direction independent camera: the compactors were
+> incorrectly reassigned along with the camera. Visuals and gameplay decisions are now fully
+> separated. Reproduced locally with 8 instances, and confirmed the round settles again after the fix.
+>
+> If you are still on 1.3, the 1.4 launcher also includes the 1.3.1 fix for the false
+> "the game is running" report.
+>
+> The "Spine Breaker: cannot throw when only two players remain" report from the comments is
+> **not** included in this update — still being investigated.
+>
+> ⚠️ **1.4 is not compatible with 1.3 or 1.3.1** — everyone in the lobby has to update to 1.4.
+> (The main menu bottom right reads `v2.1.2+overtime-1.4`.)
+
+---
 
 ### 1.3.1 —— 只换启动器：修好「明明没开游戏，却说游戏正在运行」
 

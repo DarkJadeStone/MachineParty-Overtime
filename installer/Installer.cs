@@ -67,7 +67,7 @@ static class Core
     // 已装 1.3 的人不用动，1.3 与 1.3.1 的人照样同房。
     // 它同时决定 dist\ 下的输出目录名与发布包名（见 tools\build_installer.ps1），
     // 免得重建时把已经发出去的 dist\overtime-1.3\ 连 zip 一起覆盖掉。
-    public const string ReleaseNum = "1.3.1";
+    public const string ReleaseNum = "1.4";
 
     public const string AppId   = "4108000";
     public const string GameRel = @"steamapps\common\party project\Machine Party_Windows";
