@@ -38,6 +38,61 @@ eight.*</sub>
 
 ---
 
+## 校验下载的文件 / Verifying your download
+
+**1.4** 各文件的 SHA256：
+
+```
+82D84FA7AF88516FEF18EFD58A50A4592E38F281E0CD2A73ACA54847C46F7779  Machine-Party-Overtime-1.4.zip
+E879C1831F2FC4E29DD909D4805BA319313B6F09BA28EEB3D5D73ED3D8AFD8C7  overtime_launcher.exe
+933004418B2B7B1DE1C6B68C9C4A7B091EB6AF5772C964BFFBEFA418B6BC78ED  overtime_install.exe
+```
+
+在 PowerShell 里核对：
+
+```powershell
+Get-FileHash <文件> -Algorithm SHA256
+```
+
+对得上 = 你手里的文件就是本仓库构建出来的那个、中间没有被人改过。
+⚠️ 但这**不代表**文件本身安全 —— 源码公开、可自行构建（见 [`docs/BUILD.md`](docs/BUILD.md)）才是更强的保证。
+
+**这一条对本 mod 特别重要**：很多人是从别人那里转发拿到 zip 的，从没打开过本页面。
+哈希是他们唯一能自查「这个文件有没有被别人动过手脚」的手段。
+
+> **English** — a match proves the file you have is the one built here and that nobody modified it
+> in between. It does **not** by itself prove the file is safe; the public source and building it
+> yourself ([`docs/BUILD.md`](docs/BUILD.md)) are the stronger guarantee. This matters more than
+> usual here: many players receive the zip forwarded by someone else and never open this page.
+
+## 关于杀毒软件告警 / About antivirus warnings
+
+启动器是**未签名**的小体积 .NET 程序（代码签名证书要花钱），每次发版都重新编译、内嵌 54 个补丁资源、
+并且会改写游戏的数据包。这套组合会触发部分杀软的启发式与机器学习判定 —— 报出来的通常是
+`Wacatac.B!ml`、`Gen:Variant.MSILHeracles` 这类**通用分类桶**，而不是具体的恶意软件家族。
+
+本程序从立项起就在一批自我限制下开发，全部可在源码中核对：
+
+- **零网络调用** —— 没有 `System.Net` / `HttpClient` / `WebClient` / `Socket` / `WebRequest`
+- 没有 P/Invoke、`Marshal`、`Assembly.Load`、`Reflection.Emit`，没有任何动态代码
+- 注册表**只读**（只为找到你的 Steam 库路径），从不写入
+- 「游戏日志」按钮**只是打开一个文件夹**，从不读取、打包或上传你的任何文件
+- **不常驻**：改完游戏数据就退出，无服务、无计划任务、无开机自启
+- 卸载**逐字节精确且可证明**：还原后的数据包 SHA256 与原版指纹一致，对不上就拒绝改动
+
+安装器是**单个公开文件** [`installer/Installer.cs`](installer/Installer.cs)，可以逐行读完。
+完整讨论见 [issue #2](../../issues/2)。
+
+> **English** — the launcher is a small **unsigned** .NET executable (a signing certificate costs
+> money), rebuilt for every release, carrying 54 embedded patch resources and rewriting the game's
+> data pack. That combination trips some antivirus heuristics, and what they report are generic
+> buckets (`Wacatac.B!ml`, `Gen:Variant.MSILHeracles`) rather than a named malware family.
+> It makes **zero network calls**, stays resident nowhere, writes nothing to the registry, never
+> reads or uploads your files, and uninstalls byte-exactly. The installer is a single public file
+> you can read line by line. Full breakdown in [issue #2](../../issues/2).
+
+---
+
 ## 更新日志
 
 ### 1.4 —— 残骸平台：修好 8 人局无法结束
