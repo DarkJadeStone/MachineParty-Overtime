@@ -1,12 +1,18 @@
 diff --git a/minigames/duck_hunt/states/play_state.gd b/minigames/duck_hunt/states/play_state.gd
 --- a/minigames/duck_hunt/states/play_state.gd
 +++ b/minigames/duck_hunt/states/play_state.gd
-@@ -21,6 +21,9 @@ func enter(_msg: Dictionary = {}) -> void :
+@@ -21,6 +21,15 @@ func enter(_msg: Dictionary = {}) -> void :
  		for player in owner.players:
  			player.set_active_rpc.rpc(true)
  
 +	owner.mp8_shot("go", 0.3)    # [MP8] 刚喊开始那一下，用来看倒计时口号/附注
 +	owner.mp8_shot("play", 3.0)  # [MP8] 开打 3 秒后，用来看双猎人站位
++
++	# [MP8] T52 点名：开打这一刻是唯一能同时看到「谁该动」和「谁被激活了」的时机。
++	# 服务器点全场，每台机器点自己 —— 两边都要，因为两种失败长得一模一样（人不动），
++	# 病因却相反：服务器没角色 / 服务器有但没复制到那台客机。
++	owner.mp8_roll_call()
++	owner.mp8_self_check()
 +
  func exit(_msg: Dictionary = {}) -> void :
  	pass

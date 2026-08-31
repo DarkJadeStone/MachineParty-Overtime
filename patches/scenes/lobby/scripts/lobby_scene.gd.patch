@@ -19,3 +19,38 @@ diff --git a/scenes/lobby/scripts/lobby_scene.gd b/scenes/lobby/scripts/lobby_sc
  		player_list_updated_rpc.rpc(player_order_by_seat)
  		fade_loading_screen()
  	)
+@@ -211,6 +211,9 @@ func setup_network_signals():
+ 	NetworkManager.lobby_joined.connect(_on_lobby_joined)
+ 	NetworkManager.join_allowed.connect(_on_join_allowed)
+ 	NetworkManager.join_refused.connect(_on_join_refused)
++	# [MP8] T53：④「对方没装 mod」那一种，客机跑的是原版代码、我们改不到，
++	# 只能由房主这边说出来。发到原版自带的大厅消息条上。
++	NetworkManager.mp8_join_blocked.connect(_mp8_on_join_blocked)
+ 
+ func update_player_list():
+ 
+@@ -413,6 +416,13 @@ func _on_join_allowed(reconnect: bool, game_in_progress: bool, _debug_only: bool
+ 			if GameManager.is_using_controller():
+ 				reconnect_handler.cancel_button.grab_focus()
+ 
++# [MP8] T53：有人被版本挡在门外，告诉房主是为什么、该让对方做什么。
++func _mp8_on_join_blocked(text: String) -> void :
++	if lobby_handler != null:
++		lobby_handler.send_lobby_message(text)
++	print("[MP8] " + text)
++
++
+ func _on_join_refused(network_id: int, refuse_reason):
+ 
+ 	NetworkManager.leave_lobby()
+@@ -426,7 +436,9 @@ func _on_join_refused(network_id: int, refuse_reason):
+ 		NetworkManager.RefuseReason.None:
+ 			message = tr("LOC_ROOM_UNKNOWN")
+ 		NetworkManager.RefuseReason.VersionMismatch:
+-			message = tr("LOC_TAG_VERSION_MISMATCH")
++			# [MP8] T53：原版这句对四种情形一视同仁（「版本与该房间不符」），
++			# 玩家看完不知道该更新、该让房主更新、还是该卸载。换成分情形的说法。
++			message = NetworkManager.mp8_mismatch_text()
+ 		NetworkManager.RefuseReason.SessionEnded:
+ 			message = tr("LOC_ROOM_DISBANDED")
+ 		NetworkManager.RefuseReason.HostLeft:

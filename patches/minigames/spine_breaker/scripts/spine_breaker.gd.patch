@@ -1,7 +1,7 @@
 diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_breaker/scripts/spine_breaker.gd
 --- a/minigames/spine_breaker/scripts/spine_breaker.gd
 +++ b/minigames/spine_breaker/scripts/spine_breaker.gd
-@@ -24,23 +24,309 @@ var player_count: int = 0
+@@ -24,23 +24,334 @@ var player_count: int = 0
  
  var playing: bool = false
  
@@ -81,8 +81,33 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
 +	])
 +
 +
++# 命令行 `mp8devwait=<秒>`：把**所有**装置的"杀完之后等几秒"覆盖成同一个值，返回 0 = 没传。
++#
++# 用途和 `mp8spinefuse=` 一样，是**手动把竞态窗口撑大来复现** ——
++# T51 那个 bug 要求「attach 恰好落在 `_on_device_requested_target` 的 await 窗口里」，
++# 而那个窗口默认只有 2~3 秒，靠运气撞。传 `mp8devwait=15` 撑到 15 秒，
++# 8 个挂机实例互相乱撞，几分钟内就能复现（修之前跑一次，才有对照）。
++#
++# ⚠️ 它同时也是**正常节奏的旋钮**，别在正式游玩时传：
++#    周期 = 引信 + 本值，两台错开量就是靠这两个值不等长维持的（见 MP8_DEVICE_WAIT 那段）。
++func _mp8_wait_forced() -> float :
++
++	for a in OS.get_cmdline_args():
++		var s: String = str(a)
++		if s.begins_with("mp8devwait="):
++			var v: String = s.substr(len("mp8devwait="))
++			if v.is_valid_float():
++				return clampf(float(v), 0.0, 60.0)
++
++	return 0.0
++
++
 +# 这一台杀完之后该等几秒。按 mp8_index（1 起）查表，表外退回 1 号机那档。
 +func _mp8_wait_for(which) -> float :
++
++	var forced: float = _mp8_wait_forced()
++	if forced > 0.0:
++		return forced
 +
 +	var i: int = 0
 +	if which != null and is_instance_valid(which):
@@ -312,7 +337,7 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
  func _physics_process(_delta: float) -> void :
  
  	if not playing:
-@@ -51,7 +337,7 @@ func _physics_process(_delta: float) -> void :
+@@ -51,7 +362,7 @@ func _physics_process(_delta: float) -> void :
  			continue
  
  		var query = PhysicsRayQueryParameters3D.create(
@@ -321,7 +346,7 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
  			p.global_position
  		)
  
-@@ -91,16 +377,31 @@ func initialize(_round_number: int, _total_rounds: int, _scores: Dictionary = {}
+@@ -91,16 +402,31 @@ func initialize(_round_number: int, _total_rounds: int, _scores: Dictionary = {}
  
  func spawn_players():
  
@@ -358,7 +383,7 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
  		var player_character = player_scene.instantiate()
  		players_node.add_child(player_character, true)
  
-@@ -115,7 +416,16 @@ func spawn_players():
+@@ -115,7 +441,16 @@ func spawn_players():
  
  		player_scores[network_id] = 0
  
@@ -376,7 +401,7 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
  
  func cleanup():
  
-@@ -131,6 +441,15 @@ func player_disconnected(_network_id: int):
+@@ -131,6 +466,15 @@ func player_disconnected(_network_id: int):
  	remove_player_rpc.rpc(_network_id)
  	await get_tree().create_timer(1.0).timeout
  
@@ -392,7 +417,7 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
  	check_game_end()
  
  func check_game_end():
-@@ -144,17 +463,33 @@ func check_game_end():
+@@ -144,17 +488,33 @@ func check_game_end():
  	finished = true
  
  	set_playing_rpc.rpc(false)
@@ -428,7 +453,7 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
  	player_scores_finalized.emit(player_scores)
  
  	await get_tree().create_timer(2.0).timeout
-@@ -172,7 +507,11 @@ func remove_player_rpc(_network_id: int):
+@@ -172,7 +532,11 @@ func remove_player_rpc(_network_id: int):
  	if player_instance:
  
  		if multiplayer.is_server():
@@ -441,7 +466,7 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
  
  		player_instance.queue_free()
  		players.erase(_network_id)
-@@ -187,18 +526,127 @@ func set_playing_rpc(_playing: bool):
+@@ -187,18 +551,175 @@ func set_playing_rpc(_playing: bool):
  func _on_countdown_tick(time_left: int):
  	super._on_countdown_tick(time_left)
  
@@ -470,6 +495,54 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
 +			continue
 +		if d.mp8_retired:
 +			print("[MP8] 碎骨者：选目标跳过 —— %d 号机已退休" % d.mp8_index)
++			continue
++
++		# ═══════════════════════════════════════════════════════════════════
++		# [MP8] 🩸 T51：正骑在人身上的机器**绝对不能**被重派目标
++		# ═══════════════════════════════════════════════════════════════════
++		#
++		# **玩家报的现象**（2026-08-28/29 两位互不相干的玩家，B 站评论区）：
++		# 「蜘蛛抓住他后一直不咬，他也一直丢不出去，就整个卡死掉了，只能重新C房」
++		# 「蜘蛛那一关蜘蛛会出现不杀人的情况，一直挂身上」
++		#
++		# **时序**（`_on_device_requested_target` 里那句 await 是关键）：
++		#   1. 机器在 Follow 追一个扑不上的人 → `_mp8_check_dead_end` 发 `request_new_target`；
++		#   2. `_on_device_requested_target` 开始 `await create_timer(wait)` —— **2~3 秒**；
++		#   3. **就在这段等待里**，机器撞上了一个能扑的人 → 进 Attached：
++		#      玩家背上视觉开、`mp8_bind_rpc` 绑定、引信开始烧；
++		#   4. await 结束 → 本函数被调 → 无条件 `transition_to("Follow")`
++		#      → `attached_state.exit()` 把 `owner.attached_to` 清成 null；
++		#   5. **而没有任何人去关玩家背上的视觉**（`set_spine_breaker_rpc(false)` 一次都没发）。
++		#
++		# 于是被扑的那个人：
++		#   · 背上一直挂着一台看得见的机器  —— `has_spine_breaker` 还是 true；
++		#   · 它永远不咬                    —— 那台已经走了，引信被 `start_timer()` 重置去追别人，
++		#                                      `activation_timer.timeout` 再也不会对着他响；
++		#   · 按扔也扔不出去                —— `_mp8_dev_to_throw()` 认 `attached_to == self`，
++		#                                      第 4 步刚把它清成 null → 返回 null → 不扔；
++		#   · **他永远不会死** → 如果他是最后两人之一，`active_players` 减不到 1，整局卡死。
++		#     （2026-08-27 那条「最后两个人丢不出去、出不去」很可能就是同一件事。）
++		#
++		# ⚙ **为什么直接跳过是安全的**：正骑着人的机器根本不需要新目标 ——
++		#    引信到点它自己会杀人，杀完走 BreakSpine → Idle(after_break) → `request_new_target`
++		#    那条**现成的**重派路。就算受害者被另一台先杀了，这台的引信到点后
++		#    `break_spine_state.enter()` 会发现目标已死、走 Idle 重派。两条路都自愈。
++		#
++		# ⚙ 判据用 `attached_to` 而不是状态机当前状态：`attached_to` 是 `attached_state`
++		#    在服务器上写的权威事实，且 BreakSpine 期间仍然有效（exit 才清）——
++		#    正在处决的机器同样不该被重派。
++		#
++		# 🩸 **这是同一类坑的第三次**（T45、T47 都是「await 之后没复查世界」）。
++		#    规矩：**任何 await 之后，动手之前先重新确认对象还是不是你离开时那个样子。**
++		if d.attached_to != null and is_instance_valid(d.attached_to):
++			# 带上当前状态：Attached = 差点从活人身上把机器偷走（玩家报的那个）；
++			# BreakSpine = 差点打断一次正在进行的处决。两种都该拦，但排查价值不同。
++			var st_name: String = "?"
++			if d.state_machine != null and d.state_machine.current_state != null:
++				st_name = String(d.state_machine.current_state.name)
++			print("[MP8] 碎骨者：选目标跳过 —— %d 号机正骑在 %s 身上，当前状态 %s（T51 拦截）" % [
++				d.mp8_index, String(d.attached_to.name), st_name
++			])
 +			continue
 +
 +		var prey = _mp8_pick_prey(d)
@@ -576,7 +649,7 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
  
  func _on_countdown_expired():
  	super._on_countdown_expired()
-@@ -211,14 +659,19 @@ func _on_countdown_expired():
+@@ -211,14 +732,19 @@ func _on_countdown_expired():
  
  	set_playing_rpc.rpc(true)
  
@@ -600,7 +673,7 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
  
  func _on_player_died(_network_id: int):
  
-@@ -226,6 +679,932 @@ func _on_player_died(_network_id: int):
+@@ -226,6 +752,932 @@ func _on_player_died(_network_id: int):
  		active_players.erase(_network_id)
  		dead_players.append(_network_id)
  

@@ -40,12 +40,12 @@ eight.*</sub>
 
 ## 校验下载的文件 / Verifying your download
 
-**1.4** 各文件的 SHA256：
+**1.5** 各文件的 SHA256：
 
 ```
-82D84FA7AF88516FEF18EFD58A50A4592E38F281E0CD2A73ACA54847C46F7779  Machine-Party-Overtime-1.4.zip
-E879C1831F2FC4E29DD909D4805BA319313B6F09BA28EEB3D5D73ED3D8AFD8C7  overtime_launcher.exe
-933004418B2B7B1DE1C6B68C9C4A7B091EB6AF5772C964BFFBEFA418B6BC78ED  overtime_install.exe
+3F970C4A8CB8DD930277AFFDD1D217B99A771FC6FDBD8F974B7CA3F505F7CF71  Machine-Party-Overtime-1.5.zip
+F6C6E5032F318DF7ADF01CA3FE886ED35DEEF4BD491616A388580A93C6D8BB5A  overtime_launcher.exe
+3AD3C6E409EE31AEBBCA821EC909ED83ED3CE0893F26A76D491C1795DB736A5A  overtime_install.exe
 ```
 
 在 PowerShell 里核对：
@@ -94,6 +94,77 @@ Get-FileHash <文件> -Algorithm SHA256
 ---
 
 ## 更新日志
+
+### 1.5 —— 碎骨者：装置挂在身上却不处决
+
+下载地址：
+https://github.com/DarkJadeStone/MachineParty-Overtime/releases/tag/v1.5
+普通玩家下载「Machine-Party-Overtime-1.5.zip」即可。已经安装旧版的玩家不需要先卸载：完全退出游戏，解压新版压缩包，运行里面的「overtime_launcher.exe」，点击“启用 Overtime”即可完成更新。
+本次玩法更新只涉及「碎骨者」，其他小游戏的玩法没有调整。
+
+* 修复装置扑到玩家身上后一直不处决的问题。
+* 修复该状态下玩家按键没有反应、无法将装置扔出的问题。
+* 修复由此造成的残局永久卡死：被挂住的玩家既不会死亡，也无法摆脱装置，最后只剩两人时游戏无法继续结算。
+* 退休的装置由熄灯改为绿色慢闪。现在红色快闪代表引信正在燃烧，绿色慢闪代表装置已经退休、不会再次行动。
+
+前三个现象实际来自同一个问题：装置之前发出的一次“重新寻找目标”请求会延迟执行。在等待期间，它可能已经扑到了玩家身上；但旧请求到点后，仍会把它强行派去追赶其他人。
+这会导致装置实际已经离开，玩家背上的模型和状态却没有解除。服务器也不再认为那台装置真正挂在玩家身上，因此既不会继续处决，也找不到可以扔出的装置，最终让该玩家永久留在场内、整局无法结束。
+现在，已经挂在玩家身上或正在处决的装置不会再被重新分配目标。引信会正常倒计时，玩家也可以正常将其扔出。
+另外，只剩两名玩家时，按设计会有一台装置退休，只留下另一台进行最后的 1v1。旧版退休后直接熄灯，看起来很像装置又卡住了；1.5 改为绿色慢闪，可以直接区分“正常退休”和“仍在追击”。
+这个问题先后由三位玩家在评论区独立反馈，描述的“蜘蛛挂在身上不咬人”“红蜘蛛扔不出去”“最后两人无法结束”已经确认是同一个问题。修复已通过本机 8 实例定向验证，成功拦截了三次错误的目标重派，正常处决和复位流程也能继续运行。
+⚠️ 1.5 与 1.4 及更早版本不能互通，同一房间的所有玩家都必须更新至 1.5。
+如果进入房间时提示“您当前的游戏版本与该房间不符”，请查看主菜单右下角，所有人的版本都应显示：
+v2.1.2+overtime-1.5
+如果压缩包是群友或朋友转发的，也请把新版重新发给他们，避免房间里混入旧版本。
+
+> **English — 1.5: Spine Breaker devices that latch on but never execute.**
+>
+> Download:
+> https://github.com/DarkJadeStone/MachineParty-Overtime/releases/tag/v1.5
+> Most players only need `Machine-Party-Overtime-1.5.zip`. If you already have an older version
+> you do **not** need to uninstall first: quit the game completely, extract the new archive, run
+> `overtime_launcher.exe` inside it, and click **Enable Overtime**.
+>
+> This update changes gameplay in **Spine Breaker only**. No other minigame was adjusted.
+>
+> * Fixed a device latching onto a player and then never executing them.
+> * Fixed the player being unable to act in that state — inputs did nothing and the device could
+>   not be thrown off.
+> * Fixed the permanent stall this caused: the pinned player neither died nor got free, so once
+>   only two players were left the round could never settle.
+> * A retired device now blinks slowly in green instead of going dark. Red and fast means the fuse
+>   is burning; green and slow means the device has retired and will not act again.
+>
+> The first three are the same bug. A device's earlier "find a new target" request is executed
+> after a delay. During that wait it may already have latched onto a player — but when the old
+> request comes due, it is still sent off to chase someone else.
+>
+> The device has effectively left, yet the model and state on the player's back are never cleared.
+> The server also no longer considers that device to be riding the player, so it neither continues
+> the execution nor finds a device that can be thrown — leaving that player stuck on the field
+> forever and the round unable to end.
+>
+> Now a device that is already riding a player, or currently executing one, is no longer
+> reassigned. The fuse counts down normally and the player can throw it off as usual.
+>
+> Separately, when only two players remain one device retires by design, leaving the other for the
+> final 1v1. Previously it simply went dark, which looked a lot like the device had frozen again;
+> 1.5 makes it blink slowly in green so "retired normally" and "still hunting" can be told apart
+> at a glance.
+>
+> Three players reported this independently in the comments — "the spider hangs on and won't
+> bite", "the red spider can't be thrown", "the last two players can't finish" — all confirmed to
+> be the same bug. The fix was verified locally with 8 instances, intercepting three incorrect
+> target reassignments, with normal execution and reset flows still running.
+>
+> ⚠️ **1.5 is not compatible with 1.4 or earlier** — everyone in the lobby must update to 1.5.
+> If joining shows "your client version does not match the host version", check the bottom right
+> of the main menu; everyone should read:
+> `v2.1.2+overtime-1.5`
+> If someone forwarded you the archive, please send them the new one too, so no old version ends
+> up in the lobby.
+
+---
 
 ### 1.4 —— 残骸平台：修好 8 人局无法结束
 

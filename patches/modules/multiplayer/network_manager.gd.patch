@@ -11,12 +11,12 @@ diff --git a/modules/multiplayer/network_manager.gd b/modules/multiplayer/networ
 +# [MP8] mod 版本号。**发布新版就改这里**，它会被追加进 Globals.game_version，
 +# 直接决定"谁能跟谁联机"（见 _ready() 里那段版本握手）。
 +# 格式随意但要短：主菜单右下角显示的是 `原版号+本标签`，太长会顶出去。
-+const MP8_VERSION_TAG: String = "overtime-1.4"
++const MP8_VERSION_TAG: String = "overtime-1.5"
 +
  enum NetworkBackendType{
  	Enet, Steam
  }
-@@ -42,14 +47,559 @@ signal player_removed_from_join_queue(network_id)
+@@ -42,14 +47,562 @@ signal player_removed_from_join_queue(network_id)
  
  func _ready() -> void :
  
@@ -75,6 +75,9 @@ diff --git a/modules/multiplayer/network_manager.gd b/modules/multiplayer/networ
 +	if _mp8_no_topup or _mp8_audit_on:
 +		print("[MP8] 排查开关：notopup=%s audit=%s" % [str(_mp8_no_topup), str(_mp8_audit_on)])
 +	get_tree().node_added.connect(_mp8_on_node_added)
++
++	_mp8_perf_start()
++	_mp8_version_hooks()  # [MP8] T53 版本互报
 +
 +# [MP8] UID 解析自检。逐个检查崩溃小游戏里用到的 uid://，看能不能查到路径、能不能真的载出来。
 +# 对照组是立足之本用的 res:// 路径（已验证该游戏能正常跑）。
@@ -577,3 +580,274 @@ diff --git a/modules/multiplayer/network_manager.gd b/modules/multiplayer/networ
  func is_active() -> bool:
  
  	if not multiplayer:
+@@ -269,3 +822,270 @@ func remove_player_rpc(_network_id: int):
+ 		var player_info = active_backend.connected_players[_network_id]
+ 		active_backend.disconnected_players[_network_id] = player_info
+ 		active_backend.connected_players.erase(_network_id)
++
++
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] 帧时间探针（opt-in：`mp8perf`）—— 定位 8 人卡顿卡在哪一层
++# ═══════════════════════════════════════════════════════════════════════════
++#
++# 起因：玩家报「隧道险境和立足之本 8 人卡得跟 ppt 一样，**所有人都卡**」（T50 ⑤）。
++# 读代码已经排掉四条（见 HANDOFF T50 ⑤）：不是我们的每帧代码（一行都没加）、
++# 不是多摆了对象、不是同步器流量（这两关最低）、不是纯网络延迟（所有人都卡）。
++# 而且**同样 8 人猎鸭不卡** —— 所以是这两个场景特有的东西 × 人数。
++#
++# 读到这儿就该停手上测量了。本探针每 2 秒打一行，把一帧的开销拆成三层：
++#
++#   process   —— 脚本逻辑（_process / _physics_process 里的 GDScript）
++#   physics   —— 物理步进（刚体、碰撞、角色控制器）
++#   draw/obj  —— 渲染（绘制调用数、被绘制的对象数）
++#
++# **三者哪个跟着人数涨，根因就在哪一层** —— 这是本探针唯一的目的。
++# 横比方法：同样 8 开，分别跑猎鸭（不卡）和隧道险境（卡），对比同一行的数字。
++#
++# 挂在 NetworkManager 而不是某个小游戏脚本：它是 autoload、跨小游戏常驻，
++# 一处改动就能覆盖全部 15 个小游戏，否则没法做上面那个横比。
++#
++# ⚠️ 用 Timer 而不是 _process：本脚本没有 _process，加一个有覆盖基类的风险（同 T49 的做法）。
++# ⚠️ opt-in，发布版玩家双击启动什么都不传 → 一个字节都不写（同侦察日志的规矩）。
++# ⚠️ 写**每实例一份文件**，不靠 print：8 开时所有实例共用一个 godot.log 会互相盖字，
++#    这一轮已经栽过一次（见 HANDOFF T49「常备诊断」）。性能数据糊了等于白跑。
++#    文件名用进程号而不是 peer id —— autoload 的 _ready 跑在联机建立之前，那时候还没有 peer id。
++# ⚠️ 每行 flush：测完是被 stop.ps1 强杀的，不 flush 缓冲里的全丢。
++var _mp8_perf_on: bool = false
++var _mp8_perf_timer: Timer = null
++var _mp8_perf_f: FileAccess = null
++
++func _mp8_perf_start() -> void :
++
++	var args := Array(OS.get_cmdline_args())
++	_mp8_perf_on = args.has("mp8perf")
++	if not _mp8_perf_on:
++		return
++
++	_mp8_perf_f = FileAccess.open("user://mp8_perf_%d.log" % OS.get_process_id(), FileAccess.WRITE)
++	print("[MP8-PERF] 帧时间探针已开（每 2 秒一行）→ user://mp8_perf_%d.log" % OS.get_process_id())
++
++	_mp8_perf_timer = Timer.new()
++	_mp8_perf_timer.wait_time = 2.0
++	_mp8_perf_timer.autostart = true
++	_mp8_perf_timer.timeout.connect(_mp8_perf_tick)
++	add_child(_mp8_perf_timer)
++
++
++func _mp8_perf_tick() -> void :
++
++	if not _mp8_perf_on:
++		return
++
++	# 当前在玩哪个小游戏 —— 不带这个，横比时对不上是哪一关的数
++	var where: String = "?"
++	if Globals != null:
++		var mg = Globals.get("current_minigame_identifier")
++		if mg != null:
++			where = str(mg)
++
++	var line: String = "[MP8-PERF] %-14s fps=%5.1f | 脚本 %6.2f ms | 物理 %6.2f ms | 绘制调用 %5d | 绘制对象 %5d | 节点 %5d | 玩家 %d" % [
++		where,
++		Performance.get_monitor(Performance.TIME_FPS),
++		Performance.get_monitor(Performance.TIME_PROCESS) * 1000.0,
++		Performance.get_monitor(Performance.TIME_PHYSICS_PROCESS) * 1000.0,
++		int(Performance.get_monitor(Performance.RENDER_TOTAL_DRAW_CALLS_IN_FRAME)),
++		int(Performance.get_monitor(Performance.RENDER_TOTAL_OBJECTS_IN_FRAME)),
++		int(Performance.get_monitor(Performance.OBJECT_NODE_COUNT)),
++		PlayerManager.player_presences.size() if PlayerManager != null else -1,
++	]
++	print(line)
++	if _mp8_perf_f != null:
++		_mp8_perf_f.store_line(line)
++		_mp8_perf_f.flush()
++
++
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] T53 版本不匹配的**可执行提示**（2026-08-31）
++# ═══════════════════════════════════════════════════════════════════════════
++#
++# 原版对所有不匹配只有一句话（`LOC_TAG_VERSION_MISMATCH`）：
++#     「连接失败。您当前的游戏版本与该房间不符。」
++# 它没告诉玩家**该做什么** —— 因为握手比的是整串相等
++# （`enet_backend.gd:133` / `steam_backend.gd:169`），下面四种情形走同一条路：
++#   我的 mod 旧 / 我的 mod 新 / 房主没装 mod / 我没装而房主装了。
++# 前三种要做的事完全不同（我更新 / 房主更新 / 卸载还原），第四种更是连
++# 「去装 mod」这个动作都提示不到。1.5 又要挡一批人，所以这次把话说清楚。
++#
++# ── 为什么需要互相报一次版本 ──
++# 拒绝时客机手上只有 `RefuseReason.VersionMismatch` 一个枚举，**不知道房主是什么版本**，
++# 光凭这个分不出「房主是原版」还是「房主 mod 版本不同」。
++# 所以房主在**每个 peer 连上的那一刻**先报一次自己的完整版本串，客机收到后回报自己的。
++#
++# 判据是**收没收到**，不是收到了什么：
++#   收到 → 对面装了 Overtime 1.5+，串里有确切版本，能算出谁新谁旧；
++#   没收到 → 对面要么是原版，要么是 1.4 及更早（那时还没有这套握手）。
++#            ⚠️ 这两者**分不开**，所以文案必须两种都写，不能只说「没装」。
++#            这是一次性的过渡代价，1.6 起两边都会报，就精确了。
++#
++# ── 第四种情形（我没装、房主装了）为什么只能显示在房主屏幕上 ──
++# 那台客机跑的是**原版代码**，我们一行都改不到，它必然显示原版那句话。
++# 唯一还能说话的是房主 —— 所以那条提示发到**房主的大厅消息条**
++# （`lobby_handler.send_lobby_message`，原版自带、复制房间号时就在用），
++# 让房主告诉进不来的那位。这是这一种能做到的全部，别指望客机端。
++#
++# ⚠️ 给原版客机发这条 RPC，会在**他那台机器**的日志里留一行「方法不存在」的错误。
++#    无害（节点存在、只是没这个方法），且他本来就要被拒；换来的是第四种情形有救。
++
++signal mp8_join_blocked(text: String)   # 房主侧：有人被版本挡住了，带上给房主看的话
++
++const MP8_HELLO_GRACE: float = 2.0      # 等对面回报的时间；超时即判定「没有 1.5+」
++
++var _mp8_host_version: String = ""              # 客机侧：房主报来的完整版本串
++var _mp8_peer_versions: Dictionary = {}         # 房主侧：network_id -> 对方版本串
++
++
++func _mp8_version_hooks() -> void :
++
++	on_peer_connected.connect(_mp8_on_peer_connected)
++	on_peer_disconnected.connect(func(nid): _mp8_peer_versions.erase(nid))
++
++
++# 房主：谁连上就先报一次自己的版本，然后等对方回报。
++func _mp8_on_peer_connected(network_id: int) -> void :
++
++	if not multiplayer.is_server():
++		return
++
++	mp8_hello_rpc.rpc_id(network_id, Globals.game_version)
++
++	await get_tree().create_timer(MP8_HELLO_GRACE).timeout
++	if not is_inside_tree():
++		return
++
++	# 回报到了且版本一致 → 他能正常进来，不用说什么
++	var theirs: String = String(_mp8_peer_versions.get(network_id, ""))
++	if theirs == Globals.game_version:
++		return
++
++	# 走到这儿：对方的版本串与我们不等 → 原版后端**一定**会拒掉他。
++	# 不必等真的拒绝发生，此刻就能把原因说清楚。
++	mp8_join_blocked.emit(_mp8_blocked_text_for_host(theirs))
++
++
++@rpc("any_peer", "call_remote", "reliable")
++func mp8_hello_rpc(full_version: String) -> void :
++	_mp8_host_version = full_version
++	mp8_hello_back_rpc.rpc_id(1, Globals.game_version)
++
++
++@rpc("any_peer", "call_remote", "reliable")
++func mp8_hello_back_rpc(full_version: String) -> void :
++	if not multiplayer.is_server():
++		return
++	_mp8_peer_versions[multiplayer.get_remote_sender_id()] = full_version
++
++
++# 从完整版本串里拆出 mod 标签（没有就是空串 = 原版）。串长这样：`v2.1.2+overtime-1.5`
++func _mp8_tag_of(full_version: String) -> String:
++	var i: int = full_version.find("+overtime-")
++	return "" if i < 0 else full_version.substr(i + 1)
++
++
++# 版本号比大小：`overtime-1.5` → [1, 5]，逐段比。
++# 认不出来的一律当相等（宁可少说一句，也不要说反）。
++func _mp8_cmp_tag(a: String, b: String) -> int:
++	var pa := a.trim_prefix("overtime-").split(".")
++	var pb := b.trim_prefix("overtime-").split(".")
++	for i in maxi(pa.size(), pb.size()):
++		var x: int = int(pa[i]) if i < pa.size() and pa[i].is_valid_int() else 0
++		var y: int = int(pb[i]) if i < pb.size() and pb[i].is_valid_int() else 0
++		if x != y:
++			return -1 if x < y else 1
++	return 0
++
++
++func _mp8_zh() -> bool:
++	return TranslationServer.get_locale().to_upper().begins_with("ZH")
++
++
++# ── 客机侧：被拒时显示什么 ──────────────────────────────────────────────
++# 由 lobby_scene.gd 的 _on_join_refused 调用，取代 tr("LOC_TAG_VERSION_MISMATCH")。
++func mp8_mismatch_text() -> String:
++
++	var zh: bool = _mp8_zh()
++	var mine: String = Globals.game_version
++	var theirs: String = _mp8_host_version
++
++	# ③ 房主一声没吭 → 原版，或者 1.4 及更早（分不开，两种都写上）
++	if theirs.is_empty():
++		if zh:
++			return ("连接失败：房主那边没有 Overtime，或者版本是 1.4 及更早。\n\n"
++				+ "装了 Overtime 就进不了原版房间，这是设计如此。要一起玩：让房主也装同一版，"
++				+ "或者你用启动器「卸载还原」回到原版。\n\n你：" + mine)
++		return ("Failed to connect: the host does not have Overtime, or is on 1.4 or older.\n\n"
++			+ "With Overtime installed you cannot join a vanilla lobby — that is by design. "
++			+ "Either have the host install the same version, or use the launcher's Uninstall "
++			+ "to restore vanilla.\n\nYou: " + mine)
++
++	var my_tag: String = _mp8_tag_of(mine)
++	var their_tag: String = _mp8_tag_of(theirs)
++	var cmp: int = _mp8_cmp_tag(my_tag, their_tag)
++
++	# ⑤ mod 版本一样却还是被拒 → 差的是游戏本体（比如一边更新了 Steam 版本）
++	if cmp == 0:
++		if zh:
++			return ("连接失败：Overtime 版本是一样的，不一样的是**游戏本体**。\n\n"
++				+ "让 Steam 把两边更新到同一版即可。\n\n你：" + mine + "\n房主：" + theirs)
++		return ("Failed to connect: your Overtime versions match — the base game versions do not.\n\n"
++			+ "Update both sides to the same game version on Steam.\n\nYou: " + mine
++			+ "\nHost: " + theirs)
++
++	# ① 我旧
++	if cmp < 0:
++		if zh:
++			return ("连接失败：你的 Overtime 比房主的旧。\n\n"
++				+ "去下载新版、用启动器重装一次就行（不用先卸载）。\n\n你：" + mine
++				+ "\n房主：" + theirs)
++		return ("Failed to connect: your Overtime is older than the host's.\n\n"
++			+ "Download the newer release and run the launcher again — no need to uninstall first."
++			+ "\n\nYou: " + mine + "\nHost: " + theirs)
++
++	# ② 我新
++	if zh:
++		return ("连接失败：你的 Overtime 比房主的新。\n\n"
++			+ "请房主更新到和你一样的版本；同一房间里所有人必须是同一版。\n\n"
++			+ "你：" + mine + "\n房主：" + theirs)
++	return ("Failed to connect: your Overtime is newer than the host's.\n\n"
++		+ "Ask the host to update to the same version — everyone in a lobby must be on the same one."
++		+ "\n\nYou: " + mine + "\nHost: " + theirs)
++
++
++# ── 房主侧：④ 有人进不来时，给房主的一行提示 ────────────────────────────
++# 这是第四种情形（对方没装 mod）**唯一**能说话的地方，见本节开头的说明。
++func _mp8_blocked_text_for_host(their_version: String) -> String:
++
++	var zh: bool = _mp8_zh()
++
++	if their_version.is_empty():
++		if zh:
++			return ("有人没装 Overtime（或版本 1.4 及更早），已被挡在门外。让他装 "
++				+ MP8_VERSION_TAG + " 这一版。")
++		return ("Someone without Overtime (or on 1.4 or older) was blocked. "
++			+ "Ask them to install " + MP8_VERSION_TAG + ".")
++
++	var their_tag: String = _mp8_tag_of(their_version)
++	if their_tag.is_empty():
++		if zh:
++			return "有人用原版进不来，已被挡在门外。让他装 " + MP8_VERSION_TAG + " 这一版。"
++		return "Someone on vanilla was blocked. Ask them to install " + MP8_VERSION_TAG + "."
++
++	var cmp: int = _mp8_cmp_tag(their_tag, MP8_VERSION_TAG)
++	if cmp == 0:
++		if zh:
++			return ("有人被挡在门外：Overtime 版本相同，是游戏本体版本不同（对方 "
++				+ their_version + "）。")
++		return ("Someone was blocked: same Overtime, different base game version ("
++			+ their_version + ").")
++
++	if zh:
++		return ("有人的 Overtime 是 " + their_tag + "，比房间" + ("旧" if cmp < 0 else "新")
++			+ "，已被挡在门外。全房间必须同为 " + MP8_VERSION_TAG + "。")
++	return ("Someone on Overtime " + their_tag + " was blocked ("
++		+ ("older" if cmp < 0 else "newer") + " than this lobby). Everyone must be on "
++		+ MP8_VERSION_TAG + ".")

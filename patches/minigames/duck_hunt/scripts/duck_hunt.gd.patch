@@ -375,16 +375,16 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
  			continue
  
  		player_presence = PlayerManager.player_presences[network_id]
-@@ -261,18 +589,11 @@ func spawn_players():
+@@ -261,19 +589,12 @@ func spawn_players():
  		counter += 1
  
  	duck_player_count = duck_players.size()
 -	set_hunter_rpc.rpc(hunter_network_id)
--
 +	# [MP8] 名次分要用"本小回合开局有几只鸭"。duck_player_count 会被 remove_player_rpc
 +	# 改动（有人掉线时），所以单独留一份开局快照，免得算出来的名次分随掉线飘。
 +	_mp8_round_duck_count = duck_players.size()
 +	set_hunters_rpc.rpc(hunter_network_ids)
+ 
  
 -	player_presence = PlayerManager.player_presences[hunter_network_id]
 -	var hunter_player_character = hunter_player_scene.instantiate()
@@ -395,9 +395,10 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
 -		hunter_player_spawn_position.global_position, 
 -		duck_player_count
 -	)
- 
+-
  	var hunter_initialization_delay = 8.0
  	if current_round > 0:
+ 		hunter_initialization_delay = 5.0
 @@ -281,16 +602,43 @@ func spawn_players():
  	if GameManager.local_game:
  		hunter_initialization_delay -= 2.0
@@ -422,16 +423,16 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
 +		)
 +
 +		hunter_player_character.initialize_hunter_rpc.rpc(hunter_initialization_delay)
-+
+ 
+-	local_game_players_order[player_presence.network_id] = hunter_player_character
+-	hunter_player = hunter_player_character
+-	players.append(hunter_player_character)
 +		local_game_players_order[player_presence.network_id] = hunter_player_character
 +		hunter_players.append(hunter_player_character)
 +		players.append(hunter_player_character)
 +
 +	hunter_player = hunter_players[0] if not hunter_players.is_empty() else null
- 
--	local_game_players_order[player_presence.network_id] = hunter_player_character
--	hunter_player = hunter_player_character
--	players.append(hunter_player_character)
++
 +	print("[MP8] 猎鸭开局：%d 人 → %d 鸭 %d 猎，猎人位 %s" % [
 +		total_players, duck_player_count, hunter_players.size(),
 +		str(hunter_names)
@@ -470,16 +471,16 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
  
 +# [MP8] 双猎人版：名字变成一串，另外把本局人数一起发下去，
 +# 角色揭示界面要用它显示"这一档猎人被加强/削弱了"。
-+@rpc("authority", "call_local", "reliable")
+ @rpc("authority", "call_local", "reliable")
+-func set_ducks_ambient_light_rpc(_hunter_id):
+-	if multiplayer.get_unique_id() == _hunter_id:
+-		light_parent_ducks_only.visible = false
 +func set_hunter_names_rpc(_hunter_names: Array, _total_players: int):
 +	mp8_hunter_names = _hunter_names
 +	mp8_total_players = _total_players
 +	hunter_name = String(_hunter_names[0]) if not _hunter_names.is_empty() else ""
 +
- @rpc("authority", "call_local", "reliable")
--func set_ducks_ambient_light_rpc(_hunter_id):
--	if multiplayer.get_unique_id() == _hunter_id:
--		light_parent_ducks_only.visible = false
++@rpc("authority", "call_local", "reliable")
 +func set_ducks_ambient_light_rpc(_hunter_ids):
 +	# [MP8] 原来收单个 id，现在收一串：两个猎人都要看不见"只有鸭子能看见"的补光
 +	var is_local_hunter: bool = false
@@ -698,3 +699,120 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
  func _on_countdown_expired():
  	super._on_countdown_expired()
  
+@@ -534,3 +1033,116 @@ func _on_countdown_expired():
+ func _on_unpaused():
+ 
+ 	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
++
++
++# ═══════════════════════════════════════════════════════════════════════════
++# [MP8] T52 点名器 —— 玩家报「猎鸭 5 人会有人卡住、按 wasd 无反应」
++# ═══════════════════════════════════════════════════════════════════════════
++#
++# 2026-08-30 纯读码 + 四个探针，**没找到**病因，四条假说全被测量否掉
++# （出生点几何 / spawn_limit / 我们改过移动代码 / 下标越界，见 HANDOFF T52）。
++# 读到这儿就该停手上测量了 —— 同 T49 的做法。
++#
++# 鸭子能不能动只有一个闸：`duck_player.active`，由 `play_state.enter()` 里
++# `set_active_rpc.rpc(true)` 打开，而那个循环遍历的是 **`players`**。
++# 所以「按 wasd 没反应」只可能是下面三种，且三种在画面上**完全一样**：
++#
++#   A. 服务器压根没给他造角色  → 他不在 `players` 里，激活轮不到他；
++#   B. 服务器造了、也激活了，但那个节点**没复制到他那台机器**
++#      → 他本机没有自己的角色，摄像机不切、输入无处可去；
++#   C. 造了、复制了、但 `active` 还是 false（RPC 丢了 / 到得比节点早）。
++#
++# 光看画面分不出是哪种，所以点两次名，一次在服务器一次在本机：
++#
++#   mp8_roll_call()  服务器视角：每个 presence 有没有角色、active 是不是 true
++#   mp8_self_check() 本机视角：**我自己**的角色在不在这台机器上、active 如何
++#
++# 只有 A → roll_call 报缺人；只有 B → roll_call 全绿而某台的 self_check 报找不到自己；
++# 只有 C → 两边都找得到，但 active=false。**一句日志就能定位到层。**
++#
++# ⚠️ 故意做成**常开**（不挂 `-debug-tools`），因为这个 bug 我们本机复现不出来，
++#    只能等真人局；玩家送来的 `godot.log` 里必须自带这几行才有用。
++#    代价是每个小回合两行，可接受（旁边那条「猎鸭开局」本来就是常开的）。
++func _mp8_who(nid: int) -> String:
++	var pres = PlayerManager.player_presences.get(nid)
++	return "%s(%d)" % [pres.network_name if pres != null else "?", nid]
++
++
++# [MP8] 服务器点全场：presence ↔ 角色 ↔ active 三者对不对得上。
++func mp8_roll_call() -> void :
++
++	if not multiplayer.is_server():
++		return
++
++	var owned: Dictionary = {}
++	for p in players:
++		if not is_instance_valid(p) or p.player_presence == null:
++			continue
++		owned[p.player_presence.network_id] = p
++
++	var no_body: Array[String] = []
++	var not_active: Array[String] = []
++	for nid in PlayerManager.player_presences.keys():
++		if not owned.has(nid):
++			no_body.append(_mp8_who(nid))
++		elif not owned[nid].active:
++			not_active.append(_mp8_who(nid))
++
++	if no_body.is_empty() and not_active.is_empty():
++		print("[MP8] 猎鸭点名（服务器）：%d 人全部有角色且已激活" % PlayerManager.player_presences.size())
++		return
++
++	# 走到这儿就是 A 或 C —— 把人名打出来，玩家日志里一眼能对上是谁在喊卡住
++	print("[MP8] 🩸 猎鸭点名异常（服务器）：%d 人 / %d 个角色 —— 没角色 %s ；没激活 %s（T52）" % [
++		PlayerManager.player_presences.size(), owned.size(),
++		str(no_body) if not no_body.is_empty() else "无",
++		str(not_active) if not not_active.is_empty() else "无",
++	])
++
++
++# [MP8] 本机点自己：这台机器上到底有没有「我」的角色。
++# 专抓 B —— 服务器一切正常、偏偏这一台没收到节点。服务器那边看不见这种。
++func mp8_self_check() -> void :
++
++	# 分屏本地模式一台机器管所有人，这个判据不成立，直接跳过
++	if GameManager.local_game:
++		return
++
++	# 等两秒再点：节点复制、set_player_presence、set_active_rpc 都是
++	# 开打前后陆续到的，立刻点会把「还在路上」误报成「丢了」。
++	await get_tree().create_timer(2.0, false).timeout
++	if not is_inside_tree():
++		return
++
++	var me: int = multiplayer.get_unique_id()
++	var mine = null
++	for container in [duck_player_spawn_parent, hunter_player_spawn_parent]:
++		if container == null:
++			continue
++		for c in container.get_children():
++			if c.player_presence != null and c.player_presence.network_id == me:
++				mine = c
++				break
++		if mine != null:
++			break
++
++	if mine == null:
++		print("[MP8] 🩸 猎鸭自检（本机 %d）：开打 2 秒了，场上**找不到我自己的角色** —— 这就是「人卡住、按 wasd 没反应」（T52-B）" % me)
++		return
++
++	if not mine.active:
++		print("[MP8] 🩸 猎鸭自检（本机 %d）：角色在，但 active 还是 false —— 激活没到（T52-C）" % me)
++		return
++
++	# 全绿的时候更要打这一行 —— 因为「全绿」本身就是结论：
++	# 角色在、激活了、还是动不了 → 问题不在我们这套，在**输入层**。
++	# 所以顺手把两个输入闸也读出来，省得靠排除法猜：
++	#   game_focused=false → 窗口失焦（点到第二屏 / OBS / Discord 就会），
++	#                        原版 `_process` 这时直接 return，wasd 一个字都不读，
++	#                        而且**不清零 movement_input**，人就定在原地 = 玩家说的"卡住"；
++	#   PauseMenu.active   → 暂停菜单开着。
++	# ⚠️ 还有一种全绿：**他本回合是猎人**。猎人是固定机位狙击手，wasd 本来就不动，
++	#    第一个小回合还要等 8 秒装枪 —— 没看清角色揭示的人很容易当成 bug 来报。
++	print("[MP8] 猎鸭自检（本机 %d）：角色在、已激活，%s；窗口聚焦=%s 暂停=%s" % [
++		me, "猎人（wasd 本来就不动）" if is_hunter else "鸭子",
++		str(GameManager.game_focused), str(PauseMenu.active)])

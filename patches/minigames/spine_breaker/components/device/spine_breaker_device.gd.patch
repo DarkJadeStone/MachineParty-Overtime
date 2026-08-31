@@ -1,7 +1,7 @@
 diff --git a/minigames/spine_breaker/components/device/spine_breaker_device.gd b/minigames/spine_breaker/components/device/spine_breaker_device.gd
 --- a/minigames/spine_breaker/components/device/spine_breaker_device.gd
 +++ b/minigames/spine_breaker/components/device/spine_breaker_device.gd
-@@ -74,6 +74,34 @@ var can_proximity_attach: bool = true
+@@ -74,6 +74,58 @@ var can_proximity_attach: bool = true
  
  var attached: bool = false
  
@@ -25,6 +25,30 @@ diff --git a/minigames/spine_breaker/components/device/spine_breaker_device.gd b
 +
 +# [MP8] 本台的机体颜色，由小游戏在 mp8_ensure_devices_rpc 里设（每个端各设一次）。
 +# attach 时要把它转贴到被抱住那人背上的视觉去，所以装置自己得记着。
++# [MP8] 退休那台的**灯色**（用户 2026-08-30 要求：退休的机器亮绿灯）。
++#
++# ⚠️ 上一版做错过一次：去刷**机体贴图**（albedo）了。用户当场指出要的是
++#    「闪的那盏灯」变绿，不是把机器刷成绿色 —— 记在这里免得再改回去。
++#
++# 玩家背上那盏灯是 `spine_breaker_player.spine_breaker_light`（OmniLight3D），
++# 扑上来时被设成 `Color.RED`（见玩家脚本 spine_breaker_attached_rpc）。
++# **装置本体自己的 `status_light` 看不见** —— 一 attach 就隐形并被挪到地下 100 米。
++#
++# 为什么是绿：本局里绿一直是「这台不构成威胁」的意思
++#（`spine_broken_exited_rpc` 复位后就是绿灯），退休 = 永久退出流通，语义一致。
++# 在此之前退休是**熄灯**，尸体背上黑漆漆一坨，玩家分不出那台还会不会再动 ——
++# 而这恰恰是最该知道的：场上还剩几台在猎人，直接决定要不要继续跑。
++const MP8_RETIRE_LIGHT: Color = Color(0.2, 1.0, 0.3)
++
++# [MP8] 退休那台的闪烁速度（用户 2026-08-30 要求：退休了也要闪）。
++#
++# 用**固定慢速**而不是沿用引信那个速度：正常闪烁的快慢 = 引信剩多少
++#（`_process` 里 `1.0 + (1 - 剩余比例) * 3.0`，越接近处决闪得越急）。
++# 退休那一刻引信刚好烧完，速度正卡在最快档 —— 直接留着会变成
++# 「一台报废的机器在尸体上疯狂急闪」，读起来像随时要动手，正好反了。
++# 0.6 比基础速度还慢，是「待机脉冲」的节奏，配上绿色才说得通：**它还亮着，但不急了**。
++const MP8_RETIRE_BLINK: float = 0.6
++
 +var mp8_tint: Color = Color.WHITE
 +
 +# [MP8] 机体贴图名"最后一个下划线之后"的部分（实测 = "spinebreaker base1.png"）。
@@ -36,7 +60,7 @@ diff --git a/minigames/spine_breaker/components/device/spine_breaker_device.gd b
  func _ready() -> void :
  
  	set_multiplayer_authority(1, true)
-@@ -107,16 +135,42 @@ func _process(_delta: float) -> void :
+@@ -107,16 +159,42 @@ func _process(_delta: float) -> void :
  	if velocity.length() > Globals.Epsilon && can_rotate:
  
  		visuals.rotation.y = rotate_toward(
@@ -81,7 +105,7 @@ diff --git a/minigames/spine_breaker/components/device/spine_breaker_device.gd b
  
  var looping = false
  func footsteps_loop():
-@@ -190,16 +244,21 @@ func set_lights_rpc():
+@@ -190,16 +268,21 @@ func set_lights_rpc():
  
  @rpc("any_peer", "call_local", "reliable")
  func try_throw_rpc(
@@ -107,7 +131,7 @@ diff --git a/minigames/spine_breaker/components/device/spine_breaker_device.gd b
  	if kick and not can_kick:
  		return
  
-@@ -210,9 +269,9 @@ func try_throw_rpc(
+@@ -210,9 +293,9 @@ func try_throw_rpc(
  	possible_thrower.set_spine_breaker_rpc.rpc(false)
  
  	state_machine.transition_to(&"Thrown", {
@@ -120,7 +144,7 @@ diff --git a/minigames/spine_breaker/components/device/spine_breaker_device.gd b
  		"strength": _strength
  	})
  
-@@ -265,6 +324,33 @@ func attach_entered_rpc():
+@@ -265,6 +348,77 @@ func attach_entered_rpc():
  	set_collision_layer_value(1, false)
  	set_collision_mask_value(1, false)
  
@@ -142,19 +166,63 @@ diff --git a/minigames/spine_breaker/components/device/spine_breaker_device.gd b
 +
 +	activation_timer.stop()
 +	light_animation_player.stop()
-+	light_animation_player.speed_scale = 0.0
-+	status_light.light_color = Color.BLACK
++	# [MP8] ⚠️ 这个 speed_scale **不是**给自己用的，是给玩家用的：
++	# 玩家的 `_process` 每帧都把自己的 `blink_animation_player.speed_scale`
++	# 同步成**设备这个值**。所以想让尸体背上那盏灯继续闪，唯一的旋钮就是这一行 ——
++	# 置 0 就是「不闪」，这也是上一版灯不闪的原因。
++	# 而设备的 `_process` 只在 `activation_timer` 没停时才覆写它，退休已经把表停了，
++	# 所以这里设的值不会被冲掉。
++	light_animation_player.speed_scale = MP8_RETIRE_BLINK
++	# [MP8] 原来是 Color.BLACK（熄灯）。装置本体这时已经隐形并被挪到地下 100 米，
++	# 所以这一行基本看不见 —— 真正让玩家看到绿的是下面那句给背上视觉的染色。
++	# 这里一并改成绿只为语义一致（万一哪天本体又现形，不该是黑的）。
++	status_light.light_color = Color.GREEN
 +
 +	var v = get_node_or_null(victim_path)
 +	if v is SpineBreakerPlayer and v.blink_animation_player != null:
-+		v.blink_animation_player.stop()
-+		v.blink_animation_player.speed_scale = 0.0
++
++		# ═══════════════════════════════════════════════════════════════════
++		# [MP8] 🩸 必须**显式重播**，光是「不 stop」不够（用户 2026-08-30 实测：灯压根没亮）
++		# ═══════════════════════════════════════════════════════════════════
++		#
++		# 上一版这里是 `stop()`，结果玩家报「灯亮都没亮」。两个原因叠在一起：
++		#
++		#   ① `AnimationPlayer.stop()` 会把被动画的属性**留在当时那一帧**。
++		#      闪烁动画有"灭"的相位，停在灭相上 → 灯的亮度就是 0，
++		#      **这时候再怎么改 `light_color` 都看不见**（黑乘任何颜色还是黑）。
++		#   ② 服务器和客机本来就不一致：`break_spine_state.enter()` 里那句
++		#      `target.blink_animation_player.stop()` **只在状态机跑的那一端（服务器）执行过**，
++		#      客机那份从来没被停过。所以只是"这里不再 stop"的话，
++		#      房主看到的是黑灯、客机看到的是还在闪 —— 更糟。
++		#
++		# 所以这里**主动把它播起来**，让两端都从同一个状态开始。
++		var ap: AnimationPlayer = v.blink_animation_player
++		var anim: String = ap.current_animation
++		if anim == "" and ap.get_animation_list().size() > 0:
++			anim = ap.get_animation_list()[0]
++		if anim != "":
++			ap.play(anim)
++		ap.speed_scale = MP8_RETIRE_BLINK
++
++	# [MP8] 尸体背上那盏灯改成绿色（用户 2026-08-30 要求）。
++	#
++	# 配合上面两处，效果是**慢速闪烁的绿灯**（用户 2026-08-30 定：退休了也要闪）。
++	# 红=引信在烧、快闪=快到点了；绿+慢闪=还亮着但已经报废，两套语义分得开。
++	#
++	# ⚠️ 这个绿是**故意留着不还原**的：退休那台的整套复位本来就全被跳过
++	#（不 spine_broken_exited_rpc、不 set_spine_breaker_rpc(false)），
++	# 所以它会一直绿到本局结束 —— 这正是想要的效果：
++	# 一眼看出「那具尸体上那台已经报废，场上还在猎人的只剩另一台」。
++	if v is SpineBreakerPlayer and v.spine_breaker_light != null:
++		v.spine_breaker_light.light_color = MP8_RETIRE_LIGHT
++		if multiplayer.is_server():
++			print("[MP8] 碎骨者：%d 号机退休，%s 背上那盏灯转绿" % [mp8_index, String(v.name)])
 +
 +
  @rpc("any_peer", "call_local", "reliable")
  func spine_broken_exited_rpc():
  
-@@ -274,6 +360,43 @@ func spine_broken_exited_rpc():
+@@ -274,6 +428,43 @@ func spine_broken_exited_rpc():
  	visible = true
  
  
