@@ -1,168 +1,264 @@
-﻿# Machine Party 8 人 mod —— 编译单文件安装器
-#
-# 产物：dist\mp8-<版本>\overtime_install.exe
-#   —— 补丁字节码全部内嵌，用户双击即可，**不需要装 .NET SDK、不需要下 gdre**。
-#
-# 用编译器是 Windows 自带的 csc.exe（.NET Framework 4，Win10/11 全都有），
-# 所以本机不用装任何东西，朋友那边也不用（Framework 4 是系统组件）。
-#
-# 用法：  powershell -ExecutionPolicy Bypass -File tools\build_installer.ps1
-# 前置：  先跑 tools\build.ps1（本脚本只搬 patch_gdc\ 里编译好的产物）
-
-$ErrorActionPreference = "Stop"
-
-$root  = Split-Path -Parent $PSScriptRoot
-$patch = Join-Path $root "patch"
-$gdc   = Join-Path $root "patch_gdc"
-$src   = Join-Path $root "installer\Installer.cs"
-$csc   = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
-
-foreach ($needed in @($patch, $gdc, $src, $csc)) {
-    if (-not (Test-Path $needed)) { throw "找不到 $needed" }
+# Stable offline executables + a transparent external patch ZIP.
+# Mod version and script bytes are not inputs to the executable compiler.
+param([string]$Out = '', [switch]$ForceRebuild, [string]$RepositoryRoot = '')
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.IO.Compression
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$root = if ($RepositoryRoot) { [IO.Path]::GetFullPath($RepositoryRoot) } else { Split-Path -Parent $PSScriptRoot }
+$patchRoot = Join-Path $root 'patch'
+$gdcRoot = Join-Path $root 'patch_gdc'
+$sourcePath = Join-Path $root 'installer/Installer.cs'
+$appManifest = Join-Path $root 'installer/app.manifest'
+$compiler = 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+$framework = Split-Path -Parent $compiler
+$utf8 = [Text.UTF8Encoding]::new($false)
+foreach ($needed in @($patchRoot,$gdcRoot,$sourcePath,$appManifest,$compiler)) {
+    if (-not (Test-Path -LiteralPath $needed)) { throw "Missing build input: $needed" }
 }
-
-# 版本号唯一来源：network_manager.gd 的 MP8_VERSION_TAG（它同时决定谁能跟谁联机）
-$nm = Get-Content (Join-Path $patch "modules\multiplayer\network_manager.gd") -Raw
-$m  = [regex]::Match($nm, 'MP8_VERSION_TAG\s*:\s*String\s*=\s*"([^"]+)"')
-if (-not $m.Success) { throw "从 network_manager.gd 里读不出 MP8_VERSION_TAG" }
-$tag = $m.Groups[1].Value
-
-# 安装器自己的发布号（Installer.cs 的 ReleaseNum）。跟 mod 版本分开的原因：
-# 「只修安装器」那种发布（1.3 → 1.3.1）mod 版本不变、pck 字节不变，老玩家不用
-# 重装、也不影响联机握手；但输出目录必须分开，否则下面那句 Remove-Item 会把
-# 已经发出去的 dist\overtime-1.3\ 连 zip 一起删掉。
-$cs  = Get-Content $src -Raw
-$mr  = [regex]::Match($cs, 'ReleaseNum\s*=\s*"([^"]+)"')
-if (-not $mr.Success) { throw "从 Installer.cs 里读不出 ReleaseNum" }
-# 变量名别用 $rel：下面那个内嵌资源循环里已经有个 $rel（补丁的相对路径），
-# 撞名字会把输出目录带到 dist\overtime-scripts\scenes\... 去。
-$instRev = $mr.Groups[1].Value
-Write-Host "[1/4] mod 版本 = $tag    安装器发布号 = $instRev"
-
-# 新鲜度：patch\ 里有谁比 patch_gdc\ 新 = build.ps1 没重跑
-$sources = Get-ChildItem $patch -Recurse -Filter "*.gd" -File
-$stale = @()
-foreach ($s in $sources) {
-    $o = Join-Path $gdc ($s.BaseName + ".gdc")
-    if (-not (Test-Path $o)) { $stale += "$($s.Name)（没有编译产物）"; continue }
-    if ((Get-Item $o).LastWriteTime -lt $s.LastWriteTime) { $stale += "$($s.Name)（产物比源码旧）" }
+function Hash-Bytes([byte[]]$Bytes) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { [BitConverter]::ToString($sha.ComputeHash($Bytes)).Replace('-','') } finally { $sha.Dispose() }
 }
-if ($stale.Count -gt 0) {
-    foreach ($x in $stale) { Write-Host "    $x" -ForegroundColor Red }
-    throw "patch_gdc\ 过期，先跑 tools\build.ps1"
+function Read-Constant([string]$Text, [string]$Name) {
+    $match = [regex]::Match($Text, '\b' + [regex]::Escape($Name) + '\s*=\s*"([^"]+)"')
+    if (-not $match.Success) { throw "Missing string constant $Name" }
+    $match.Groups[1].Value
 }
-Write-Host "[2/4] 新鲜度检查通过（$($sources.Count) 个补丁）"
-
-# ── 备料：内嵌资源 ──────────────────────────────────────────────────
-# 资源名用序号（mp8.0 / mp8.1 …）而不是 res:// 路径：
-# csc 的 /resource: 用逗号分隔"文件,资源名"，路径里的斜杠冒号容易出岔子，
-# 序号最稳；路径关系记在 mp8.manifest 里。
-$work = Join-Path $env:TEMP "mp8_installer_build"
-if (Test-Path $work) { Remove-Item $work -Recurse -Force }
-New-Item -ItemType Directory -Force $work | Out-Null
-
-$resArgs = @()
-$manifest = @("# <序号>|<res:// 路径>    由 tools\build_installer.ps1 生成")
-$i = 0
-foreach ($s in $sources) {
-    $rel = $s.FullName.Substring($patch.Length + 1) -replace '\\', '/' -replace '\.gd$', '.gdc'
-    $blob = Join-Path $work "$i.bin"
-    Copy-Item (Join-Path $gdc ($s.BaseName + ".gdc")) $blob -Force
-    $resArgs += "/resource:$blob,mp8.$i"
-    $manifest += "$i|res://$rel"
-    $i++
+function Remove-BuildStage([string]$Path, [string]$Parent) {
+    $resolved = [IO.Path]::GetFullPath($Path)
+    $boundary = [IO.Path]::GetFullPath($Parent).TrimEnd('\','/') + [IO.Path]::DirectorySeparatorChar
+    if (-not $resolved.StartsWith($boundary,[StringComparison]::OrdinalIgnoreCase) -or (Split-Path -Leaf $resolved) -notlike '.build-*') { throw "Refusing cleanup: $resolved" }
+    if (Test-Path -LiteralPath $resolved) { Remove-Item -LiteralPath $resolved -Recurse -Force }
 }
-
-$manFile = Join-Path $work "manifest.txt"
-[System.IO.File]::WriteAllText($manFile, ($manifest -join "`n"), (New-Object System.Text.UTF8Encoding($false)))
-$resArgs += "/resource:$manFile,mp8.manifest"
-
-$verFile = Join-Path $work "version.txt"
-[System.IO.File]::WriteAllText($verFile, $tag, (New-Object System.Text.UTF8Encoding($false)))
-$resArgs += "/resource:$verFile,mp8.version"
-
-# ── 编译 ────────────────────────────────────────────────────────────
-# 每次重建都从空目录开始：残留上一版的文件会让"发给朋友的到底是哪一版"变成糊涂账
-$outDir = Join-Path $root "dist\overtime-$instRev"
-if (Test-Path $outDir) { Remove-Item $outDir -Recurse -Force }
-New-Item -ItemType Directory -Force $outDir | Out-Null
-
-# 同一份源码编两个 exe：控制台版（命令行齐全）+ 窗口版（双击即用，一键切换）。
-# 窗口版靠 /define:GUI 走另一个 Main，/target:winexe 才不会弹黑框。
-$targets = @(
-    @{ Name = "overtime_install.exe";  Kind = "/target:exe";    Extra = @() },
-    @{ Name = "overtime_launcher.exe"; Kind = "/target:winexe"; Extra = @(
-           "/define:GUI",
-           "/reference:System.Windows.Forms.dll",
-           "/reference:System.Drawing.dll") }
-)
-
-Write-Host "[3/4] 编译（csc.exe，内嵌 $i 个补丁）"
-$log = Join-Path $env:TEMP "mp8_csc.log"
-$built = @()
-
-foreach ($t in $targets) {
-    $exe = Join-Path $outDir $t.Name
-    # /codepage:65001：源码是无 BOM 的 UTF-8，中文字面量全靠它。
-    # 本机 csc 能自己认出来，但换台机器未必，写死更保险。
-    $cargs = @(
-        "/nologo", $t.Kind, "/platform:anycpu", "/optimize+", "/codepage:65001",
-        "/reference:System.dll", "/reference:System.Core.dll"
-    ) + $t.Extra + @("/out:$exe", $src) + $resArgs
-
-    if (Test-Path $log) { Remove-Item $log -Force }
-    Start-Process $csc -ArgumentList $cargs -NoNewWindow -Wait -RedirectStandardOutput $log
-    if (-not (Test-Path $exe)) {
-        Get-Content $log | Select-Object -First 30
-        throw "编译失败：$($t.Name)"
-    }
-    $warn = Get-Content $log | Where-Object { $_ -match "error|warning" }
-    if ($warn) { $warn | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkYellow } }
-    Write-Host ("      {0}  {1:N0} 字节" -f $t.Name, (Get-Item $exe).Length)
-    $built += $exe
+function Write-Zip([string]$Path, $Entries) {
+    $file = [IO.File]::Open($Path,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+    try {
+        $zip = [IO.Compression.ZipArchive]::new($file,[IO.Compression.ZipArchiveMode]::Create,$true)
+        try {
+            foreach ($item in $Entries) {
+                $entry = $zip.CreateEntry($item.Name,[IO.Compression.CompressionLevel]::Optimal)
+                $entry.LastWriteTime = [DateTimeOffset]::new(2000,1,1,0,0,0,[TimeSpan]::Zero)
+                $stream = $entry.Open()
+                try { $stream.Write($item.Bytes,0,$item.Bytes.Length) } finally { $stream.Dispose() }
+            }
+        } finally { $zip.Dispose() }
+    } finally { $file.Dispose() }
 }
-
-Copy-Item (Join-Path $root "installer\README.md") $outDir -Force
-Remove-Item $work -Recurse -Force
-
-# ── 发布包：一个 zip，里面只有启动器 + README ────────────────────────
-# 用户 2026-08-18 定：**玩家只该看到一个程序**。
-# 控制台版仍然编（自己排查、脚本化安装、以及从源码构建的人要用），
-# 但**不进发布包** —— 两个 exe 摆在一起只会让玩家纠结该点哪个。
-$zipName = "Machine-Party-Overtime-$instRev.zip"
-$zip     = Join-Path $outDir $zipName
-$stage   = Join-Path $env:TEMP "ot_zip_stage"
-if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
-New-Item -ItemType Directory -Force $stage | Out-Null
-Copy-Item (Join-Path $outDir "overtime_launcher.exe") $stage -Force
-Copy-Item (Join-Path $outDir "README.md")             $stage -Force
-Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip -Force
-Remove-Item $stage -Recurse -Force
-Write-Host ("      发布包 {0}  {1:N0} 字节" -f $zipName, (Get-Item $zip).Length)
-
-# ── 自检：绝不能混进游戏资产 ────────────────────────────────────────
-$bad = Get-ChildItem $outDir -Recurse -File | Where-Object { $_.Extension -notin @(".exe", ".md", ".zip") }
-if ($bad) {
-    foreach ($b in $bad) { Write-Host "    多余文件：$($b.Name)" -ForegroundColor Red }
-    throw "发布目录里有不该发的文件"
+$sourceBytes = [IO.File]::ReadAllBytes($sourcePath)
+$code = $utf8.GetString($sourceBytes).TrimStart([char]0xFEFF)
+$networkSource = [IO.File]::ReadAllText((Join-Path $patchRoot 'modules/multiplayer/network_manager.gd'))
+$tagMatch = [regex]::Match($networkSource, 'MP8_VERSION_TAG\s*:\s*String\s*=\s*"([^"]+)"')
+if (-not $tagMatch.Success) { throw 'Missing MP8_VERSION_TAG' }
+$modTag = $tagMatch.Groups[1].Value
+if ($modTag -notmatch '^overtime-[0-9]+\.[0-9]+(?:\.[0-9]+)?(?:-[a-z0-9][a-z0-9.-]*)?$') { throw 'Unsafe Mod tag' }
+$modVersion = $modTag.Substring('overtime-'.Length)
+$runtimeVersion = Read-Constant $code 'ReleaseNum'
+if ($runtimeVersion -notmatch '^[0-9]+\.[0-9]+(?:\.[0-9]+)?(?:-[a-z0-9][a-z0-9.-]*)?$') { throw 'Unsafe installer version' }
+$gameVersion = Read-Constant $code 'GameVersion'
+$vanillaHash = Read-Constant $code 'VanillaSha'
+$sizeMatch = [regex]::Match($code, '\bVanillaSize\s*=\s*([0-9]+)L')
+if (-not $sizeMatch.Success) { throw 'Missing VanillaSize' }
+$vanillaSize = $sizeMatch.Groups[1].Value
+if ([string]::IsNullOrWhiteSpace($Out)) { $Out = Join-Path $root "dist/overtime-$modVersion-launcher-$runtimeVersion" }
+$outDir = [IO.Path]::GetFullPath($Out)
+foreach ($protected in @($root, $patchRoot, $gdcRoot, (Join-Path $root 'src'), (Join-Path $root 'installer'), (Join-Path $root 'tools'), (Join-Path $root 'mpml'), (Join-Path $root 'game_test'))) {
+    $boundary = [IO.Path]::GetFullPath($protected).TrimEnd('\','/')
+    if ($outDir.TrimEnd('\','/') -eq $boundary -or $boundary.StartsWith($outDir.TrimEnd('\','/') + '\',[StringComparison]::OrdinalIgnoreCase) -or ($protected -ne $root -and $outDir.StartsWith($boundary + '\',[StringComparison]::OrdinalIgnoreCase))) { throw "Unsafe output directory: $outDir" }
 }
-foreach ($e in $built) {
-    $sz = (Get-Item $e).Length
-    if ($sz -gt 5MB) {
-        throw ("{0} 有 {1:N0} 字节，超过 5 MB —— 八成混进了游戏资产，停下来查" -f (Split-Path -Leaf $e), $sz)
+$playerArchive = "Machine-Party-Overtime-$modVersion.zip"
+$consoleArchive = "Machine-Party-Overtime-$modVersion-CLI.zip"
+$outputNames = @('overtime_launcher.exe','overtime_install.exe','overtime_payload.zip','BUILDINFO.json','SHA256SUMS.txt','README.md',$playerArchive,$consoleArchive)
+function Assert-PlainDirectory([string]$Path) {
+    $probe = [IO.Path]::GetFullPath($Path)
+    while (-not (Test-Path -LiteralPath $probe)) { $probe = Split-Path -Parent $probe }
+    $node = Get-Item -LiteralPath $probe
+    while ($null -ne $node) {
+        if ($node.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Reparse point in output path: $($node.FullName)" }
+        $node = $node.Parent
     }
 }
-
-Write-Host "[4/4] 自检通过"
-Write-Host ""
-Write-Host "完成：$outDir" -ForegroundColor Green
-foreach ($e in $built) {
-    $sz = (Get-Item $e).Length
-    Write-Host ("      {0,-18} {1,10:N0} 字节（{2:N0} KB）" -f (Split-Path -Leaf $e), $sz, ($sz / 1KB)) -ForegroundColor Green
+function Assert-OutputOwnership {
+    Assert-PlainDirectory $outDir
+    if (-not (Test-Path -LiteralPath $outDir)) { return }
+    if (-not (Test-Path -LiteralPath $outDir -PathType Container)) { throw 'Out must be a directory' }
+    $lockPath = Join-Path $outDir '.installer-build.lock'
+    if ((Test-Path -LiteralPath $lockPath) -and ((Get-Item -LiteralPath $lockPath).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Linked build lock' }
+    $items = @(Get-ChildItem -LiteralPath $outDir -Force | Where-Object Name -ne '.installer-build.lock')
+    foreach ($item in $items) {
+        if ($item.PSIsContainer -or $item.Name -notin $outputNames -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Unowned output item: $($item.FullName)" }
+    }
+    if ($items.Count -eq 0) { return }
+    $existing = Get-Content -LiteralPath (Join-Path $outDir 'BUILDINFO.json') -Raw | ConvertFrom-Json
+    if ($existing.format -ne 1 -or $existing.modTag -ne $modTag -or $existing.playerArchive -ne $playerArchive -or $existing.consoleArchive -ne $consoleArchive -or @($existing.artifacts).Count -ne 3) { throw 'Output is not a matching installer candidate directory' }
+    foreach ($record in $existing.artifacts) {
+        if ($record.name -notin @('overtime_launcher.exe','overtime_install.exe','overtime_payload.zip') -or (Get-FileHash -LiteralPath (Join-Path $outDir $record.name)).Hash -ne $record.sha256) { throw 'Existing output differs from its build record; use a new -Out directory' }
+    }
 }
-Write-Host ("      内嵌 {0} 个补丁，无外部依赖" -f $i) -ForegroundColor Green
-Write-Host ""
-Write-Host ("      发给玩家的只有 {0}（启动器 + README）" -f $zipName) -ForegroundColor Green
-Write-Host "      overtime_install.exe 是命令行版，自己排查用，**不发**" -ForegroundColor DarkGray
-Write-Host ""
-Write-Host "给朋友时说清楚：他得自己有正版；一起玩的人必须装同一版。" -ForegroundColor Yellow
+Assert-OutputOwnership
+New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+$outLock = [IO.File]::Open((Join-Path $outDir '.installer-build.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+$cacheLock = $null
+$stage = Join-Path $outDir ('.build-' + [guid]::NewGuid().ToString('N'))
+try {
+    Assert-OutputOwnership
+    New-Item -ItemType Directory -Path $stage | Out-Null
+    Write-Host "[1/5] Verify compiled inputs: $modTag / installer $runtimeVersion"
+    $sources = @(Get-ChildItem -LiteralPath $patchRoot -Recurse -Filter '*.gd' -File | Sort-Object FullName)
+    if ($sources.Count -lt 1 -or $sources.Count -gt 256) { throw 'Patch count outside limits' }
+    if (@($sources | Group-Object BaseName | Where-Object Count -gt 1).Count) { throw 'Duplicate compiled script basename' }
+    $manifest = [Collections.Generic.List[string]]::new()
+    foreach ($line in @("OVERTIME-PAYLOAD`t1","mod_tag`t$modTag","game_version`t$gameVersion","vanilla_sha256`t$vanillaHash","vanilla_size`t$vanillaSize")) { $manifest.Add($line) }
+    $payloadEntries = [Collections.Generic.List[object]]::new()
+    $sourceRecords = [Collections.Generic.List[object]]::new()
+    $total = 0L
+    for ($i=0; $i -lt $sources.Count; $i++) {
+        $source = $sources[$i]
+        $compiledPath = Join-Path $gdcRoot ($source.BaseName + '.gdc')
+        if (-not (Test-Path -LiteralPath $compiledPath)) { throw "Missing bytecode: $compiledPath" }
+        if ((Get-Item -LiteralPath $compiledPath).LastWriteTimeUtc -lt $source.LastWriteTimeUtc) { throw "Stale bytecode; run build.ps1 -CompileOnly: $($source.Name)" }
+        $bytes = [IO.File]::ReadAllBytes($compiledPath)
+        if ($bytes.Length -eq 0 -or $bytes.Length -gt 4MB) { throw "Script size outside limits: $($source.Name)" }
+        $total += $bytes.Length
+        if ($total -gt 32MB) { throw 'Payload exceeds limit' }
+        $relative = $source.FullName.Substring($patchRoot.Length + 1).Replace('\','/')
+        $target = 'res://' + $relative.Substring(0,$relative.Length-3) + '.gdc'
+        $entryName = 'scripts/{0:D3}.gdc' -f $i
+        $hash = Hash-Bytes $bytes
+        $manifest.Add("file`t$target`t$entryName`t$($bytes.Length)`t$hash")
+        $payloadEntries.Add([pscustomobject]@{Name=$entryName;Bytes=$bytes})
+        $sourceRecords.Add([ordered]@{path=('patch/'+$relative);sha256=(Get-FileHash -LiteralPath $source.FullName -Algorithm SHA256).Hash;bytecodeSha256=$hash})
+    }
+    $manifestBytes = $utf8.GetBytes(($manifest -join "`n") + "`n")
+    if ($manifestBytes.Length -gt 128KB) { throw 'Manifest exceeds limit' }
+    Write-Zip (Join-Path $stage 'overtime_payload.zip') (@([pscustomobject]@{Name='manifest.txt';Bytes=$manifestBytes}) + @($payloadEntries.ToArray()))
+    Write-Host '[2/5] Build or reuse unchanged runtime executables'
+    # Compile only immutable snapshots. /noconfig and /nostdlib+ make every
+    # reference explicit instead of inheriting mutable csc.rsp defaults.
+    $inputDir = Join-Path $stage 'inputs'
+    New-Item -ItemType Directory -Path $inputDir | Out-Null
+    $runtimeRecords = [Collections.Generic.List[object]]::new()
+    $references = @('mscorlib.dll','System.dll','System.Core.dll','System.IO.Compression.dll','System.Drawing.dll','System.Windows.Forms.dll')
+    foreach ($path in @($sourcePath,$appManifest) + @($references | ForEach-Object { Join-Path $framework $_ })) {
+        $bytes = if ($path -eq $sourcePath) { $sourceBytes } else { [IO.File]::ReadAllBytes($path) }
+        $name = Split-Path -Leaf $path
+        [IO.File]::WriteAllBytes((Join-Path $inputDir $name), $bytes)
+        $runtimeRecords.Add([pscustomobject]@{path=$path;name=$name;sha256=(Hash-Bytes $bytes)})
+    }
+    foreach ($name in @('csc.exe','csc.exe.config','cscomp.dll')) {
+        $path = Join-Path $framework $name
+        $hash = if (Test-Path -LiteralPath $path) { (Get-FileHash -LiteralPath $path).Hash } else { 'absent' }
+        $runtimeRecords.Add([pscustomobject]@{path=$path;name=$name;sha256=$hash})
+    }
+    $runtimeNames = @('overtime_launcher.exe','overtime_install.exe')
+    $compilerPlans = @()
+    foreach ($name in $runtimeNames) {
+        $arguments = @('/nologo','/noconfig','/nostdlib+','/platform:anycpu','/optimize+','/codepage:65001','/win32manifest:inputs\app.manifest',('/out:'+$name))
+        foreach ($ref in @('mscorlib.dll','System.dll','System.Core.dll','System.IO.Compression.dll')) { $arguments += '/reference:inputs\' + $ref }
+        if ($name -eq 'overtime_launcher.exe') { $arguments += @('/target:winexe','/define:GUI','/reference:inputs\System.Drawing.dll','/reference:inputs\System.Windows.Forms.dll') } else { $arguments += '/target:exe' }
+        $arguments += 'inputs\Installer.cs'
+        $compilerPlans += [pscustomobject]@{name=$name;arguments=$arguments}
+    }
+    # Hash the actual compiler argv, not a manually maintained description.
+    $runtimeInputs = @('overtime-runtime-cache-v2', ($compilerPlans | ConvertTo-Json -Depth 5 -Compress))
+    foreach ($record in $runtimeRecords) { $runtimeInputs += $record.name + ':' + $record.sha256 }
+    $runtimeKey = Hash-Bytes ($utf8.GetBytes($runtimeInputs -join "`n"))
+    $cacheRoot = Join-Path $root 'dist/installer-runtime'
+    Assert-PlainDirectory $cacheRoot
+    New-Item -ItemType Directory -Force -Path $cacheRoot | Out-Null
+    $cacheLock = [IO.File]::Open((Join-Path $cacheRoot '.runtime-build.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    $cacheDir = Join-Path $cacheRoot $runtimeKey
+    $cacheIndex = Join-Path $cacheDir 'runtime.json'
+    $cacheValid = $false
+    if (Test-Path -LiteralPath $cacheIndex) {
+        try {
+            $cached = Get-Content -LiteralPath $cacheIndex -Raw -Encoding UTF8 | ConvertFrom-Json
+            $cacheValid = $cached.key -eq $runtimeKey -and @($cached.files).Count -eq 2 -and @($cached.files.name | Select-Object -Unique).Count -eq 2
+            foreach ($record in $cached.files) {
+                if ($record.name -notin @('overtime_launcher.exe','overtime_install.exe')) { $cacheValid=$false; break }
+                if ((Get-FileHash -LiteralPath (Join-Path $cacheDir $record.name) -Algorithm SHA256).Hash -ne $record.sha256) { $cacheValid=$false; break }
+            }
+        } catch { $cacheValid = $false }
+    }
+    if ($cacheValid -and -not $ForceRebuild) {
+        foreach ($name in $runtimeNames) { Copy-Item -LiteralPath (Join-Path $cacheDir $name) -Destination (Join-Path $stage $name) }
+        Write-Host "      Reused runtime $runtimeKey"
+    } else {
+        Push-Location $stage
+        try {
+            foreach ($plan in $compilerPlans) {
+                $arguments = $plan.arguments
+                $compilerOutput = & $compiler @arguments 2>&1
+                if ($LASTEXITCODE -ne 0) { throw "Compiler failed: $compilerOutput" }
+                if ($compilerOutput) { $compilerOutput | Write-Host }
+                if ((Get-Item -LiteralPath (Join-Path $stage $plan.name)).Length -gt 5MB) { throw 'Unexpected executable size' }
+            }
+        } finally { Pop-Location }
+    }
+    Write-Host '[3/5] Verify payload through the actual installer entry point'
+    $verifyOutput = & (Join-Path $stage 'overtime_install.exe') --verify-package 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "Installer verification failed: $verifyOutput" }
+    $verifyOutput | Write-Host
+    Write-Host '[4/5] Record hashes and package the candidate'
+    # Another development process must not change inputs while this candidate is
+    # being assembled. Timestamps reject stale builds; hashes detect this race.
+    foreach ($record in $sourceRecords) {
+        $currentSource = Join-Path $root $record.path
+        $currentCompiled = Join-Path $gdcRoot (([IO.Path]::GetFileNameWithoutExtension($record.path)) + '.gdc')
+        if ((Get-FileHash -LiteralPath $currentSource -Algorithm SHA256).Hash -ne $record.sha256 -or (Get-FileHash -LiteralPath $currentCompiled -Algorithm SHA256).Hash -ne $record.bytecodeSha256) { throw "Build input changed: $($record.path)" }
+    }
+    if ([IO.File]::ReadAllText($sourcePath) -cne $code -or [IO.File]::ReadAllText((Join-Path $patchRoot 'modules/multiplayer/network_manager.gd')) -cne $networkSource) { throw 'Build metadata changed during assembly' }
+    foreach ($record in $runtimeRecords) {
+        $currentHash = if (Test-Path -LiteralPath $record.path) { (Get-FileHash -LiteralPath $record.path).Hash } else { 'absent' }
+        if ($currentHash -ne $record.sha256) { throw "Runtime input changed: $($record.name)" }
+    }
+    Copy-Item -LiteralPath (Join-Path $root 'installer/README.md') -Destination (Join-Path $stage 'README.md')
+    $artifactRecords = @()
+    $checksumLines = @()
+    foreach ($name in @('overtime_launcher.exe','overtime_install.exe','overtime_payload.zip')) {
+        $hash = (Get-FileHash -LiteralPath (Join-Path $stage $name) -Algorithm SHA256).Hash
+        $artifactRecords += [ordered]@{name=$name;sha256=$hash}
+        $checksumLines += "$hash  $name"
+    }
+    $sourceCommit = 'unavailable'
+    if (Get-Command git -ErrorAction SilentlyContinue) {
+        try {
+            $gitResult = & git -C $root rev-parse HEAD 2>$null
+            if ($LASTEXITCODE -eq 0) { $sourceCommit = [string]$gitResult }
+        } catch { $sourceCommit = 'unavailable' }
+    }
+    $buildInfo = [ordered]@{format=1;modTag=$modTag;installerVersion=$runtimeVersion;gameVersion=$gameVersion;sourceCommit=$sourceCommit;runtimeKey=$runtimeKey;scriptCount=$sources.Count;playerArchive=$playerArchive;consoleArchive=$consoleArchive;artifacts=$artifactRecords;sources=$sourceRecords.ToArray();notes='Content hashes describe this build. Signing and Defender evaluation are separate release checks.'}
+    [IO.File]::WriteAllText((Join-Path $stage 'BUILDINFO.json'),($buildInfo | ConvertTo-Json -Depth 6),$utf8)
+    [IO.File]::WriteAllText((Join-Path $stage 'SHA256SUMS.txt'),($checksumLines -join "`n") + "`n",$utf8)
+    foreach ($archive in @(@{Name=$playerArchive;Exe='overtime_launcher.exe'},@{Name=$consoleArchive;Exe='overtime_install.exe'})) {
+        $archiveEntries = @()
+        foreach ($name in @($archive.Exe,'overtime_payload.zip','README.md','BUILDINFO.json','SHA256SUMS.txt') | Sort-Object) { $archiveEntries += [pscustomobject]@{Name=$name;Bytes=[IO.File]::ReadAllBytes((Join-Path $stage $name))} }
+        Write-Zip (Join-Path $stage $archive.Name) $archiveEntries
+    }
+    # Publish the cache only after all input checks and package assembly pass.
+    # A forced rebuild does not replace an already verified canonical runtime.
+    if (-not $cacheValid) {
+        $cacheStage = Join-Path $stage 'runtime-cache'
+        New-Item -ItemType Directory -Path $cacheStage | Out-Null
+        $cacheRecords = @()
+        foreach ($name in $runtimeNames) {
+            Copy-Item -LiteralPath (Join-Path $stage $name) -Destination (Join-Path $cacheStage $name)
+            $cacheRecords += [ordered]@{name=$name;sha256=(Get-FileHash -LiteralPath (Join-Path $cacheStage $name)).Hash}
+        }
+        [IO.File]::WriteAllText((Join-Path $cacheStage 'runtime.json'),([ordered]@{key=$runtimeKey;files=$cacheRecords;compilerPlans=$compilerPlans;inputs=@($runtimeRecords | Select-Object name,sha256)} | ConvertTo-Json -Depth 6),$utf8)
+        if (Test-Path -LiteralPath $cacheDir) {
+            $resolved = [IO.Path]::GetFullPath($cacheDir)
+            if (-not $resolved.StartsWith([IO.Path]::GetFullPath($cacheRoot).TrimEnd('\') + '\',[StringComparison]::OrdinalIgnoreCase) -or (Split-Path -Leaf $resolved) -notmatch '^[A-F0-9]{64}$' -or ((Get-Item -LiteralPath $resolved).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Unsafe runtime cache path' }
+            Move-Item -LiteralPath $resolved -Destination ($resolved + '.rejected-' + [guid]::NewGuid().ToString('N'))
+        }
+        Move-Item -LiteralPath $cacheStage -Destination $cacheDir
+    }
+    Write-Host '[5/5] Publish candidate files locally'
+    foreach ($item in Get-ChildItem -LiteralPath $stage -File) { Move-Item -LiteralPath $item.FullName -Destination (Join-Path $outDir $item.Name) -Force }
+    Write-Host "Candidate: $outDir"
+    Write-Host "Player archive: $playerArchive (keep payload beside the exe)"
+    Write-Host 'Defender detection reduction has not been established by this build.'
+} finally {
+    if ($null -ne $cacheLock) { $cacheLock.Dispose() }
+    $outLock.Dispose()
+    Remove-BuildStage $stage $outDir
+}

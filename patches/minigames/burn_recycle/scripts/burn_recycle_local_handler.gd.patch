@@ -1,0 +1,144 @@
+diff --git a/minigames/burn_recycle/scripts/burn_recycle_local_handler.gd b/minigames/burn_recycle/scripts/burn_recycle_local_handler.gd
+--- a/minigames/burn_recycle/scripts/burn_recycle_local_handler.gd
++++ b/minigames/burn_recycle/scripts/burn_recycle_local_handler.gd
+@@ -38,6 +38,7 @@ const Layouts: Dictionary = {
+ var keyboard_rect: TextureRect
+ var texture_rects: Array[TextureRect]
+ var overlay_templates: Dictionary[BurnRecyclePlayer, LocalOverlayTemplate]
++var _mp8_players: Array[BurnRecyclePlayer] = []
+ 
+ func _process(_delta: float) -> void :
+ 	pass
+@@ -53,36 +54,100 @@ func show_all_tags():
+ 		o.fade_in_name_label(1.0)
+ 
+ func set_players(players: Array[BurnRecyclePlayer]):
++	_mp8_clear_views()
++	_mp8_players.assign(players)
++	_mp8_players.sort_custom(func(a, b): return _mp8_seat(a) < _mp8_seat(b))
++	for player in _mp8_players:
++		var display := TextureRect.new()
++		display.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
++		display.texture = player.local_viewport.get_texture()
++		display.clip_children = CanvasItem.CLIP_CHILDREN_AND_DRAW
++		display.mouse_filter = Control.MOUSE_FILTER_IGNORE
++		local_canvas_root.add_child(display)
++		texture_rects.append(display)
++		var overlay = LOCAL_OVERLAY_TEMPLATE.instantiate()
++		overlay.name_label.text = _mp8_player_tag(player)
++		overlay.mouse_filter = Control.MOUSE_FILTER_IGNORE
++		local_after_post_processing_root.add_child(overlay)
++		overlay_templates[player] = overlay
++	_mp8_relayout()
++
++
++# One normalized layout drives textures, HUD, viewport sizes and pointer mapping.
++static func mp8_layout(count: int) -> Array[Rect2]:
++	var result: Array[Rect2] = []
++	if count <= 0:
++		return result
++	count = mini(count, 8)
++	if count <= 4:
++		for pair in Layouts[count]:
++			result.append(Rect2(pair[0], pair[1]))
++		return result
++	var columns: int = 3 if count <= 6 else 4
++	for i in count:
++		result.append(Rect2(Vector2(float(i % columns) / columns, float(i / columns) / 2.0),
++			Vector2(1.0 / columns, 0.5)))
++	return result
++
++static func mp8_pixel_rect(rect: Rect2, canvas_size: Vector2) -> Rect2:
++	var first := (rect.position * canvas_size).floor()
++	var last := (rect.end * canvas_size).floor()
++	return Rect2(first, (last - first).max(Vector2.ONE))
++
++static func mp8_screen_to_view(point: Vector2, screen_rect: Rect2, viewport_size: Vector2) -> Vector2:
++	if screen_rect.size.x <= 0 or screen_rect.size.y <= 0 or not screen_rect.has_point(point):
++		return Vector2(-1, -1)
++	return (point - screen_rect.position) / screen_rect.size * viewport_size
++
++func _mp8_seat(player) -> int:
++	var fallback: int = maxi(0, PlayerManager.player_presences.keys().find(player.player_presence.network_id))
++	return int(player.player_presence.get_meta("mp8_local_seat", fallback))
++
++func _mp8_player_tag(player) -> String:
++	var device: String = "Pad" if player.player_presence.using_joystick else "KB"
++	return "P%d · %s · %s" % [_mp8_seat(player) + 1, player.player_presence.network_name, device]
++
++func _ready() -> void:
++	get_viewport().size_changed.connect(_mp8_relayout)
++	if is_instance_valid(local_canvas_root):
++		local_canvas_root.resized.connect(_mp8_relayout)
++
++func _mp8_relayout() -> void:
++	if _mp8_players.is_empty() or not is_instance_valid(local_canvas_root):
++		return
++	var canvas_size: Vector2 = local_canvas_root.size
++	if canvas_size.x <= 0 or canvas_size.y <= 0:
++		canvas_size = local_canvas_root.get_viewport_rect().size
++	var layout := mp8_layout(_mp8_players.size())
++	for i in _mp8_players.size():
++		var player = _mp8_players[i]
++		if not is_instance_valid(player):
++			continue
++		var rect := mp8_pixel_rect(layout[i], canvas_size)
++		var display: TextureRect = texture_rects[i]
++		display.position = rect.position
++		display.size = rect.size
++		player.local_viewport.size = Vector2i(rect.size)
++		var transform := display.get_global_transform_with_canvas()
++		player.local_viewport.set_meta("mp8_input_rect",
++			Rect2(transform * Vector2.ZERO, (transform * rect.size) - (transform * Vector2.ZERO)))
++		_mp8_place_overlay(player, rect)
++
++func _mp8_place_overlay(player, rect: Rect2) -> void:
++	var overlay = overlay_templates[player]
++	overlay.position = rect.position
++	overlay.size = rect.size
++
++func _mp8_clear_views() -> void:
++	for display in texture_rects:
++		if is_instance_valid(display):
++			display.get_parent().remove_child(display)
++			display.queue_free()
++	texture_rects.clear()
++	for overlay in overlay_templates.values():
++		if is_instance_valid(overlay):
++			overlay.get_parent().remove_child(overlay)
++			overlay.queue_free()
++	overlay_templates.clear()
++	_mp8_players.clear()
+ 
+-	var player_count = players.size()
+-	var layout = Layouts[player_count]
+-	var viewport_rect: Rect2 = local_canvas_root.get_viewport_rect()
+-
+-	for i in players.size():
+-		var player: BurnRecyclePlayer = players[i]
+-		var values = layout[i]
+-
+-		player.local_viewport.size = Vector2i(
+-			viewport_rect.end.x * values[1].x, 
+-			viewport_rect.end.y * values[1].y, 
+-		)
+-		var texture = player.local_viewport.get_texture()
+-		var texture_rect: = TextureRect.new()
+-		texture_rect.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+-		texture_rect.texture = texture
+-		texture_rect.clip_children = CanvasItem.CLIP_CHILDREN_AND_DRAW
+-
+-		local_canvas_root.add_child(texture_rect)
+-		texture_rect.position = viewport_rect.end * values[0]
+-		texture_rect.size = viewport_rect.end * values[1]
+-
+-
+-
+-		var overlay_template = LOCAL_OVERLAY_TEMPLATE.instantiate()
+-		overlay_template.name_label.text = player.player_presence.network_name
+-
+-		local_after_post_processing_root.add_child(overlay_template)
+-		overlay_template.position = viewport_rect.end * values[0]
+-		overlay_template.size = viewport_rect.end * values[1]
+-
+-		overlay_templates[player] = overlay_template

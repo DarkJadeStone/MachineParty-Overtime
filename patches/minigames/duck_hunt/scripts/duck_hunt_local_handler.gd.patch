@@ -1,0 +1,103 @@
+diff --git a/minigames/duck_hunt/scripts/duck_hunt_local_handler.gd b/minigames/duck_hunt/scripts/duck_hunt_local_handler.gd
+--- a/minigames/duck_hunt/scripts/duck_hunt_local_handler.gd
++++ b/minigames/duck_hunt/scripts/duck_hunt_local_handler.gd
+@@ -5,30 +5,77 @@ class_name DuckHuntLocalHandler
+ @export var viewport_parent: Control
+ @export var canvas_layer: CanvasLayer
+ 
+-var texture_rects: Array[TextureRect]
++var texture_rects: Array[TextureRect] = []
++var _mp8_viewports: Array[SubViewport] = []
++var _mp8_labels: Array[Label] = []
+ 
+-func setup(players_viewport: SubViewport, hunter_viewport: SubViewport):
++static func mp8_layout(hunter_count: int) -> Array[Rect2]:
++	var rows: Array[Rect2] = [Rect2(0, 0, 0.5, 1)]
++	if hunter_count <= 1:
++		rows.append(Rect2(0.5, 0, 0.5, 1))
++	else:
++		rows.append(Rect2(0.5, 0, 0.5, 0.5))
++		rows.append(Rect2(0.5, 0.5, 0.5, 0.5))
++	return rows
+ 
+-	var viewport_rect: Rect2 = viewport_parent.get_viewport_rect()
++func _ready() -> void:
++	get_viewport().size_changed.connect(_mp8_relayout)
++	if is_instance_valid(viewport_parent):
++		viewport_parent.resized.connect(_mp8_relayout)
+ 
++func clear_views() -> void:
++	for rect in texture_rects:
++		if is_instance_valid(rect):
++			rect.get_parent().remove_child(rect)
++			rect.queue_free()
++	texture_rects.clear()
++	_mp8_labels.clear()
++	_mp8_viewports.clear()
+ 
+-	players_viewport.size = viewport_rect.end * Vector2(0.5, 1.0)
+-	var player_texture = players_viewport.get_texture()
+-	var player_texture_rect: = TextureRect.new()
+-	player_texture_rect.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+-	player_texture_rect.texture = player_texture
+-	player_texture_rect.clip_children = CanvasItem.CLIP_CHILDREN_AND_DRAW
+-	viewport_parent.add_child(player_texture_rect)
+-	player_texture_rect.position = viewport_rect.end * Vector2.ZERO
+-	player_texture_rect.size = viewport_rect.end * Vector2(0.5, 1.0)
++func setup(players_viewport: SubViewport, hunter_viewports: Array[SubViewport],
++		labels: PackedStringArray = PackedStringArray(), font: Font = null):
++	clear_views()
++	_mp8_viewports.append(players_viewport)
++	for viewport in hunter_viewports:
++		_mp8_viewports.append(viewport)
++	for i in _mp8_viewports.size():
++		var rect := TextureRect.new()
++		rect.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
++		rect.texture = _mp8_viewports[i].get_texture()
++		rect.clip_children = CanvasItem.CLIP_CHILDREN_AND_DRAW
++		rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
++		viewport_parent.add_child(rect)
++		texture_rects.append(rect)
++		var label := Label.new()
++		label.text = labels[i] if i < labels.size() else ""
++		label.mouse_filter = Control.MOUSE_FILTER_IGNORE
++		label.add_theme_font_size_override("font_size", 16)
++		if font != null:
++			label.add_theme_font_override("font", font)
++		label.add_theme_color_override("font_color", Color.WHITE)
++		label.add_theme_color_override("font_shadow_color", Color.BLACK)
++		label.add_theme_constant_override("shadow_offset_x", 1)
++		label.add_theme_constant_override("shadow_offset_y", 1)
++		label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
++		rect.add_child(label)
++		_mp8_labels.append(label)
++	_mp8_relayout()
+ 
+-
+-	hunter_viewport.size = viewport_rect.end * Vector2(0.5, 1.0)
+-	var hunter_texture = hunter_viewport.get_texture()
+-	var hunter_texture_rect: = TextureRect.new()
+-	hunter_texture_rect.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+-	hunter_texture_rect.texture = hunter_texture
+-	hunter_texture_rect.clip_children = CanvasItem.CLIP_CHILDREN_AND_DRAW
+-	viewport_parent.add_child(hunter_texture_rect)
+-	hunter_texture_rect.position = viewport_rect.end * Vector2(0.5, 0.0)
+-	hunter_texture_rect.size = viewport_rect.end * Vector2(0.5, 1.0)
++func _mp8_relayout() -> void:
++	if _mp8_viewports.is_empty() or not is_instance_valid(viewport_parent):
++		return
++	var size: Vector2 = viewport_parent.size
++	if size.x <= 0 or size.y <= 0:
++		size = viewport_parent.get_viewport_rect().size
++	var layout := mp8_layout(_mp8_viewports.size() - 1)
++	for i in _mp8_viewports.size():
++		if not is_instance_valid(_mp8_viewports[i]):
++			continue
++		var first := (layout[i].position * size).floor()
++		var last := (layout[i].end * size).floor()
++		var rect := Rect2(first, (last - first).max(Vector2.ONE))
++		texture_rects[i].position = rect.position
++		texture_rects[i].size = rect.size
++		_mp8_viewports[i].size = Vector2i(rect.size)
++		_mp8_labels[i].position = Vector2(8, 6)
++		_mp8_labels[i].size = Vector2(maxf(1.0, rect.size.x - 16), 48)

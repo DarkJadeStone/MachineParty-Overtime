@@ -1,0 +1,72 @@
+diff --git a/modules/player_presence/player_presence.gd b/modules/player_presence/player_presence.gd
+--- a/modules/player_presence/player_presence.gd
++++ b/modules/player_presence/player_presence.gd
+@@ -16,15 +16,36 @@ var customization: Array
+ var active: bool = false
+ var debug_player: bool = false
+ var local_controller_connected: bool = false
++var mp8_local_seat: int = -1
++var mp8_local_device_available: bool = false
++var mp8_local_reconnect_pending: bool = false
++var _mp8_reconnect_release_pending: bool = false
+ 
+ func set_local():
+ 
+-	Input.joy_connection_changed.connect(_on_joy_connection_changed)
+-	local_controller_connected = true
++	if not Input.joy_connection_changed.is_connected(_on_joy_connection_changed):
++		Input.joy_connection_changed.connect(_on_joy_connection_changed)
++	process_mode = Node.PROCESS_MODE_ALWAYS
++	mp8_local_device_available = not using_joystick or Input.get_connected_joypads().has(device_id)
++	local_controller_connected = mp8_local_device_available
++	mp8_local_reconnect_pending = not local_controller_connected
+ 
+ func _physics_process(_delta: float) -> void :
+ 
+ 	if local:
++		if _mp8_reconnect_release_pending:
++			# Keep gameplay disabled for the whole confirmation gesture, including
++			# its release frame. Player nodes run later in this same physics tick.
++			if not MultiplayerInput.is_action_pressed(device_id, "action_1") \
++				and not MultiplayerInput.is_action_just_pressed(device_id, "action_1") \
++				and not MultiplayerInput.is_action_just_released(device_id, "action_1"):
++				_mp8_reconnect_release_pending = false
++				mp8_local_reconnect_pending = false
++				local_controller_connected = true
++			return
++		if mp8_local_reconnect_pending and mp8_local_device_available:
++			if MultiplayerInput.is_action_just_pressed(device_id, "action_1"):
++				mp8_confirm_local_device(device_id)
+ 		return
+ 
+ 	if not active:
+@@ -44,7 +65,28 @@ func _physics_process(_delta: float) -> void :
+ func _on_joy_connection_changed(_device: int, connected: bool):
+ 
+ 	if device_id == _device:
+-		local_controller_connected = connected
++		_mp8_reconnect_release_pending = false
++		mp8_local_device_available = connected
++		mp8_local_reconnect_pending = true
++		local_controller_connected = false
++
++func mp8_confirm_local_device(confirmed_device: int) -> bool:
++	if not local or confirmed_device != device_id or not mp8_local_device_available or not mp8_local_reconnect_pending:
++		return false
++	local_controller_connected = false
++	_mp8_reconnect_release_pending = true
++	return true
++
++func mp8_local_status_text() -> String:
++	var identity: String = "P%d %s" % [mp8_local_seat + 1, network_name]
++	var device_text: String = "PAD %d" % (device_id + 1) if using_joystick else "KEYBOARD"
++	if local_controller_connected:
++		return "%s | %s" % [identity, device_text]
++	if _mp8_reconnect_release_pending:
++		return "%s | %s: release A / CROSS to resume" % [identity, device_text]
++	if mp8_local_device_available:
++		return "%s | %s: A / CROSS to confirm" % [identity, device_text]
++	return "%s | %s DISCONNECTED (new ID: rejoin lobby)" % [identity, device_text]
+ 
+ 
+ 

@@ -1,0 +1,52 @@
+diff --git a/addons/multiplayer_input/multiplayer_input.gd b/addons/multiplayer_input/multiplayer_input.gd
+--- a/addons/multiplayer_input/multiplayer_input.gd
++++ b/addons/multiplayer_input/multiplayer_input.gd
+@@ -1,5 +1,8 @@
+ extends Node
+ 
++# Core actions belong to the keyboard. 8 is a valid controller ID after hot
++# plugging, so reserve an unreachable ID instead of routing that pad twice.
++const MP8_KEYBOARD_ONLY_DEVICE: int = 2147483647
+ 
+ 
+ 
+@@ -54,7 +57,7 @@ func initialize():
+ 	for action in core_actions:
+ 		for e in InputMap.action_get_events(action):
+ 			if _is_joypad_event(e) and !is_ui_action(action):
+-				e.device = 8
++				e.device = MP8_KEYBOARD_ONLY_DEVICE
+ 
+ 	for device_id in Input.get_connected_joypads():
+ 		_create_actions_for_device(device_id)
+@@ -105,25 +108,12 @@ func _create_actions_for_device(device: int):
+ 				InputMap.action_add_event(new_action, new_event)
+ 
+ func _delete_actions_for_device(device: int):
++	# Use the exact names created for this device; prefix "1" also matches "10".
++	var actions: Dictionary = device_actions.get(device, {})
++	for action in actions.values():
++		if InputMap.has_action(action):
++			InputMap.erase_action(action)
+ 	device_actions.erase(device)
+-	var actions_to_erase = []
+-	var device_num_str = str(device)
+-
+-
+-	for action in InputMap.get_actions():
+-		var action_str = String(action)
+-		var maybe_device = action_str.substr(0, device_num_str.length())
+-		if maybe_device == device_num_str:
+-			actions_to_erase.append(action)
+-
+-
+-
+-
+-	for action in actions_to_erase:
+-		InputMap.erase_action(action)
+-
+-
+-
+ 
+ func get_action_raw_strength(device: int, action: StringName, exact_match: bool = false) -> float:
+ 	if device >= 0:

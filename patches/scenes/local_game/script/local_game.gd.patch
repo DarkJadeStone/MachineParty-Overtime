@@ -1,0 +1,167 @@
+diff --git a/scenes/local_game/script/local_game.gd b/scenes/local_game/script/local_game.gd
+--- a/scenes/local_game/script/local_game.gd
++++ b/scenes/local_game/script/local_game.gd
+@@ -61,6 +61,23 @@ var can_check_for_connect_requests = false
+ 
+ signal game_session_ended()
+ 
++var _mp8_round_committed: bool = false
++var _mp8_final_scores_received: bool = false
++var _mp8_round_epoch: int = 0
++var _mp8_finish_claimed: bool = false
++var _mp8_minigame_initialized: bool = false
++var _mp8_device_labels: Dictionary = {}
++
++# Same aggregate rules as the current online mainline. LocalGame owns its
++# independent score dictionaries; no online vote/restart state enters this path.
++const MP8_MINIGAME_SCORE_SCALE: Dictionary = {
++	Globals.MinigameIdentifier.DuckHunt: 0.5,
++	Globals.MinigameIdentifier.ExplodingCollarRace: 0.75,
++}
++const MP8_MINIGAME_SCORE_SCALE_BY_COUNT: Dictionary = {
++	Globals.MinigameIdentifier.DuckHunt: {6: 0.8},
++}
++
+ func _ready() -> void :
+ 
+ 	GameManager.can_input_switch = false
+@@ -68,6 +85,7 @@ func _ready() -> void :
+ 	GameManager.in_game = true
+ 
+ 	setup_scores()
++	_mp8_create_device_status()
+ 
+ 	intermission_manager.game = self
+ 	intermission_manager.screen_score.score_screen_hidden.connect(_on_score_screen_hidden)
+@@ -102,6 +120,7 @@ func setup_scores():
+ 	for key in PlayerManager.player_presences.keys():
+ 		game_score_by_network_id[key] = 0
+ 		total_score_by_network_id[key] = 0
++		round_score_by_network_id[key] = 0
+ 
+ func generate_session_playlist():
+ 
+@@ -176,6 +195,8 @@ func show_score():
+ 	intermission_manager.screen_score.check_to_show_score()
+ 
+ func load_minigame(minigame_identifier: Globals.MinigameIdentifier, _is_round: bool, _total_rounds: int = -1, ):
++	_mp8_round_epoch += 1
++	_mp8_finish_claimed = true
+ 
+ 	Globals.current_minigame_identifier = minigame_identifier
+ 
+@@ -192,11 +213,17 @@ func load_minigame(minigame_identifier: Globals.MinigameIdentifier, _is_round: b
+ 
+ 		minigame.minigame_loaded.disconnect(_on_minigame_loaded)
+ 		minigame.minigame_ready.disconnect(_on_minigame_ready)
++		minigame.player_scored.disconnect(_on_minigame_player_scored)
++		minigame.player_scores_finalized.disconnect(_on_minigame_player_score_finalized)
+ 
+ 		minigame.cleanup_rpc()
+ 		await get_tree().create_timer(1.0).timeout
+ 
+ 	var minigame_scene: PackedScene = load(Globals.MinigamePaths[minigame_identifier])
++	_mp8_round_committed = false
++	_mp8_final_scores_received = false
++	_mp8_finish_claimed = false
++	_mp8_minigame_initialized = false
+ 	var minigame_instance = minigame_scene.instantiate()
+ 	minigame = minigame_instance
+ 
+@@ -209,9 +236,12 @@ func load_minigame(minigame_identifier: Globals.MinigameIdentifier, _is_round: b
+ 	minigame_parent.add_child(minigame_instance, true)
+ 
+ func update_scores(more_rounds: bool):
++	if _mp8_round_committed:
++		return
++	_mp8_round_committed = true
+ 
+ 	for k in game_score_by_network_id.keys():
+-		game_score_by_network_id[k] += round_score_by_network_id[k]
++		game_score_by_network_id[k] += round_score_by_network_id.get(k, 0)
+ 
+ 	if not more_rounds:
+ 		for k in game_score_by_network_id.keys():
+@@ -299,8 +329,12 @@ func _on_minigame_loaded(_network_id: int):
+ 	capture_input = false
+ 
+ func _on_minigame_ready(_network_id: int):
+-
+-
++	if _mp8_minigame_initialized:
++		return
++	_mp8_minigame_initialized = true
++	# Local bypasses Minigame.all_players_loaded(), but gameplay guards still
++	# depend on its flag (forklift delivery, escalator and smoke state updates).
++	minigame.is_all_player_loaded = true
+ 	state_machine.transition_to_rpc(&"MinigameStart")
+ 	minigame.initialize(
+ 		session_current_minigame_round, 
+@@ -308,14 +342,65 @@ func _on_minigame_ready(_network_id: int):
+ 		total_score_by_network_id
+ 	)
+ 
++# Shared session state calls this before changing round counters. This is a
++# local lifecycle guard only; no votes, peer IDs or restart snapshots involved.
++func mp8_claim_round_finish(instance_id: int, epoch: int) -> bool:
++	if not is_instance_valid(minigame) or epoch != _mp8_round_epoch:
++		return false
++	if instance_id != minigame.get_instance_id() or _mp8_finish_claimed:
++		return false
++	_mp8_finish_claimed = true
++	return true
++
+ func _on_minigame_player_scored(_network_id: int, _score: int):
+-	round_score_by_network_id[_network_id] += (_score * score_multiplier)
++	if _mp8_round_committed or not round_score_by_network_id.has(_network_id):
++		return
++	round_score_by_network_id[_network_id] += int(_score * score_multiplier * _mp8_score_scale())
+ 
+ func _on_minigame_player_score_finalized(player_scores):
++	if _mp8_round_committed or _mp8_final_scores_received:
++		return
++	_mp8_final_scores_received = true
+ 
+ 	for network_id in player_scores.keys():
+ 		if round_score_by_network_id.has(network_id):
+-			round_score_by_network_id[network_id] += player_scores[network_id] * score_multiplier
++			round_score_by_network_id[network_id] += int(player_scores[network_id] * score_multiplier * _mp8_score_scale())
++
++func _mp8_score_scale() -> float:
++	var identifier = Globals.current_minigame_identifier
++	var by_count: Dictionary = MP8_MINIGAME_SCORE_SCALE_BY_COUNT.get(identifier, {})
++	return float(by_count.get(PlayerManager.player_presences.size(), MP8_MINIGAME_SCORE_SCALE.get(identifier, 1.0)))
++
++func _mp8_create_device_status() -> void:
++	var canvas: CanvasLayer = CanvasLayer.new()
++	canvas.layer = 80
++	add_child(canvas)
++	var column: VBoxContainer = VBoxContainer.new()
++	column.position = Vector2(8, 8)
++	column.mouse_filter = Control.MOUSE_FILTER_IGNORE
++	canvas.add_child(column)
++	for presence in PlayerManager.player_presences.values():
++		var label: Label = Label.new()
++		label.mouse_filter = Control.MOUSE_FILTER_IGNORE
++		label.add_theme_font_override("font", load("res://fonts/Terminal F4.ttf"))
++		label.add_theme_font_size_override("font_size", 18)
++		label.add_theme_color_override("font_outline_color", Color.BLACK)
++		label.add_theme_constant_override("outline_size", 4)
++		column.add_child(label)
++		_mp8_device_labels[presence.device_id] = label
++	_mp8_update_device_status()
++
++func _process(_delta: float) -> void:
++	_mp8_update_device_status()
++
++func _mp8_update_device_status() -> void:
++	for device in _mp8_device_labels:
++		if not PlayerManager.player_presences.has(device):
++			continue
++		var presence = PlayerManager.player_presences[device]
++		var label: Label = _mp8_device_labels[device]
++		label.text = presence.mp8_local_status_text()
++		label.modulate = Color.WHITE if presence.local_controller_connected else Color(1.0, 0.55, 0.2)
+ 
+ func _on_score_screen_finished():
+ 

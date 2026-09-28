@@ -530,3 +530,37 @@ diff --git a/minigames/duck_hunt/components/hunter_player/scripts/hunter_player.
  
  
  
+@@ -637,9 +1044,33 @@ func _on_input_device_changed(input_device: GameManager.InputDevice):
+ 
+ 
+ 
++func mp8_setup_local_view(index: int) -> void:
++	# Only the two local hunter cameras see their own hands/weapon/laser. The
++	# shared duck/name layer 11 remains unchanged; private layers are 12 and 13.
++	var layer: int = 12 + clampi(index, 0, 1)
++	local_camera.set_cull_mask_value(12, false)
++	local_camera.set_cull_mask_value(13, false)
++	local_camera.set_cull_mask_value(11, false)
++	local_camera.set_cull_mask_value(layer, true)
++	_mp8_set_local_mesh_layer(weapon_parent, 1 << (layer - 1))
++	for mesh in hand_meshes:
++		mesh.layers = 1 << (layer - 1)
++	# The beam warns ducks; retail hunters do not see their own aiming beam.
++	# Only weapon/hands belong to each hunter's private view.
++	laser_mesh.layers = 1 << 10
++
++func _mp8_set_local_mesh_layer(node: Node, mask: int) -> void:
++	if node is VisualInstance3D:
++		node.layers = mask
++	for child in node.get_children():
++		_mp8_set_local_mesh_layer(child, mask)
++
+ func reveal_role():
+ 
+ 	role_label.text = tr("LOC_CONTROL_HUNTER_NAME") % player_presence.network_name
++	if GameManager.local_game:
++		var fallback: int = maxi(0, PlayerManager.player_presences.keys().find(player_presence.network_id))
++		role_label.text = "P%d · %s" % [int(player_presence.get_meta("mp8_local_seat", fallback)) + 1, role_label.text]
+ 
+ 	role_overlay.modulate.a = 1.0
+ 	role_overlay.visible = true

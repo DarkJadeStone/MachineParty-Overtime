@@ -1,7 +1,17 @@
 diff --git a/minigames/manufacture_gun/scripts/manufacture_gun.gd b/minigames/manufacture_gun/scripts/manufacture_gun.gd
 --- a/minigames/manufacture_gun/scripts/manufacture_gun.gd
 +++ b/minigames/manufacture_gun/scripts/manufacture_gun.gd
-@@ -57,9 +57,190 @@ var local_item_sequence: Dictionary
+@@ -2,6 +2,9 @@ extends Minigame
+ 
+ class_name ManufactureGun
+ 
++const MP8_LAYOUT_LIMIT: float = 10000.0
++var _mp8_sequences_sent: Dictionary = {}
++
+ const player_scene = preload("res://minigames/manufacture_gun/components/player/manufacture_gun_player.tscn")
+ const workstation_scene = preload("res://minigames/manufacture_gun/components/workstation/manufacture_gun_workstation.tscn")
+ const item_scene = preload("res://minigames/manufacture_gun/components/item/manufacture_gun_item.tscn")
+@@ -57,9 +60,190 @@ var local_item_sequence: Dictionary
  
  var ach_players_with_gun: Array[int]
  
@@ -192,7 +202,7 @@ diff --git a/minigames/manufacture_gun/scripts/manufacture_gun.gd b/minigames/ma
  	for c in item_sequence_preview_node_parent.get_children():
  		sequence_preview_nodes.append(c)
  
-@@ -90,6 +271,1282 @@ func _ready() -> void :
+@@ -90,6 +274,1297 @@ func _ready() -> void :
  		await get_tree().create_timer(1.0).timeout
  		minigame_ready.emit(1)
  
@@ -202,7 +212,7 @@ diff --git a/minigames/manufacture_gun/scripts/manufacture_gun.gd b/minigames/ma
 +func _mp8_setup_field() -> void :
 +
 +	var args := Array(OS.get_cmdline_args())
-+	_mp8_no_expand = args.has("mp8noexpand")
++	_mp8_no_expand = args.has("mp8noexpand") and NetworkManager.mp8_development_tools_allowed()
 +	mp8_player_count = PlayerManager.player_presences.size()
 +
 +	var lay: String = _mp8_arg("mp8gunlayout=")
@@ -213,7 +223,7 @@ diff --git a/minigames/manufacture_gun/scripts/manufacture_gun.gd b/minigames/ma
 +
 +	# [MP8] 手调模式：只有显式传 mp8gunedit 才开。**故意不跟着 -debug-tools 走** ——
 +	# 它要抢一批按键，挂在 -debug-tools 上会让每次普通测试都莫名其妙地被抢键。
-+	_mp8_edit_on = args.has("mp8gunedit")
++	_mp8_edit_on = args.has("mp8gunedit") and multiplayer.is_server() and NetworkManager.mp8_development_tools_allowed()
 +
 +	# 生效顺序：存盘文件 > mp8gunlayout= > 内置 ring。mp8gunnofile 可以无视文件。
 +	_mp8_build_live_layout(args.has("mp8gunnofile"))
@@ -518,6 +528,8 @@ diff --git a/minigames/manufacture_gun/scripts/manufacture_gun.gd b/minigames/ma
 +
 +
 +func _mp8_arg(prefix: String) -> String :
++	if prefix in ["mp8gunpower=", "mp8gunitems="] and not NetworkManager.mp8_development_tools_allowed():
++		return ""
 +	for a in OS.get_cmdline_args():
 +		if String(a).begins_with(prefix):
 +			return String(a).substr(prefix.length())
@@ -750,7 +762,8 @@ diff --git a/minigames/manufacture_gun/scripts/manufacture_gun.gd b/minigames/ma
 +
 +
 +func _unhandled_key_input(event: InputEvent) -> void :
-+
++	if not multiplayer.is_server() or not NetworkManager.mp8_development_tools_allowed():
++		return
 +	if not _mp8_edit_on or _mp8_slots.is_empty():
 +		return
 +	var key := event as InputEventKey
@@ -886,12 +899,17 @@ diff --git a/minigames/manufacture_gun/scripts/manufacture_gun.gd b/minigames/ma
 +	])
 +
 +
-+# [MP8] any_peer + call_local：谁按的键谁发起，8 台机器一起挪。
++# [MP8] 房主广播布局，8 台机器一起挪；接收端不要求开发模式，
++# 因为正式对局 initialize() 也通过此入口同步房主的合法自定义布局。
 +# ⚠️ 必须每台机器都挪：空桌和教程高亮框是**各机本地的场景节点**，不走网络同步
 +# （和 _mp8_setup_field 每台都要跑是同一个理由）。
-+@rpc("any_peer", "call_local", "reliable")
++@rpc("authority", "call_local", "reliable")
 +func mp8_gun_move_rpc(slot: int, pos: Vector3, yaw: float) -> void :
-+
++	if not _mp8_server_command() or not _mp8_valid_layout_position(pos) or not is_finite(yaw):
++		return
++	yaw = fposmod(yaw, 360.0)
++	if slot >= _mp8_layout_live.size():
++		return
 +	if slot < 0 or slot >= _mp8_slots.size():
 +		# 房主广播过来、本机却没有这个工位 = 本机场地压根没扩（人数读少了 / 打错包）。
 +		# 静默丢掉的话，画面上就是"客机比房主少一张桌"，一样是不一致 —— 让它出声。
@@ -923,6 +941,13 @@ diff --git a/minigames/manufacture_gun/scripts/manufacture_gun.gd b/minigames/ma
 +	_mp8_place_at(ws_node, pos, yaw)
 +
 +	_mp8_edit_refresh()
++
++func _mp8_server_command() -> bool:
++	var sender: int = multiplayer.get_remote_sender_id()
++	return sender == get_multiplayer_authority() or (sender == 0 and multiplayer.is_server())
++
++func _mp8_valid_layout_position(pos: Vector3) -> bool:
++	return pos.is_finite() and absf(pos.x) <= MP8_LAYOUT_LIMIT and absf(pos.y) <= MP8_LAYOUT_LIMIT and absf(pos.z) <= MP8_LAYOUT_LIMIT
 +
 +
 +# 搬一件家当：只改水平位置和偏航，**保留它自己的 y**
@@ -1475,7 +1500,7 @@ diff --git a/minigames/manufacture_gun/scripts/manufacture_gun.gd b/minigames/ma
  func fade_in_ambience():
  	for speaker_controller in ambience_speaker_controllers:
  		speaker_controller.speaker.volume_linear = 0
-@@ -99,10 +1556,26 @@ func fade_in_ambience():
+@@ -99,10 +1574,26 @@ func fade_in_ambience():
  func initialize(_round_number: int, _total_rounds: int, _scores: Dictionary = {}):
  	super.initialize(_round_number, _total_rounds, _scores)
  
@@ -1502,7 +1527,7 @@ diff --git a/minigames/manufacture_gun/scripts/manufacture_gun.gd b/minigames/ma
  	state_machine.transition_to_rpc.rpc(&"Round", {"round": _round_number, "total": _total_rounds})
  
  func initialize_debug_specifics():
-@@ -150,14 +1623,27 @@ func spawn_players():
+@@ -150,14 +1641,27 @@ func spawn_players():
  
  		var player_presence: PlayerPresence = PlayerManager.player_presences[key]
  
@@ -1532,7 +1557,7 @@ diff --git a/minigames/manufacture_gun/scripts/manufacture_gun.gd b/minigames/ma
  		)
  
  		player_characters[player_presence.network_id] = player_character
-@@ -176,11 +1662,22 @@ func spawn_workstations():
+@@ -176,11 +1680,22 @@ func spawn_workstations():
  		spawn_positions.append(c.global_position)
  		spawn_rotations.append(c.rotation_degrees)
  
@@ -1555,7 +1580,7 @@ diff --git a/minigames/manufacture_gun/scripts/manufacture_gun.gd b/minigames/ma
  		var workstation_instance = workstation_scene.instantiate()
  		workstations_node_parent.add_child(workstation_instance, true)
  
-@@ -190,9 +1687,18 @@ func spawn_workstations():
+@@ -190,9 +1705,18 @@ func spawn_workstations():
  		workstation_instance.teleport_rpc_with_rot.rpc(spawn_positions[counter], spawn_rotations[counter])
  		workstation_instance.item_assembled.connect(_on_item_assembled)
  
@@ -1575,7 +1600,7 @@ diff --git a/minigames/manufacture_gun/scripts/manufacture_gun.gd b/minigames/ma
  		if GameManager.local_game:
  			local_setup_workstation(player_presence.network_id)
  		else:
-@@ -200,6 +1706,8 @@ func spawn_workstations():
+@@ -200,6 +1724,8 @@ func spawn_workstations():
  
  		counter += 1
  
@@ -1584,7 +1609,7 @@ diff --git a/minigames/manufacture_gun/scripts/manufacture_gun.gd b/minigames/ma
  func local_setup_workstation(network_id: int):
  
  
-@@ -222,6 +1730,12 @@ func spawn_items():
+@@ -222,6 +1748,12 @@ func spawn_items():
  	var spawn_positions: Array[Vector3]
  	for c in $ItemSpawner / ItemSpawns.get_children():
  		spawn_positions.append(c.global_position)
@@ -1597,7 +1622,7 @@ diff --git a/minigames/manufacture_gun/scripts/manufacture_gun.gd b/minigames/ma
  	spawn_positions.shuffle()
  
  	var variations = ManufactureGunItem.Variation.values().duplicate()
-@@ -258,6 +1772,9 @@ func check_game_end():
+@@ -258,6 +1790,9 @@ func check_game_end():
  			player.finished_rpc.rpc()
  			break
  
@@ -1607,7 +1632,7 @@ diff --git a/minigames/manufacture_gun/scripts/manufacture_gun.gd b/minigames/ma
  	player_scores_finalized.emit(player_scores)
  
  	await get_tree().create_timer(2.0).timeout
-@@ -267,6 +1784,30 @@ func check_game_end():
+@@ -267,60 +1802,175 @@ func check_game_end():
  	set_effects_visibility_rpc.rpc(false)
  
  
@@ -1638,7 +1663,16 @@ diff --git a/minigames/manufacture_gun/scripts/manufacture_gun.gd b/minigames/ma
  @rpc("authority", "call_local", "reliable")
  func set_tutorial_variables(current_minigame_identifier, custom_game, minigame_round):
  	Globals.current_minigame_identifier = current_minigame_identifier
-@@ -280,10 +1821,44 @@ func spawned_workstation_rpc():
+ 	GameManager.custom_game = custom_game
+ 	Globals.current_minigame_round = minigame_round
+ 
+-@rpc("any_peer", "call_local", "reliable")
++@rpc("authority", "call_local", "reliable")
+ func spawned_workstation_rpc():
+-
++	if not _mp8_server_command():
++		return
+ 	for w in workstations_node_parent.get_children():
  		if w.player_presence.network_id == multiplayer.get_unique_id():
  			workstation = w
  			workstation.set_sequence_preview_node(item_sequence_preview_node_parent)
@@ -1647,6 +1681,9 @@ diff --git a/minigames/manufacture_gun/scripts/manufacture_gun.gd b/minigames/ma
  			return
  
  
+-@rpc("any_peer", "call_local", "reliable")
+-func request_item_sequence_rpc(network_id: int):
+-	if multiplayer.is_server():
 +# [MP8] 第 1 轮那 10 秒教程会高亮"你的工作台"，用的是
 +# `marker.bounds_workspaces[按象限算的下标]`（player_marker_state.gd:84-92，
 +# 判据是 `p.global_position.x > 1` / `z > 1` 四个象限）。
@@ -1657,10 +1694,20 @@ diff --git a/minigames/manufacture_gun/scripts/manufacture_gun.gd b/minigames/ma
 +# 这样无论象限算出 0~3 哪个下标，指的都是对的那张桌子。
 +# ≤4 人时整段不跑（_mp8_ws_boxes 是空的），与原版逐像素一致。
 +func _mp8_point_tutorial_at(own_workstation: Node3D) -> void :
-+
+ 
+-		var sequence: Array = ManufactureGunItem.Variation.values()
+-		sequence.erase(0)
+-		sequence.shuffle()
+-		if sequence[0] == ManufactureGunItem.Variation.Three:
+-			sequence.pop_front()
+-			sequence.insert(randi_range(1, sequence.size()), ManufactureGunItem.Variation.Three)
 +	if mp8_player_count <= 4 or _mp8_ws_boxes.is_empty():
 +		return
-+
+ 
+-		if network_id == 1:
+-			update_sequence(sequence)
+-		else:
+-			receive_item_sequence_rpc.rpc_id(network_id, sequence)
 +	var marker: Node = get_node_or_null("PlayerMarker")
 +	if marker == null:
 +		return
@@ -1678,24 +1725,78 @@ diff --git a/minigames/manufacture_gun/scripts/manufacture_gun.gd b/minigames/ma
 +	print("[MP8] 枪械工厂：教程高亮框锁定为 %s（本机工位 %.1f,%.1f）" % [
 +		String(box.name), own_workstation.global_position.x, own_workstation.global_position.z
 +	])
+ 
+-		for w in workstations:
+-			if w.player_presence.network_id == network_id:
+-				w.set_item_sequence_rpc.rpc_id(network_id, sequence)
+ 
++@rpc("any_peer", "call_local", "reliable")
++func request_item_sequence_rpc(network_id: int):
++	if not multiplayer.is_server():
++		return
++	var sender: int = multiplayer.get_remote_sender_id()
++	if sender != 0 and sender != network_id:
++		return
++	if not PlayerManager.player_presences.has(network_id):
++		return
++	var own_workstation = null
++	for w in workstations:
++		if is_instance_valid(w) and w.player_presence.network_id == network_id:
++			own_workstation = w
++			break
++	if own_workstation == null:
++		return
++	if GameManager.local_game:
++		if sender == 0:
++			local_setup_workstation(network_id)
++		return
++	if network_id <= 0 or _mp8_sequences_sent.has(network_id):
++		return
+ 
+-@rpc("any_peer", "call_remote", "reliable")
++	var sequence: Array = ManufactureGunItem.Variation.values()
++	sequence.erase(0)
++	sequence.shuffle()
++	if sequence[0] == ManufactureGunItem.Variation.Three:
++		sequence.pop_front()
++		sequence.insert(randi_range(1, sequence.size()), ManufactureGunItem.Variation.Three)
++	_mp8_sequences_sent[network_id] = true
++	if network_id == 1:
++		update_sequence(sequence)
++	else:
++		receive_item_sequence_rpc.rpc_id(network_id, sequence)
++	for w in workstations:
++		if w == own_workstation:
++			w.set_item_sequence_rpc.rpc_id(network_id, sequence)
 +
 +
- @rpc("any_peer", "call_local", "reliable")
- func request_item_sequence_rpc(network_id: int):
- 	if multiplayer.is_server():
-@@ -311,16 +1886,43 @@ func receive_item_sequence_rpc(sequence: Array):
++@rpc("authority", "call_remote", "reliable")
+ func receive_item_sequence_rpc(sequence: Array):
++	if not _mp8_server_command():
++		return
++	var expected: Array = ManufactureGunItem.Variation.values()
++	expected.erase(0)
++	if sequence.size() != expected.size():
++		return
++	for item in sequence:
++		if typeof(item) != TYPE_INT or not expected.has(item):
++			return
++		expected.erase(item)
+ 	update_sequence(sequence)
  
  
  
+-@rpc("any_peer", "call_local", "reliable")
+-func remove_empty_workstation_rpc(index: int):
+-	empty_desk_array[index].queue_free()
 +# [MP8] 原版签名是 `(index: int)`，直接 `empty_desk_array[index].queue_free()` ——
 +# 数组只有 4 项而 index 会走到 7，5~8 号工位越界读 → 报错 + RPC 中断。
 +# 改成**按位置认**：谁离这个工位最近就撤谁。
 +# 4 人局时工位与空桌的 x/z 逐值相同，匹配是精确的，行为与原版一致。
- @rpc("any_peer", "call_local", "reliable")
--func remove_empty_workstation_rpc(index: int):
--	empty_desk_array[index].queue_free()
++@rpc("authority", "call_local", "reliable")
 +func remove_empty_workstation_rpc(slot_position: Vector3):
-+
++	if not _mp8_server_command() or not _mp8_valid_layout_position(slot_position):
++		return
 +	var best: int = -1
 +	var bd: float = INF
 +
@@ -1730,7 +1831,7 @@ diff --git a/minigames/manufacture_gun/scripts/manufacture_gun.gd b/minigames/ma
  
  	active_players.erase(_network_id)
  
-@@ -331,6 +1933,19 @@ func player_disconnected(_network_id: int):
+@@ -331,6 +1981,19 @@ func player_disconnected(_network_id: int):
  	if player_characters.has(_network_id):
  		player_characters.erase(_network_id)
  

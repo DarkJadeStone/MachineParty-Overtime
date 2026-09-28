@@ -1,129 +1,124 @@
 extends SceneTree
+# Called by build_mpml_mod.ps1 with a fresh staging directory. This script reads
+# the original pack but never starts its scenes or modifies that pack.
+var ROOT: String
+var ORIG: String
+var OUT_DIR: String
 
-# [MP8] 生成 MPML 备选安装包（2026-09-03）
-#
-# 产物：dist\mpml\overtime\{mod.json, main.gd, vanilla_md5.json, overtime_overlay.zip}
-# 玩家把这个 overtime 文件夹整个丢进游戏目录的 mods\ 里就行。
-#
-# 三件事：
-#   1. 从**原版** .pck 里逐个算出「我们将要覆盖的那 54 个文件」的 md5
-#      —— 这是 main.gd 版本闸门的判据。游戏一更新这些哈希就全变，
-#      mod 会拒绝挂载而不是拿旧脚本盖新游戏。
-#   2. 把 patch_gdc\ 的 54 个 .gdc 打成 overtime_overlay.zip
-#   3. 抄 mpml\overtime\ 下的 mod.json 与 main.gd 过去
-#
-# 用法（一般由 tools\build_mpml_mod.ps1 调）：
-#   godot.windows.opt.tools.64.exe --headless --path tools/probe --script build_mpml_mod.gd
+func fail(message: String) -> bool:
+	printerr("[MP8-BUILD] " + message)
+	return false
 
-# 仓库根从 res:// 反推，不写死绝对路径 —— 本文件随公开仓发出去，
-# 别人克隆到哪个盘都得能跑。（Godot 用 --path tools/probe 起，res:// 就是 tools/probe/。）
-# 末尾那个 "/" 不能省：下面全是 ROOT + "xxx/" 直接拼，simplify_path 会把它吃掉。
-var ROOT: String = ProjectSettings.globalize_path("res://").path_join("../..").simplify_path() + "/"
-var ORIG: String = ROOT + "game_test/Machine Party.pck.orig"
-var SRC_MOD: String = ROOT + "mpml/overtime/"
-var OUT_DIR: String = ROOT + "dist/mpml/overtime/"
-
-var lines: PackedStringArray = []
-func say(s: String) -> void:
-	lines.append(s); print(s)
-
-
-# patch\ 下的相对路径 -> [patch_gdc 里的平铺文件名, res:// 里的 .gdc 路径]
-# patch_gdc 是按基名平铺的（gdre 的 --output 不保留层级，见 build.ps1），
-# 54 个基名已核实无重名。
 func manifest() -> Array:
-	var out: Array = []
-	var stack: Array = [""]
+	var result: Array = []
+	var stack: Array[String] = [""]
+	var basenames: Dictionary = {}
 	while not stack.is_empty():
 		var rel: String = stack.pop_back()
-		var d := DirAccess.open(ROOT + "patch/" + rel)
-		if d == null:
-			continue
-		for f in d.get_files():
-			if f.ends_with(".gd"):
-				out.append([
-					f.trim_suffix(".gd") + ".gdc",
-					"res://" + rel + f.trim_suffix(".gd") + ".gdc",
-				])
-		for sub in d.get_directories():
+		var directory := DirAccess.open(ROOT.path_join("patch").path_join(rel))
+		if directory == null:
+			fail("Cannot read patch directory: " + rel)
+			return []
+		for file in directory.get_files():
+			if not file.ends_with(".gd"):
+				continue
+			var base := file.trim_suffix(".gd") + ".gdc"
+			if basenames.has(base.to_lower()):
+				fail("Duplicate bytecode basename: " + base)
+				return []
+			basenames[base.to_lower()] = true
+			result.append([base, "res://" + rel + base])
+		for sub in directory.get_directories():
 			stack.append(rel + sub + "/")
-	out.sort_custom(func(a, b): return a[1] < b[1])
-	return out
+	result.sort_custom(func(a, b): return a[1] < b[1])
+	return result
 
+func write_bytes(path: String, data: PackedByteArray) -> bool:
+	var file := FileAccess.open(path, FileAccess.WRITE)
+	if file == null:
+		return fail("Cannot create " + path)
+	file.store_buffer(data)
+	var error := file.get_error()
+	file.close()
+	return error == OK
+
+func build() -> bool:
+	var entries := manifest()
+	if entries.is_empty():
+		return fail("Empty/invalid patch manifest")
+	if not DirAccess.dir_exists_absolute(OUT_DIR):
+		if DirAccess.make_dir_recursive_absolute(OUT_DIR) != OK:
+			return fail("Cannot create staging directory")
+	if not DirAccess.get_files_at(OUT_DIR).is_empty() or not DirAccess.get_directories_at(OUT_DIR).is_empty():
+		return fail("Output must be an empty staging directory")
+	if not ProjectSettings.load_resource_pack(ORIG, false):
+		return fail("Cannot read original pack")
+	var originals: Dictionary = {}
+	for entry in entries:
+		if not FileAccess.file_exists(entry[1]):
+			return fail("Original pack lacks " + entry[1])
+		originals[entry[1]] = FileAccess.get_md5(entry[1])
+		if str(originals[entry[1]]).length() != 32:
+			return fail("Cannot hash original " + entry[1])
+	var tag: String = ""
+	var source := FileAccess.get_file_as_string(ROOT.path_join("patch/modules/multiplayer/network_manager.gd"))
+	for line in source.split("\n"):
+		if line.begins_with("const MP8_VERSION_TAG"):
+			tag = line.get_slice("\"", 1)
+			break
+	if not tag.begins_with("overtime-"):
+		return fail("Missing version tag")
+
+	var pack_path := OUT_DIR.path_join("overtime_overlay.zip")
+	var pack := ZIPPacker.new()
+	if pack.open(pack_path) != OK:
+		return fail("Cannot create overlay ZIP")
+	for entry in entries:
+		var bytes := FileAccess.get_file_as_bytes(ROOT.path_join("patch_gdc").path_join(entry[0]))
+		if bytes.is_empty():
+			pack.close()
+			return fail("Missing/empty bytecode " + entry[0])
+		if pack.start_file(String(entry[1]).trim_prefix("res://")) != OK:
+			pack.close()
+			return fail("Cannot start ZIP entry " + entry[1])
+		if pack.write_file(bytes) != OK or pack.close_file() != OK:
+			pack.close()
+			return fail("Cannot write ZIP entry " + entry[1])
+	if pack.close() != OK:
+		return fail("Cannot finish overlay ZIP")
+	var stream := FileAccess.open(pack_path, FileAccess.READ)
+	if stream == null:
+		return fail("Cannot reopen ZIP")
+	var pack_size := stream.get_length()
+	stream.close()
+	var digest := FileAccess.get_sha256(pack_path)
+	if pack_size <= 0 or digest.length() != 64:
+		return fail("Cannot hash ZIP")
+	for name in ["mod.json", "main.gd"]:
+		var bytes := FileAccess.get_file_as_bytes(ROOT.path_join("mpml/overtime").path_join(name))
+		if bytes.is_empty() or not write_bytes(OUT_DIR.path_join(name), bytes):
+			return fail("Cannot copy " + name)
+	# Manifest is the final file. An interrupted staging build is not mountable.
+	var data := {
+		"schema": 1, "game_version": tag, "godot": Engine.get_version_info()["string"],
+		"files": originals, "overlay_size": pack_size, "overlay_sha256": digest,
+	}
+	if not write_bytes(OUT_DIR.path_join("vanilla_md5.json"), JSON.stringify(data, "  ").to_utf8_buffer()):
+		return fail("Cannot write manifest")
+	print("[MP8-BUILD] %d original fingerprints; overlay %d bytes SHA256=%s" % [entries.size(), pack_size, digest])
+	return true
 
 func _init() -> void:
-
-	var man := manifest()
-	say("[1/4] 补丁清单：%d 个文件" % man.size())
-
-	# ---- 原版 md5（版本闸门的判据）----
-	if not ProjectSettings.load_resource_pack(ORIG, false):
-		say("!! 挂不上原版包 " + ORIG); quit(1); return
-
-	var ver := "%d.%d.%d" % [
-		int(Engine.get_version_info()["major"]),
-		int(Engine.get_version_info()["minor"]),
-		int(Engine.get_version_info()["patch"]),
-	]
-	var files := {}
-	var missing := 0
-	for e in man:
-		var res_path: String = e[1]
-		if not FileAccess.file_exists(res_path):
-			say("   !! 原版包里没有 " + res_path)
-			missing += 1
-			continue
-		files[res_path] = FileAccess.get_md5(res_path)
-	if missing > 0:
-		say("!! 有 %d 个路径在原版包里找不到 —— 游戏版本对不上？停手" % missing)
+	var args := OS.get_cmdline_user_args()
+	var options: Dictionary = {}
+	if args.size() % 2 != 0:
+		fail("Expected option/value pairs"); quit(1); return
+	for i in range(0, args.size(), 2):
+		options[args[i]] = args[i + 1]
+	if not options.has("--mp8-root") or not options.has("--mp8-output") or not options.has("--mp8-original"):
+		fail("Use build_mpml_mod.ps1 to provide root, original pack and fresh staging output")
 		quit(1); return
-	say("[2/4] 原版 md5：%d 条" % files.size())
-
-	# ---- 组装输出目录 ----
-	DirAccess.make_dir_recursive_absolute(OUT_DIR)
-
-	# 游戏版本从 patch 的 MP8_VERSION_TAG 取（那是"这批 .gdc 是给谁编的"的权威标识）
-	var tag := "?"
-	var nm_src := FileAccess.get_file_as_string(ROOT + "patch/modules/multiplayer/network_manager.gd")
-	for ln in nm_src.split("\n"):
-		if ln.begins_with("const MP8_VERSION_TAG"):
-			tag = ln.get_slice("\"", 1)
-			break
-
-	var mf := {
-		"built_for_note": "这些是**原版**文件的 md5。mod 挂载前逐条核对；对不上说明游戏不是这一版，拒绝挂载。",
-		"game_version": tag,
-		"godot": ver,
-		"files": files,
-	}
-	var f := FileAccess.open(OUT_DIR + "vanilla_md5.json", FileAccess.WRITE)
-	f.store_string(JSON.stringify(mf, "  "))
-	f.close()
-	say("[3/4] 写出 vanilla_md5.json（game_version=%s）" % tag)
-
-	# ---- 覆盖包 ----
-	var z := ZIPPacker.new()
-	if z.open(OUT_DIR + "overtime_overlay.zip") != OK:
-		say("!! 打包失败"); quit(1); return
-	for e in man:
-		var src: String = ROOT + "patch_gdc/" + e[0]
-		if not FileAccess.file_exists(src):
-			say("!! patch_gdc 里缺 " + e[0] + " —— 先跑 tools\\build.ps1")
-			z.close(); quit(1); return
-		z.start_file(String(e[1]).trim_prefix("res://"))
-		z.write_file(FileAccess.get_file_as_bytes(src))
-		z.close_file()
-	z.close()
-
-	# ---- 抄 mod.json / main.gd ----
-	for n in ["mod.json", "main.gd"]:
-		var b := FileAccess.get_file_as_bytes(SRC_MOD + n)
-		if b.is_empty():
-			say("!! 读不到 " + SRC_MOD + n); quit(1); return
-		var o := FileAccess.open(OUT_DIR + n, FileAccess.WRITE)
-		o.store_buffer(b); o.close()
-
-	say("[4/4] 完成 -> %s" % OUT_DIR)
-	for n in ["mod.json", "main.gd", "vanilla_md5.json", "overtime_overlay.zip"]:
-		say("      %-24s %d 字节" % [n, FileAccess.get_file_as_bytes(OUT_DIR + n).size()])
-	quit(0)
+	ROOT = String(options["--mp8-root"]).simplify_path()
+	ORIG = String(options["--mp8-original"]).simplify_path()
+	OUT_DIR = String(options["--mp8-output"]).simplify_path()
+	quit(0 if build() else 1)

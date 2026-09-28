@@ -53,7 +53,32 @@ diff --git a/minigames/knife_at_the_office/components/player/scripts/knife_at_th
  	if DynamicInput.is_action_just_pressed(player_presence.device_id, "action_1") && !knife_on_cooldown:
  
  		if is_holding_syringe:
-@@ -624,14 +647,34 @@ func set_player_presence(_network_id: int):
+@@ -523,6 +546,10 @@ func play_scream_sound():
+ 
+ func set_infected_name_label():
+ 
++	# Retail split screen does not reveal infected ally names. Layer 20 is
++	# available for P8's fog output locally, so no name mesh may use it here.
++	if GameManager.local_game:
++		return
+ 	if infected_label_visible:
+ 		return
+ 
+@@ -570,7 +597,13 @@ func set_local_values(starting_layer: int):
+ 
+ 	local_visual_layer_from = starting_layer
+ 
++	# World geometry, characters and the ambient light occupy layers 1..4.
++	for layer in range(1, 5):
++		local_camera.set_cull_mask_value(layer, true)
++	for layer in range(5, 21):
++		local_camera.set_cull_mask_value(layer, false)
+ 	local_camera.set_cull_mask_value(starting_layer + 1, true)
++	fog_of_war.overhead_camera.cull_mask = 0
+ 	fog_of_war.set_local_values(starting_layer)
+ 
+ @rpc("any_peer", "call_local", "reliable")
+@@ -624,14 +657,34 @@ func set_player_presence(_network_id: int):
  func set_game_reference_from_path(_game_reference_path: NodePath):
  	game_reference = get_node(_game_reference_path)
  
@@ -91,7 +116,7 @@ diff --git a/minigames/knife_at_the_office/components/player/scripts/knife_at_th
  @rpc("any_peer", "call_local", "reliable")
  func set_can_search_rpc(_can_search: bool):
  
-@@ -652,7 +695,16 @@ func set_has_item_rpc(_has_item: bool, _equip_item: bool = true):
+@@ -652,7 +705,16 @@ func set_has_item_rpc(_has_item: bool, _equip_item: bool = true):
  		tween_equip.tween_property(ik_left_hand, "influence", 1, 0.3)
  		tween_equip.tween_property(syringe_in_hand, "scale", Vector3(1, 1, 1), 0.3)
  
@@ -109,7 +134,7 @@ diff --git a/minigames/knife_at_the_office/components/player/scripts/knife_at_th
  
  	if multiplayer.is_server() && _equip_item:
  
-@@ -667,7 +719,9 @@ func set_has_item_rpc(_has_item: bool, _equip_item: bool = true):
+@@ -667,7 +729,9 @@ func set_has_item_rpc(_has_item: bool, _equip_item: bool = true):
  	if has_item:
  		ach_active = true
  		ach_item_acquire_timer = ach_item_acquire_duration

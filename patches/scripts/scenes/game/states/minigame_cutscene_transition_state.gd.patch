@@ -1,0 +1,19 @@
+diff --git a/scripts/scenes/game/states/minigame_cutscene_transition_state.gd b/scripts/scenes/game/states/minigame_cutscene_transition_state.gd
+--- a/scripts/scenes/game/states/minigame_cutscene_transition_state.gd
++++ b/scripts/scenes/game/states/minigame_cutscene_transition_state.gd
+@@ -27,10 +27,13 @@ func enter(_msg: Dictionary = {}) -> void :
+ 		intermission_manager.reset_environment_rpc.rpc()
+ 
+ 		owner.session_next_minigame_index = 0
++		# [MP8] This path bypasses the picker callback, which normally selects
++		# session_minigame_index. Do not carry the previous/shuffled slot forward.
++		owner.session_minigame_index = owner.session_next_minigame_index
+ 		owner.session_next_minigame_identifier = owner.session_minigame_list[owner.session_next_minigame_index]
+ 		owner.load_minigame(
+-			owner.session_next_minigame_identifier, 
+-			false, 
++			owner.session_next_minigame_identifier,
++			false,
+ 			1
+ 		)
+ 

@@ -1,11 +1,11 @@
 // Machine Party 8 人 mod —— 安装器 / 启动器
 //
 // 同一份源码编出两个 exe（见 tools\build_installer.ps1）：
-//   mp8_install.exe    控制台版，命令行参数齐全
-//   mp8_launcher.exe   窗口版（/define:GUI /target:winexe），双击即用
-// 补丁字节码全部**内嵌**，两个都不需要装任何运行库、不需要下别的工具。
+//   overtime_install.exe    控制台版，命令行参数齐全
+//   overtime_launcher.exe   窗口版（/define:GUI /target:winexe），双击即用
+// 稳定离线工具；补丁及 mod 版本来自同目录的 overtime_payload.zip。
 //
-// 它不含、也不分发任何游戏原始资产：内嵌的只有 mod 自己改过的那些 .gdc。
+// 不下载文件、不改安全设置；外置包只有 mod 改过的 .gdc，不含原版游戏资产。
 //
 // ── 还原是怎么做到只存几 KB 的 ───────────────────────────────────────
 // 打补丁的做法是「把新内容追加到 PCK 末尾 + 把索引里那一条指过去」，
@@ -20,16 +20,24 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.IO.Compression;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
 using Microsoft.Win32;
 #if GUI
 using System.Drawing;
-using System.Threading;
 using System.Windows.Forms;
 #endif
+
+[assembly: AssemblyTitle("Machine Party Overtime Offline Installer")]
+[assembly: AssemblyDescription("Offline installer and restore tool for the community Machine Party Overtime mod")]
+[assembly: AssemblyProduct("Machine Party Overtime")]
+[assembly: AssemblyCompany("Machine Party Overtime community project")]
+[assembly: AssemblyVersion("1.7.0.0")]
+[assembly: AssemblyFileVersion("1.7.0.0")]
 
 // ═════════════════════════════════════════════════════════════════════════
 // 双语文案
@@ -67,7 +75,7 @@ static class Core
     // 已装 1.3 的人不用动，1.3 与 1.3.1 的人照样同房。
     // 它同时决定 dist\ 下的输出目录名与发布包名（见 tools\build_installer.ps1），
     // 免得重建时把已经发出去的 dist\overtime-1.3\ 连 zip 一起覆盖掉。
-    public const string ReleaseNum = "1.6";
+    public const string ReleaseNum = "1.7.0";
 
     public const string AppId   = "4108000";
     public const string GameRel = @"steamapps\common\party project\Machine Party_Windows";
@@ -77,6 +85,12 @@ static class Core
     // 0.9 之前叫 mp8_restore.dat。已经装过旧版的机器上还是那个名字，
     // 所以读的时候两个名字都认，写只写新名。
     public const string OldResName = "mp8_restore.dat";
+    public const string PayloadName = "overtime_payload.zip";
+    public const int MaxPayloadFiles = 256;
+    public const int MaxPayloadFileBytes = 4 * 1024 * 1024;
+    public const int MaxPayloadBytes = 32 * 1024 * 1024;
+    public const int MaxManifestBytes = 128 * 1024;
+    public static string PayloadPath { get { return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, PayloadName); } }
 
     // 现场已有的还原数据在哪（新名优先）。没有就返回空串。
     public static string FindRes(string gameDir)
@@ -89,7 +103,7 @@ static class Core
     }
 
     const uint  ResMagic  = 0x3852504Du;   // "MP8R"
-    const uint  ResFormat = 1u;
+    const uint  ResFormat = 2u;       // v2 also validates/reverts a partially applied write
 
     // ── 日志 ───────────────────────────────────────────────────────────
     static readonly List<string> logBuf = new List<string>();
@@ -100,18 +114,20 @@ static class Core
 
     public static void Log(string s)
     {
-        logBuf.Add(DateTime.Now.ToString("HH:mm:ss") + "  " + s);
+        lock (logBuf) logBuf.Add(DateTime.Now.ToString("HH:mm:ss") + "  " + s);
     }
 
     public static void FlushLog()
     {
+        lock (logBuf)
+        {
         // 缓冲空就别写：否则每按一次「安装日志」都往文件里插一个空段落头
         if (logBuf.Count == 0) return;
         try
         {
             var sb = new StringBuilder();
             sb.AppendLine("──── " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") +
-                          "  mod " + ModTag() + "  安装器 " + ReleaseNum +
+                          "  安装器 " + ReleaseNum +
                           "  游戏 " + GameVersion + " ────");
             foreach (string s in logBuf) sb.AppendLine(s);
             File.AppendAllText(LogPath, sb.ToString(), Encoding.UTF8);
@@ -121,6 +137,7 @@ static class Core
             logBuf.Clear();
         }
         catch { }
+        }
     }
 
     // ── 找游戏：注册表拿 Steam 根目录 → libraryfolders.vdf 拿所有库盘 ──
@@ -292,13 +309,9 @@ static class Core
 
     public static string ModTag()
     {
-        try
-        {
-            using (var s = Assembly.GetExecutingAssembly().GetManifestResourceStream("mp8.version"))
-                if (s != null) using (var r = new StreamReader(s)) return r.ReadToEnd().Trim();
-        }
+        try { return LoadPayload().Tag; }
         catch { }
-        return "mp8";
+        return L.T("补丁包未就绪", "Payload unavailable");
     }
 
     public static string Sha256(string path)
@@ -378,43 +391,142 @@ static class Core
         return idx;
     }
 
-    // 内嵌资源：mp8.manifest 一行 "<序号>|<res:// 路径>"，内容在 mp8.<序号>
-    public static SortedDictionary<string, byte[]> LoadEmbedded()
+    // 验证整个容器后才发布快照；调用者拿不到内部可写数组，磁盘替换不影响此次安装。
+    public sealed class PayloadSnapshot
     {
-        var asm = Assembly.GetExecutingAssembly();
-        // ⚠️ 用 SortedDictionary 而不是 Dictionary：写入顺序决定追加顺序，
-        //    进而决定产物字节。定死顺序才能「同样的输入产出同样的包」。
-        var map = new SortedDictionary<string, byte[]>(StringComparer.Ordinal);
-
-        string manifest;
-        using (var s = asm.GetManifestResourceStream("mp8.manifest"))
+        readonly string tag;
+        readonly SortedDictionary<string, byte[]> patches;
+        internal PayloadSnapshot(string value, SortedDictionary<string, byte[]> data) { tag = value; patches = data; }
+        public string Tag { get { return tag; } }
+        public int Count { get { return patches.Count; } }
+        internal SortedDictionary<string, byte[]> CopyPatches()
         {
-            if (s == null)
-                throw new Exception(L.T("这个 exe 里没有内嵌补丁（打包时漏了）",
-                                        "This exe has no embedded patches (packaging error)"));
-            using (var r = new StreamReader(s, Encoding.UTF8)) manifest = r.ReadToEnd();
+            var copy = new SortedDictionary<string, byte[]>(StringComparer.Ordinal);
+            foreach (var kv in patches) copy.Add(kv.Key, (byte[])kv.Value.Clone());
+            return copy;
         }
+    }
 
-        foreach (string raw in manifest.Split('\n'))
+    static bool SafeTag(string value)
+    {
+        return value != null && value.Length <= 64 && Regex.IsMatch(value,
+            @"\Aovertime-[0-9]+(?:\.[0-9]+){1,3}(?:-[A-Za-z0-9]+(?:[.-][A-Za-z0-9]+)*)?\z");
+    }
+
+    static bool SafeScriptPath(string path)
+    {
+        if (path == null || path.Length > 512 || !path.EndsWith(".gdc", StringComparison.Ordinal)) return false;
+        foreach (string part in path.Split('/'))
+            if (part != part.Trim() || !Regex.IsMatch(part, @"\A[A-Za-z0-9_-][A-Za-z0-9_ .-]*\z")) return false;
+        return true;
+    }
+
+    static InvalidDataException BadPayload(string detail)
+    {
+        return new InvalidDataException(L.T("补丁包校验失败：", "Payload validation failed: ") + detail + "\n" +
+            L.T("请重新完整解压官方发布包，让启动器与 " + PayloadName + " 位于同一目录。",
+                "Extract the complete official release again, keeping the launcher and " + PayloadName + " together."));
+    }
+
+    static byte[] ReadExactBounded(Stream stream, long length, int maximum)
+    {
+        if (length < 0 || length > maximum) throw BadPayload("entry size exceeds limit");
+        var data = new byte[(int)length];
+        int offset = 0;
+        while (offset < data.Length)
         {
-            string line = raw.Trim();
-            if (line.Length == 0 || line.StartsWith("#")) continue;
-            int bar = line.IndexOf('|');
-            if (bar < 0) throw new Exception("bad manifest line: " + line);
-            string id = line.Substring(0, bar);
-            string path = line.Substring(bar + 1).Trim();
-            if (path.StartsWith("res://")) path = path.Substring(6);   // PCK 索引里不带 res://
+            int read = stream.Read(data, offset, data.Length - offset);
+            if (read == 0) throw BadPayload("truncated entry");
+            offset += read;
+        }
+        if (stream.ReadByte() != -1) throw BadPayload("entry length mismatch");
+        return data;
+    }
 
-            using (var s = asm.GetManifestResourceStream("mp8." + id))
+    public static PayloadSnapshot LoadPayload() { return LoadPayload(PayloadPath); }
+
+    public static PayloadSnapshot LoadPayload(string path)
+    {
+        if (!File.Exists(path)) throw new FileNotFoundException(L.T(
+            "找不到补丁包 " + PayloadName + "。请完整解压发布 ZIP，再从解压目录启动；不要只复制 exe。\n仍可卸载或恢复已有安装。",
+            "Missing " + PayloadName + ". Extract the entire release ZIP and run the launcher from that folder; do not copy only the exe.\nExisting installations can still be removed or restored."), path);
+        try
+        {
+            byte[] container;
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
             {
-                if (s == null) throw new Exception("missing embedded patch: mp8." + id);
-                var buf = new byte[s.Length];
-                int off = 0;
-                while (off < buf.Length) off += s.Read(buf, off, buf.Length - off);
-                map[path] = buf;
+                if (fs.Length < 22 || fs.Length > MaxPayloadBytes) throw BadPayload("ZIP size exceeds limit or is truncated");
+                container = ReadExactBounded(fs, fs.Length, MaxPayloadBytes);
+            }
+            using (var memory = new MemoryStream(container, false))
+            using (var archive = new ZipArchive(memory, ZipArchiveMode.Read, false))
+            {
+                if (archive.Entries.Count < 2 || archive.Entries.Count > MaxPayloadFiles + 1) throw BadPayload("entry count");
+                var entries = new Dictionary<string, ZipArchiveEntry>(StringComparer.OrdinalIgnoreCase);
+                foreach (var entry in archive.Entries)
+                {
+                    if (entry.FullName != "manifest.txt" && !Regex.IsMatch(entry.FullName, @"\Ascripts/[0-9]{3}\.gdc\z"))
+                        throw BadPayload("unexpected ZIP path");
+                    if (entries.ContainsKey(entry.FullName)) throw BadPayload("duplicate ZIP path");
+                    if (entry.Length <= 0 || entry.Length > (entry.FullName == "manifest.txt" ? MaxManifestBytes : MaxPayloadFileBytes))
+                        throw BadPayload("entry size exceeds limit");
+                    entries.Add(entry.FullName, entry);
+                }
+                ZipArchiveEntry manifestEntry;
+                if (!entries.TryGetValue("manifest.txt", out manifestEntry)) throw BadPayload("missing manifest.txt");
+                byte[] manifestBytes;
+                using (var input = manifestEntry.Open()) manifestBytes = ReadExactBounded(input, manifestEntry.Length, MaxManifestBytes);
+                string manifest = new UTF8Encoding(false, true).GetString(manifestBytes);
+                if (manifest.Length == 0 || manifest[0] == '\uFEFF') throw BadPayload("manifest must be UTF-8 without BOM");
+                manifest = manifest.Replace("\r\n", "\n");
+                if (manifest.IndexOf('\r') >= 0 || manifest.IndexOf('\0') >= 0) throw BadPayload("invalid manifest characters");
+                if (manifest.EndsWith("\n", StringComparison.Ordinal)) manifest = manifest.Substring(0, manifest.Length - 1);
+                string[] lines = manifest.Split('\n');
+                if (lines.Length < 6 || lines[0] != "OVERTIME-PAYLOAD\t1") throw BadPayload("manifest format version");
+                var metadata = new Dictionary<string, string>(StringComparer.Ordinal);
+                for (int i = 1; i <= 4; i++)
+                {
+                    string[] row = lines[i].Split('\t');
+                    if (row.Length != 2 || (row[0] != "mod_tag" && row[0] != "game_version" && row[0] != "vanilla_sha256" && row[0] != "vanilla_size") || metadata.ContainsKey(row[0]))
+                        throw BadPayload("missing, duplicate or unknown metadata");
+                    metadata.Add(row[0], row[1]);
+                }
+                if (!SafeTag(metadata["mod_tag"])) throw BadPayload("invalid mod_tag");
+                if (metadata["game_version"] != GameVersion || !string.Equals(metadata["vanilla_sha256"], VanillaSha, StringComparison.OrdinalIgnoreCase) ||
+                    metadata["vanilla_size"] != VanillaSize.ToString(CultureInfo.InvariantCulture)) throw BadPayload("target game metadata mismatch");
+                int count = lines.Length - 5;
+                if (count < 1 || count > MaxPayloadFiles || archive.Entries.Count != count + 1) throw BadPayload("file count or extra ZIP entries");
+                var map = new SortedDictionary<string, byte[]>(StringComparer.Ordinal);
+                var targets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                long total = 0;
+                for (int i = 5; i < lines.Length; i++)
+                {
+                    string[] row = lines[i].Split('\t');
+                    if (row.Length != 5 || row[0] != "file" || !row[1].StartsWith("res://", StringComparison.Ordinal) || !SafeScriptPath(row[1].Substring(6))) throw BadPayload("invalid file record or target path");
+                    if (!targets.Add(row[1])) throw BadPayload("duplicate target path");
+                    string expectedEntry = "scripts/" + (i - 5).ToString("D3", CultureInfo.InvariantCulture) + ".gdc";
+                    if (row[2] != expectedEntry) throw BadPayload("script entry order or path");
+                    long length;
+                    if (!Regex.IsMatch(row[3], @"\A[1-9][0-9]*\z") || !long.TryParse(row[3], NumberStyles.None, CultureInfo.InvariantCulture, out length) || length > MaxPayloadFileBytes) throw BadPayload("script length exceeds limit");
+                    total += length;
+                    if (total > MaxPayloadBytes) throw BadPayload("total script size exceeds limit");
+                    if (!Regex.IsMatch(row[4], @"\A[0-9A-Fa-f]{64}\z")) throw BadPayload("invalid SHA256");
+                    ZipArchiveEntry entry;
+                    if (!entries.TryGetValue(row[2], out entry) || entry.FullName != row[2] || entry.Length != length) throw BadPayload("missing entry or length mismatch");
+                    byte[] data;
+                    using (var input = entry.Open()) data = ReadExactBounded(input, length, MaxPayloadFileBytes);
+                    using (var hash = SHA256.Create())
+                        if (!string.Equals(BitConverter.ToString(hash.ComputeHash(data)).Replace("-", ""), row[4], StringComparison.OrdinalIgnoreCase)) throw BadPayload("script SHA256 mismatch");
+                    map.Add(row[1].Substring(6), data);
+                }
+                // Hashes detect corruption, not publisher identity or authenticity.
+                return new PayloadSnapshot(metadata["mod_tag"], map);
             }
         }
-        return map;
+        catch (InvalidDataException ex) { throw BadPayload(ex.Message); }
+        catch (DecoderFallbackException) { throw BadPayload("invalid UTF-8"); }
+        catch (IOException ex) { throw BadPayload(ex.Message); }
+        catch (ArgumentException ex) { throw BadPayload(ex.Message); }
     }
 
     static byte[] Md5Of(byte[] data)
@@ -432,7 +544,7 @@ static class Core
     // ═══════════════════════════════════════════════════════════════════
     // 当前状态
     // ═══════════════════════════════════════════════════════════════════
-    public enum Kind { Missing, Vanilla, OursInstalled, OldVersion, Unknown }
+    public enum Kind { Missing, Vanilla, OursInstalled, OldVersion, RestorableInstalled, Unknown }
 
     public class State
     {
@@ -444,6 +556,9 @@ static class Core
         public bool   HasLegacy;
         public string InstalledTag = "";   // 还原数据里记的 mod 版本
         public string Note = "";
+        public string PayloadError = "";
+        public string PayloadTag = "";
+        public int PayloadCount;
 
         public bool CanUninstall { get { return HasRestore || HasLegacy; } }
     }
@@ -451,7 +566,11 @@ static class Core
     public static State Detect(string gameDir)
     {
         var st = new State();
+        PayloadSnapshot payload = null;
+        try { payload = LoadPayload(); } catch (Exception ex) { st.PayloadError = ex.Message; }
+        if (payload != null) { st.PayloadTag = payload.Tag; st.PayloadCount = payload.Count; }
         st.GameDir = gameDir;
+        if (string.IsNullOrEmpty(gameDir)) return st;
         st.PckPath = Path.Combine(gameDir, PckName);
         if (!File.Exists(st.PckPath)) return st;
 
@@ -462,19 +581,31 @@ static class Core
 
         if (st.HasRestore)
         {
-            try { st.InstalledTag = ReadRestore(resPath).ModTag; }
+            try { string tag = ReadRestore(resPath).ModTag; st.InstalledTag = SafeTag(tag) ? tag : L.T("版本未知", "unknown version"); }
             catch { }
         }
 
         try
         {
-            var patches = LoadEmbedded();
+            if (payload == null)
+            {
+                string why;
+                if (st.HasRestore && RestoreApplies(st.PckPath, ReadRestore(resPath), out why))
+                {
+                    st.Kind = Kind.RestorableInstalled;
+                    st.Note = L.T("当前数据与安装还原记录一致，可切回安装前状态。", "The PCK matches its restore record and can be restored.");
+                }
+                else if (st.Length == VanillaSize && Sha256(st.PckPath) == VanillaSha) st.Kind = Kind.Vanilla;
+                else { st.Kind = Kind.Unknown; st.Note = L.T("无法比对补丁版本；仍可尝试已有的还原数据或旧版备份。", "Payload comparison unavailable; existing restore data or a legacy backup can still be used."); }
+                return st;
+            }
+            var patches = payload.CopyPatches();
             using (var fs = new FileStream(st.PckPath, FileMode.Open, FileAccess.Read))
             {
                 var idx = ReadIndex(fs);
 
                 // 判「装的是不是我们这一版」：不算整包哈希（635 MB 要十几秒），
-                // 只比索引里记的 md5 与内嵌补丁的 md5 —— 一样就是我们写进去的。
+                // 快速状态比对使用索引 MD5 与已验证补丁；安装后的完整自检另读实际载荷。
                 int hit = 0, total = 0;
                 bool allPresent = true;
                 foreach (var kv in patches)
@@ -492,14 +623,14 @@ static class Core
                                   "Files this mod patches are absent — the game is probably not " + GameVersion);
                 }
                 else if (hit == total)   st.Kind = Kind.OursInstalled;
-                else if (st.InstalledTag.Length > 0 && st.InstalledTag != ModTag())
+                else if (st.InstalledTag.Length > 0 && st.InstalledTag != payload.Tag)
                 {
                     // 🩸 装着**别的版本**的 MP8。不这么判的话会掉进下面那条
                     //    "只有 N/47 个补丁在位、上次安装可能失败了" —— 既吓人又是错的，
                     //    而升级恰恰是最常见的路径（每次发新版所有老用户都会走到这里）。
                     st.Kind = Kind.OldVersion;
-                    st.Note = L.T("装的是 Overtime " + st.InstalledTag + "，本程序是 " + ModTag() + "。直接装即可升级。",
-                                  "Overtime " + st.InstalledTag + " is installed; this program is " + ModTag() + ". Installing upgrades it.");
+                    st.Note = L.T("装的是 " + st.InstalledTag + "，补丁包是 " + payload.Tag + "。直接装即可更换版本。",
+                                  st.InstalledTag + " is installed; the payload is " + payload.Tag + ". Installing replaces that version.");
                 }
                 else if (hit > 0)
                 {
@@ -507,7 +638,7 @@ static class Core
                     st.Note = L.T("只有 " + hit + "/" + total + " 个补丁在位 —— 上次安装可能中途失败了",
                                   "Only " + hit + "/" + total + " patches present — a previous install may have failed");
                 }
-                else if (st.Length == VanillaSize) st.Kind = Kind.Vanilla;
+                else if (st.Length == VanillaSize && Sha256(st.PckPath) == VanillaSha) st.Kind = Kind.Vanilla;
                 else
                 {
                     st.Kind = Kind.Unknown;
@@ -529,6 +660,7 @@ static class Core
     // ═══════════════════════════════════════════════════════════════════
     class RestoreData
     {
+        public uint Format = ResFormat;
         public long   OrigLength;      // 打补丁之前的文件长度
         public long   PatchedLength;   // 打完之后的文件长度
         public string BaseSha;         // 打补丁之前那份包的指纹；没校验过则为空
@@ -541,11 +673,14 @@ static class Core
 
     static void WriteRestore(string path, RestoreData d)
     {
-        using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write))
+        string temp = path + ".new-" + Guid.NewGuid().ToString("N");
+        try
+        {
+        using (var fs = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
         using (var bw = new BinaryWriter(fs, Encoding.UTF8))
         {
             bw.Write(ResMagic);
-            bw.Write(ResFormat);
+            bw.Write(d.Format);
             bw.Write(d.OrigLength);
             bw.Write(d.PatchedLength);
             bw.Write(d.BaseSha == null ? "" : d.BaseSha);
@@ -559,7 +694,13 @@ static class Core
                 bw.Write(kv.Value.Offset); bw.Write(kv.Value.Size); bw.Write(kv.Value.Md5);
                 bw.Write(made.Offset);     bw.Write(made.Size);     bw.Write(made.Md5);
             }
+            bw.Flush();
+            fs.Flush(true);
         }
+        if (File.Exists(path)) File.Replace(temp, path, path + ".previous-" + Guid.NewGuid().ToString("N"));
+        else File.Move(temp, path);
+        }
+        finally { if (File.Exists(temp)) File.Delete(temp); }
     }
 
     static RestoreData ReadRestore(string path)
@@ -567,22 +708,26 @@ static class Core
         using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read))
         using (var br = new BinaryReader(fs, Encoding.UTF8))
         {
+            if (fs.Length > 512 * 1024) throw new InvalidDataException("Restore record exceeds size limit");
             if (br.ReadUInt32() != ResMagic)
                 throw new Exception(L.T("还原数据文件损坏（标记不对）", "Restore data corrupt (bad magic)"));
             uint fmt = br.ReadUInt32();
-            if (fmt != ResFormat)
+            if (fmt != 1u && fmt != ResFormat)
                 throw new Exception(L.T("还原数据的格式版本是 " + fmt + "，本程序不认",
                                         "Restore data format " + fmt + " is not supported"));
             var d = new RestoreData();
+            d.Format = fmt;
             d.OrigLength    = br.ReadInt64();
             d.PatchedLength = br.ReadInt64();
             d.BaseSha       = br.ReadString();
             d.GameVer       = br.ReadString();
             d.ModTag        = br.ReadString();
             int n = br.ReadInt32();
+            if (n < 0 || n > MaxPayloadFiles) throw new InvalidDataException("Invalid restore entry count");
             for (int i = 0; i < n; i++)
             {
                 string p = br.ReadString();
+                if (!SafeScriptPath(p) || d.Orig.ContainsKey(p)) throw new InvalidDataException("Invalid or duplicate restore path");
                 var o = new PckEntry();
                 o.Offset = br.ReadUInt64(); o.Size = br.ReadUInt64(); o.Md5 = br.ReadBytes(16);
                 var m = new PckEntry();
@@ -590,6 +735,7 @@ static class Core
                 d.Orig[p] = o;
                 d.Made[p] = m;
             }
+            if (fs.Position != fs.Length || (fmt == 2 && (!Regex.IsMatch(d.BaseSha, @"\A[0-9A-F]{64}\z") || n == 0))) throw new InvalidDataException("Invalid restore record");
             return d;
         }
     }
@@ -602,54 +748,73 @@ static class Core
     //   1. 新内容写到文件末尾（索引后面也无所谓 —— 引擎只按索引里的偏移去 seek）；
     //   2. 把那一条索引的 偏移/大小/md5 原地改掉。
     // 于是 635 MB 的包只写进去 ~640 KB，秒级完成。
-    static int PatchPck(string pckPath, SortedDictionary<string, byte[]> patches, RestoreData rec)
+    static void ValidateTargets(string pckPath, SortedDictionary<string, byte[]> patches)
     {
-        int replaced = 0;
-        using (var fs = new FileStream(pckPath, FileMode.Open, FileAccess.ReadWrite))
+        using (var fs = new FileStream(pckPath, FileMode.Open, FileAccess.Read, FileShare.Read))
         {
             var idx = ReadIndex(fs);
-            var bw = new BinaryWriter(fs);
-
             var missing = new List<string>();
             foreach (var kv in patches) if (!idx.Entries.ContainsKey(kv.Key)) missing.Add(kv.Key);
             if (missing.Count > 0)
                 throw new Exception(L.T("这些补丁在游戏包里找不到对应文件（游戏版本不对？）：\n  ",
                                         "These patches have no counterpart in the game (wrong version?):\n  ")
                                     + string.Join("\n  ", missing.ToArray()));
+        }
+    }
 
-            // 先把「改之前的索引字段」原样记下来 —— 这就是还原的全部所需
+    static void PreparePatch(string pckPath, SortedDictionary<string, byte[]> patches, RestoreData rec)
+    {
+        ValidateTargets(pckPath, patches);
+        using (var fs = new FileStream(pckPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            var idx = ReadIndex(fs);
             rec.OrigLength = fs.Length;
+            long at = fs.Length;
             foreach (var kv in patches)
             {
                 var e = idx.Entries[kv.Key];
                 var copy = new PckEntry();
                 copy.Offset = e.Offset; copy.Size = e.Size; copy.Md5 = e.Md5;
                 rec.Orig[kv.Key] = copy;
+                var made = new PckEntry();
+                made.Offset = idx.RelBase ? checked((ulong)at - idx.FileBase) : (ulong)at;
+                made.Size = (ulong)kv.Value.Length;
+                made.Md5 = Md5Of(kv.Value);
+                rec.Made[kv.Key] = made;
+                at = checked(at + kv.Value.Length);
             }
+            rec.PatchedLength = at;
+        }
+    }
 
+    static int PatchPck(string pckPath, SortedDictionary<string, byte[]> patches, RestoreData rec)
+    {
+        using (var fs = new FileStream(pckPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        {
+            if (fs.Length != rec.OrigLength) throw new IOException("PCK changed after preflight");
+            var idx = ReadIndex(fs);
+            foreach (var kv in rec.Orig)
+            {
+                PckEntry current;
+                if (!idx.Entries.TryGetValue(kv.Key, out current) || current.Offset != kv.Value.Offset || current.Size != kv.Value.Size || !SameBytes(current.Md5, kv.Value.Md5))
+                    throw new IOException("PCK index changed after preflight");
+            }
+            var bw = new BinaryWriter(fs);
             foreach (var kv in patches)      // SortedDictionary：顺序确定，产物可复现
             {
                 byte[] data = kv.Value;
                 fs.Position = fs.Length;
-                long at = fs.Position;
                 bw.Write(data);
-
-                ulong stored = idx.RelBase ? (ulong)at - idx.FileBase : (ulong)at;
-                byte[] md5 = Md5Of(data);
+                var made = rec.Made[kv.Key];
                 fs.Position = idx.Entries[kv.Key].FieldPos;
-                bw.Write(stored);
-                bw.Write((ulong)data.Length);
-                bw.Write(md5);
-
-                var made = new PckEntry();
-                made.Offset = stored; made.Size = (ulong)data.Length; made.Md5 = md5;
-                rec.Made[kv.Key] = made;
-                replaced++;
+                bw.Write(made.Offset);
+                bw.Write(made.Size);
+                bw.Write(made.Md5);
             }
             bw.Flush();
-            rec.PatchedLength = fs.Length;
+            fs.Flush(true);
         }
-        return replaced;
+        return patches.Count;
     }
 
     // 「现在这份包，正是我当初改过的那一份吗？」
@@ -664,6 +829,53 @@ static class Core
         try
         {
             var fi = new FileInfo(pckPath);
+            if (d.Format == 2)
+            {
+                if (d.OrigLength < 40 || d.PatchedLength < d.OrigLength || fi.Length < d.OrigLength || fi.Length > d.PatchedLength)
+                    throw new InvalidDataException("PCK length is outside the recorded write range");
+                using (var fs = new FileStream(pckPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+                {
+                    var idx = ReadIndex(fs);
+                    // Hash the would-be original without writing it: overlay only the recorded
+                    // original index fields in the read buffer. Unchanged data/header/path-table
+                    // bytes must match the pre-write SHA256, including for an interrupted append.
+                    var fields = new SortedDictionary<long, byte[]>();
+                    long priorEnd = -1;
+                    foreach (var kv in d.Orig)
+                    {
+                        PckEntry e;
+                        if (!idx.Entries.TryGetValue(kv.Key, out e) || e.FieldPos < 40 || e.FieldPos + 32 > d.OrigLength)
+                            throw new InvalidDataException("Restore target is absent or out of range");
+                        using (var bytes = new MemoryStream()) using (var writer = new BinaryWriter(bytes))
+                        {
+                            writer.Write(kv.Value.Offset); writer.Write(kv.Value.Size); writer.Write(kv.Value.Md5);
+                            fields.Add(e.FieldPos, bytes.ToArray());
+                        }
+                    }
+                    foreach (var field in fields)
+                    { if (field.Value.Length != 32 || field.Key < priorEnd) throw new InvalidDataException("Overlapping restore fields"); priorEnd = field.Key + 32; }
+                    using (var hash = SHA256.Create())
+                    {
+                        byte[] buffer = new byte[65536];
+                        long position = 0; fs.Position = 0;
+                        while (position < d.OrigLength)
+                        {
+                            int want = (int)Math.Min(buffer.Length, d.OrigLength - position), got = 0;
+                            while (got < want) { int read = fs.Read(buffer, got, want - got); if (read == 0) throw new EndOfStreamException(); got += read; }
+                            foreach (var field in fields)
+                            {
+                                long start = Math.Max(position, field.Key), end = Math.Min(position + want, field.Key + 32);
+                                if (start < end) Buffer.BlockCopy(field.Value, (int)(start - field.Key), buffer, (int)(start - position), (int)(end - start));
+                            }
+                            hash.TransformBlock(buffer, 0, want, buffer, 0); position += want;
+                        }
+                        hash.TransformFinalBlock(new byte[0], 0, 0);
+                        if (BitConverter.ToString(hash.Hash).Replace("-", "") != d.BaseSha)
+                            throw new InvalidDataException("Original PCK bytes no longer match the restore record");
+                    }
+                }
+                return true;
+            }
             if (fi.Length != d.PatchedLength)
             {
                 why = L.T("数据包长度变了（记录 " + d.PatchedLength.ToString("N0") +
@@ -697,7 +909,7 @@ static class Core
         catch (Exception ex) { why = ex.Message; return false; }
     }
 
-    // 打完之后把索引重新读一遍，核对每条的 md5 都是我们刚写的那份。
+    // 索引及实际载荷逐字节回读，不能以索引中声明的 MD5 代替磁盘内容。
     // 便宜的保险：写了一半断电/磁盘满，这里就能当场发现。
     static void VerifyPatched(string pckPath, SortedDictionary<string, byte[]> patches)
     {
@@ -711,6 +923,12 @@ static class Core
                 if (!idx.Entries.TryGetValue(kv.Key, out e)) { bad.Add(kv.Key); continue; }
                 if (!SameBytes(e.Md5, Md5Of(kv.Value))) bad.Add(kv.Key);
                 if (e.Size != (ulong)kv.Value.Length) bad.Add(kv.Key);
+                ulong offset = checked(e.Offset + (idx.RelBase ? idx.FileBase : 0));
+                if (offset > (ulong)fs.Length || e.Size > (ulong)fs.Length - offset) { bad.Add(kv.Key); continue; }
+                fs.Position = (long)offset;
+                byte[] actual = new byte[kv.Value.Length]; int read = 0;
+                while (read < actual.Length) { int n = fs.Read(actual, read, actual.Length - read); if (n == 0) break; read += n; }
+                if (read != actual.Length || !SameBytes(actual, kv.Value)) bad.Add(kv.Key);
             }
             if (bad.Count > 0)
                 throw new Exception(L.T("写入自检没过（" + bad.Count + " 条对不上）",
@@ -746,19 +964,46 @@ static class Core
             }
             bw.Flush();
             fs.SetLength(d.OrigLength);      // 砍掉追加的那一段
+            fs.Flush(true);
         }
     }
 
     // ═══════════════════════════════════════════════════════════════════
     // 对外动作
     // ═══════════════════════════════════════════════════════════════════
+    sealed class OperationLock : IDisposable
+    {
+        readonly Mutex mutex;
+        public OperationLock(string gameDir)
+        {
+            string normalized = Path.GetFullPath(gameDir).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).ToUpperInvariant();
+            string key;
+            using (var hash = SHA256.Create()) key = BitConverter.ToString(hash.ComputeHash(Encoding.UTF8.GetBytes(normalized))).Replace("-", "");
+            mutex = new Mutex(false, @"Local\MachinePartyOvertime-" + key);
+            bool held = false;
+            try { held = mutex.WaitOne(0); } catch (AbandonedMutexException) { held = true; }
+            if (!held) { mutex.Close(); throw new IOException(L.T("另一个安装器正在操作这个游戏目录，请等它完成。", "Another installer is working on this game folder. Wait for it to finish.")); }
+        }
+        public void Dispose() { mutex.ReleaseMutex(); mutex.Close(); }
+    }
+
     public static void Install(string gameDir, bool force, Action<string> say)
     {
+        using (var gate = new OperationLock(gameDir)) InstallLocked(gameDir, force, say);
+    }
+
+    static void InstallLocked(string gameDir, bool force, Action<string> say)
+    {
+        // 此处必须在 Preflight / 升级还原 / 任何游戏目录写入之前。
+        var payload = LoadPayload();
+        var patches = payload.CopyPatches();
         string live = Path.Combine(gameDir, PckName);
         string res  = Path.Combine(gameDir, ResName);   // 写：永远用新名
         string cur  = FindRes(gameDir);                 // 读：现场那个（可能是旧名）
         string bak  = Path.Combine(gameDir, BakName);
+	    bool revertedPrevious = false;
 
+        ValidateTargets(live, patches);   // 旧 mod 仍在时先证明所有目标存在
         PreflightWritable(gameDir, live);
 
         // 已经装过 → 先原样还原回去，再从干净的包重打。
@@ -773,6 +1018,7 @@ static class Core
             {
                 say(L.T("[1/4] 先还原上一次的安装…", "[1/4] Reverting the previous install first..."));
                 ApplyRestore(live, old);
+                revertedPrevious = true;
                 File.Delete(cur);
             }
             else
@@ -801,6 +1047,7 @@ static class Core
                     "  Most likely the game updated while that backup is from an older version.\n" +
                     "  Fix: delete it, then use Steam's \"Verify integrity of game files\"."));
             File.Copy(bak, live, true);
+            revertedPrevious = true;
             say(L.T("      ✓ 已从旧备份还原到原版", "      OK, restored to vanilla from the legacy backup"));
         }
 
@@ -815,7 +1062,9 @@ static class Core
         {
             if (!force)
                 throw new Exception(L.T(
-                    "当前数据包跟本 mod 认识的原版对不上，**没有动它**。\n" +
+                    (revertedPrevious
+                        ? "上一次安装已还原到安装前的数据包；该数据包不是受支持的原版，新版本未安装。\n"
+                        : "当前数据包跟本 mod 认识的原版对不上，**没有动它**。\n") +
                     "  期望：" + VanillaSha + "（" + GameVersion + "，" + VanillaSize.ToString("N0") + " 字节）\n" +
                     "  实际：" + sha + "（" + sz.ToString("N0") + " 字节）\n" +
                     "常见原因：\n" +
@@ -823,7 +1072,9 @@ static class Core
                     "  2. 已经装过别的 mod。\n" +
                     "补救：Steam → 右键游戏 → 属性 → 已安装的文件 → 验证游戏文件的完整性。\n" +
                     "确定要继续可以加 --force。",
-                    "The current PCK does not match the vanilla build this mod knows. Nothing was changed.\n" +
+                    (revertedPrevious
+                        ? "The previous installation was reverted to its original input PCK. That baseline is unsupported; the new version was not installed.\n"
+                        : "The current PCK does not match the vanilla build this mod knows. Nothing was changed.\n") +
                     "  Expected: " + VanillaSha + " (" + GameVersion + ", " + VanillaSize.ToString("N0") + " bytes)\n" +
                     "  Actual:   " + sha + " (" + sz.ToString("N0") + " bytes)\n" +
                     "Common causes:\n" +
@@ -836,25 +1087,43 @@ static class Core
         }
         else say(L.T("      ✓ 是原版 " + GameVersion, "      OK, vanilla " + GameVersion));
 
-        var patches = LoadEmbedded();
         say(L.T("[3/4] 写入 " + patches.Count + " 个补丁…",
                 "[3/4] Writing " + patches.Count + " patches..."));
 
         var rec = new RestoreData();
-        rec.BaseSha = verified ? VanillaSha : null;   // 没验过就不承诺还原后等于原版
+        rec.BaseSha = sha;  // --force 也记录实际基线，只承诺回到该输入，不称它是原版
         rec.GameVer = GameVersion;
-        rec.ModTag  = ModTag();
+        rec.ModTag  = payload.Tag;
 
-        var sw = Stopwatch.StartNew();
-        int n = PatchPck(live, patches, rec);
-        sw.Stop();
-
-        // 还原数据必须在打完之后落盘：中途失败的话文件里没有半份还原数据，
-        // 重跑一次会当成「没装过」，从原包重打，天然自洽。
+        PreparePatch(live, patches, rec);
+        // 先落盘并刷新恢复依据，再改 PCK；v2 记录可验证并恢复部分追加/索引写入。
         WriteRestore(res, rec);
-
-        say(L.T("[4/4] 写入自检…", "[4/4] Verifying what was written..."));
-        VerifyPatched(live, patches);
+        var sw = Stopwatch.StartNew();
+        int n;
+        try
+        {
+            n = PatchPck(live, patches, rec);
+            say(L.T("[4/4] 写入自检…", "[4/4] Verifying what was written..."));
+            VerifyPatched(live, patches);
+        }
+        catch (Exception failure)
+        {
+            string recovery;
+            try
+            {
+                ApplyRestore(live, rec);
+                if (Sha256(live) != rec.BaseSha) throw new IOException("Rollback checksum mismatch");
+                string evidence = res + ".failed-" + Guid.NewGuid().ToString("N");
+                File.Move(res, evidence);
+                recovery = L.T("已还原到本次写入前的基线（升级时是还原后的原版，不是旧 mod）。恢复记录保留在：", "Restored to the baseline before this write (for an upgrade, the reverted base, not the previous mod). Recovery evidence: ") + evidence;
+            }
+            catch (Exception rollback)
+            {
+                recovery = L.T("自动恢复未完成，恢复记录已保留；请使用「切回原版」重试，或用 Steam 校验游戏文件。\n", "Automatic recovery could not finish. The restore record is retained; retry Switch to vanilla or verify game files in Steam.\n") + res + "\n" + rollback.Message;
+            }
+            throw new IOException(L.T("安装写入失败：", "Installation write failed: ") + failure.Message + "\n" + recovery, failure);
+        }
+        sw.Stop();
 
         say("");
         say(L.T("✓ 装好了：" + n + " 个文件已替换，用时 " + sw.Elapsed.TotalSeconds.ToString("0.0") + " 秒",
@@ -866,6 +1135,11 @@ static class Core
     }
 
     public static void Uninstall(string gameDir, Action<string> say)
+    {
+        using (var gate = new OperationLock(gameDir)) UninstallLocked(gameDir, say);
+    }
+
+    static void UninstallLocked(string gameDir, Action<string> say)
     {
         string live = Path.Combine(gameDir, PckName);
         string res  = FindRes(gameDir);                // 可能是旧名 mp8_restore.dat
@@ -897,8 +1171,8 @@ static class Core
                             "\n用 Steam「验证游戏文件的完整性」可以拿回原版。",
                             "The restored PCK does not match the vanilla fingerprint:\n  expected " + d.BaseSha +
                             "\n  actual   " + sha + "\nUse Steam's \"Verify integrity of game files\" to recover."));
-                    say(L.T("      ✓ 逐字节等于原版 " + GameVersion,
-                            "      OK, byte-for-byte identical to vanilla " + GameVersion));
+                    say(d.BaseSha == VanillaSha ? L.T("      ✓ 逐字节等于原版 " + GameVersion,
+                            "      OK, byte-for-byte identical to vanilla " + GameVersion) : L.T("      ✓ 逐字节等于安装前的基线", "      OK, byte-for-byte identical to the pre-install baseline"));
                 }
                 File.Delete(res);
                 say("");
@@ -1065,7 +1339,7 @@ static class Installer
     {
         L.Auto();
 
-        bool uninstall = false, force = false, status = false, validate = false;
+        bool uninstall = false, force = false, status = false, validate = false, verifyPackage = false;
         string gameDir = null;
 
         for (int i = 0; i < args.Length; i++)
@@ -1075,6 +1349,7 @@ static class Installer
             else if (a == "--status" || a == "-s") status = true;
             else if (a == "--force") force = true;
             else if (a == "--validate") validate = true;
+            else if (a == "--verify-package") { verifyPackage = true; pause = false; }
             else if (a == "--no-pause") pause = false;
             else if (a == "--lang" && i + 1 < args.Length) L.Zh = (args[++i].ToLowerInvariant() == "zh");
             else if ((a == "--game" || a == "-g") && i + 1 < args.Length) gameDir = args[++i];
@@ -1092,6 +1367,12 @@ static class Installer
 
         try
         {
+            if (verifyPackage)
+            {
+                var payload = Core.LoadPayload();
+                Console.WriteLine("Payload OK: " + payload.Tag + " | scripts=" + payload.Count);
+                return Done(0);
+            }
             if (validate) { Core.OpenSteamValidate(); Console.WriteLine(L.T("已请求 Steam 校验游戏文件。", "Asked Steam to verify game files.")); return Done(0); }
 
             if (gameDir == null) gameDir = PickGameDir();
@@ -1176,6 +1457,8 @@ static class Installer
                 Line(L.T("状态：  原版（没装 mod）", "State:    vanilla (mod not installed)"), ConsoleColor.Gray); break;
             case Core.Kind.OursInstalled:
                 Line(L.T("状态：  已装 Overtime " + Core.ModTag(), "State:    Overtime " + Core.ModTag() + " installed"), ConsoleColor.Green); break;
+            case Core.Kind.RestorableInstalled:
+                Line(L.T("状态：  存在可恢复安装 ", "State:    restorable installation ") + st.InstalledTag, ConsoleColor.Green); break;
             case Core.Kind.OldVersion:
                 Line(L.T("状态：  已装 Overtime " + st.InstalledTag + "（旧版，本程序是 " + Core.ModTag() + "）",
                          "State:    Overtime " + st.InstalledTag + " installed (this program is " + Core.ModTag() + ")"), ConsoleColor.Yellow);
@@ -1191,6 +1474,7 @@ static class Installer
         Console.WriteLine(L.T("还原数据：", "Restore:  ") + (st.HasRestore ? Path.GetFileName(Core.FindRes(gameDir)) : "-"));
         Console.WriteLine(L.T("旧版备份：", "Legacy:   ") + (st.HasLegacy ? Core.BakName + " (605 MB)" : "-"));
         Console.WriteLine(L.T("日志：  ", "Log:      ") + Core.LogPath);
+        if (st.PayloadError.Length > 0) Console.WriteLine(st.PayloadError);
     }
 
     static void Say(string s) { Console.WriteLine(s); Core.Log(s); }
@@ -1227,6 +1511,8 @@ static class Installer
     {
         Console.WriteLine();
         Console.WriteLine(L.T("用法：", "Usage:"));
+        Console.WriteLine(L.T("  overtime_install.exe --verify-package  只验证同目录补丁包，不操作游戏",
+                              "  overtime_install.exe --verify-package  validate the adjacent payload without accessing the game"));
         Console.WriteLine(L.T("  mp8_install.exe                 安装（自动找 Steam 里的游戏）",
                               "  mp8_install.exe                 install (auto-detects the game)"));
         Console.WriteLine(L.T("  mp8_install.exe --uninstall     还原成原版",
@@ -1263,7 +1549,17 @@ static class Launcher
         L.Auto();
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
-        Application.Run(new MainForm());
+        string preferred = null;
+        bool again;
+        do
+        {
+            using (var form = new MainForm(Core.FindGameDirs(), preferred))
+            {
+                Application.Run(form);
+                preferred = form.SelectedGameDirectory;
+                again = form.LanguageChanged;
+            }
+        } while (again);
     }
 }
 
@@ -1288,11 +1584,17 @@ class MainForm : Form
     static readonly Color FreeLine = Color.FromArgb(246, 203, 203);
 
     ComboBox dirBox;
-    Label    stateLabel, noteLabel;
+    Label    stateLabel, noteLabel, ver;
     Panel    accentBar;
-    Button   toggleBtn, launchBtn, validateBtn, logBtn, gameLogBtn;
+    Button   toggleBtn, launchBtn, validateBtn, logBtn, gameLogBtn, languageBtn, browse;
+    TextBox  payloadInfo;
     Core.State st;
     bool busy;
+    bool detecting, statusReady;
+    int detectionVersion;
+    readonly Func<string, Core.State> detector;
+    public bool LanguageChanged { get; private set; }
+    public string SelectedGameDirectory { get; private set; }
 
     static Font F(float size, FontStyle style)
     {
@@ -1316,13 +1618,18 @@ class MainForm : Form
         return b;
     }
 
-    public MainForm()
+    public MainForm() : this(Core.FindGameDirs(), null) { }
+
+    public MainForm(IEnumerable<string> gameDirs, string preferredDir) : this(gameDirs, preferredDir, Core.Detect) { }
+
+    internal MainForm(IEnumerable<string> gameDirs, string preferredDir, Func<string, Core.State> detect)
     {
+        detector = detect;
         Text = "Machine Party-Overtime";   // 品牌名，两种语言下一致
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(580, 430);
+        ClientSize = new Size(580, 506);
         BackColor = Color.White;
         Font = F(9f, FontStyle.Regular);
 
@@ -1348,11 +1655,11 @@ class MainForm : Form
         sub.SetBounds(26, 46, 340, 20);
         header.Controls.Add(sub);
 
-        var ver = new Label();
+        ver = new Label();
         // 三行：mod 版本 / 安装器发布号 / 游戏版本。安装器那行是给排障用的 ——
         // 只修安装器的发布（如 1.3.1）ModTag() 不变，没有这一行就分不出玩家手上
         // 是修好的那版还是出事的那版，而我们能拿到的往往只有一张截图。
-        ver.Text = Core.ModTag() + "\n"
+        ver.Text = L.T("检测中…", "Checking...") + "\n"
                  + L.T("安装器 ", "installer ") + Core.ReleaseNum + "\n"
                  + L.T("游戏 ", "game ") + Core.GameVersion;
         ver.Font = F(8.5f, FontStyle.Regular);
@@ -1371,13 +1678,14 @@ class MainForm : Form
         Controls.Add(dirLab);
 
         dirBox = new ComboBox();
+        dirBox.Name = "game-directory";
         dirBox.DropDownStyle = ComboBoxStyle.DropDownList;
         dirBox.FlatStyle = FlatStyle.Flat;
         dirBox.SetBounds(26, 114, 428, 24);
         dirBox.SelectedIndexChanged += delegate { Refresh2(); };
         Controls.Add(dirBox);
 
-        var browse = FlatBtn(L.T("浏览…", "Browse"), Ghost, GhostHot, Ink, 9f, FontStyle.Regular);
+        browse = FlatBtn(L.T("浏览…", "Browse"), Ghost, GhostHot, Ink, 9f, FontStyle.Regular);
         browse.SetBounds(462, 113, 92, 26);
         browse.Click += delegate { Browse(); };
         Controls.Add(browse);
@@ -1410,6 +1718,7 @@ class MainForm : Form
 
         // ── 动作按钮 ───────────────────────────────────────────────────
         toggleBtn = FlatBtn("", Amber, AmberHot, Color.White, 11f, FontStyle.Bold);
+        toggleBtn.Name = "toggle-install";
         toggleBtn.SetBounds(26, 260, 268, 48);
         toggleBtn.Click += delegate { Toggle(); };
         Controls.Add(toggleBtn);
@@ -1417,6 +1726,7 @@ class MainForm : Form
         // 比主按钮更深一档：主按钮（琥珀/石板）→ 启动游戏（近黑）→ Steam 修复（浅灰），
         // 三级色阶把「这次该点哪个」一眼分开。同色会让主次失效（第一版就是这样）。
         launchBtn = FlatBtn(L.T("启动游戏", "Play"), Ink, Color.FromArgb(44, 47, 58), Color.White, 10f, FontStyle.Regular);
+        launchBtn.Name = "launch-game";
         launchBtn.SetBounds(306, 260, 122, 48);
         launchBtn.Click += delegate { Core.LaunchGame(); };
         Controls.Add(launchBtn);
@@ -1450,10 +1760,35 @@ class MainForm : Form
         };
         Controls.Add(gameLogBtn);
 
+        languageBtn = FlatBtn(L.Zh ? "English" : "简体中文", Ghost, GhostHot, Ink, 8.5f, FontStyle.Regular);
+        languageBtn.Name = "language-switch";
+        languageBtn.AccessibleName = "Language / 语言";
+        languageBtn.SetBounds(438, 318, 116, 24);
+        languageBtn.Click += delegate {
+            if (busy) return;
+            SelectedGameDirectory = Dir;
+            L.Zh = !L.Zh;
+            LanguageChanged = true;
+            Close();
+        };
+        Controls.Add(languageBtn);
+
+        payloadInfo = new TextBox();
+        payloadInfo.Name = "payload-info";
+        payloadInfo.SetBounds(26, 352, 528, 66);
+        payloadInfo.Multiline = true;
+        payloadInfo.ReadOnly = true;
+        payloadInfo.BorderStyle = BorderStyle.None;
+        payloadInfo.BackColor = Color.White;
+        payloadInfo.ForeColor = Muted;
+        payloadInfo.Font = F(8.5f, FontStyle.Regular);
+        payloadInfo.ScrollBars = ScrollBars.Vertical;
+        Controls.Add(payloadInfo);
+
         // ── 免费声明（红色，常驻）──────────────────────────────────────
         // 社区里有人把同类 mod 闭源收费卖，这条得让人一眼看见。
         var freeBand = new Panel();
-        freeBand.SetBounds(0, 354, 580, 76);
+        freeBand.SetBounds(0, 430, 580, 76);
         freeBand.BackColor = FreeBg;
         Controls.Add(freeBand);
 
@@ -1473,13 +1808,17 @@ class MainForm : Form
         freeBand.Controls.Add(free);
 
         // 只探测、不操作就关窗的情况下，缓冲里的日志得有人写出去
-        FormClosed += delegate { Core.FlushLog(); };
+        FormClosed += delegate { detectionVersion++; Core.FlushLog(); };
+        FormClosing += delegate(object sender, FormClosingEventArgs e) { if (busy) e.Cancel = true; };
+        Shown += delegate { Refresh2(); };
 
-        foreach (string d in Core.FindGameDirs()) dirBox.Items.Add(d);
+        foreach (string d in gameDirs) dirBox.Items.Add(d);
+        if (!string.IsNullOrEmpty(preferredDir) && !dirBox.Items.Contains(preferredDir)) dirBox.Items.Add(preferredDir);
         // 给 SelectedIndex 赋值会触发 SelectedIndexChanged → Refresh2()，
         // 所以只有「一个目录都没找到」时才需要自己补一次。1.3 是两边都调，
         // 于是每开一次启动器就往日志里记两行一模一样的 detect。
-        if (dirBox.Items.Count > 0) dirBox.SelectedIndex = 0;
+        if (!string.IsNullOrEmpty(preferredDir)) dirBox.SelectedItem = preferredDir;
+        else if (dirBox.Items.Count > 0) dirBox.SelectedIndex = 0;
         else Refresh2();
 
         // 开局别让焦点落在下拉框上：DropDownList 一旦获得焦点，选中项会整行刷成
@@ -1516,6 +1855,50 @@ class MainForm : Form
     void Refresh2()
     {
         if (busy) return;
+        detectionVersion++;
+        statusReady = false;
+        toggleBtn.Enabled = launchBtn.Enabled = validateBtn.Enabled = false;
+        SetState(L.T("正在检查文件…", "Checking files..."), Muted,
+                 L.T("完整性校验正在后台进行，可以切换目录或关闭窗口。", "Integrity checks are running in the background. You can change folders or close this window."));
+        payloadInfo.Text = L.T("正在读取补丁包：", "Reading payload: ") + Core.PayloadPath;
+        // Do not create a worker before WinForms has a UI handle. Coalesce
+        // rapid directory changes into one pending request, never parallel hashes.
+        if (IsHandleCreated && !detecting) StartDetection();
+    }
+
+    void StartDetection()
+    {
+        detecting = true;
+        int version = detectionVersion;
+        string dir = Dir;
+        var worker = new Thread(delegate()
+        {
+            Core.State result;
+            try { result = detector(dir); }
+            catch (Exception ex) { result = new Core.State { GameDir = dir, Kind = Core.Kind.Unknown, Note = ex.Message, PayloadError = ex.Message }; }
+            try { BeginInvoke((Action)delegate
+            {
+                detecting = false;
+                if (IsDisposed || Disposing) return;
+                if (version != detectionVersion) { StartDetection(); return; }
+                st = result;
+                statusReady = true;
+                ApplyDetection();
+            }); } catch (InvalidOperationException) { /* closed while checking */ }
+        });
+        worker.IsBackground = true;
+        worker.Start();
+    }
+
+    void ApplyDetection()
+    {
+        launchBtn.Enabled = validateBtn.Enabled = true;
+        string tag = st.PayloadTag.Length > 0 ? st.PayloadTag : L.T("补丁包不可用", "Payload unavailable");
+        ver.Text = tag + "\n" + L.T("安装器 ", "installer ") + Core.ReleaseNum + "\n" + L.T("游戏 ", "game ") + Core.GameVersion;
+        payloadInfo.ForeColor = st.PayloadError.Length > 0 ? Caution : Muted;
+        payloadInfo.Text = st.PayloadError.Length > 0
+            ? st.PayloadError.Replace("\r\n", "\n").Replace("\n", "\r\n")
+            : L.T("补丁包：", "Payload: ") + tag + "  |  " + st.PayloadCount + L.T(" 个脚本", " scripts") + "\r\n" + Core.PayloadPath;
         if (Dir == null)
         {
             SetState(L.T("没找到游戏", "Game not found"), Bad,
@@ -1528,7 +1911,6 @@ class MainForm : Form
             return;
         }
 
-        st = Core.Detect(Dir);
         // 控制台版不发给玩家了，所以日志是唯一的诊断通道 ——
         // 每次探测都记一行，「打开日志」在还没装任何东西时也有内容可看。
         Core.Log(string.Format("detect: {0} | tag={1} | len={2} | restore={3} | legacy={4} | {5}",
@@ -1541,10 +1923,17 @@ class MainForm : Form
         {
             case Core.Kind.OursInstalled:
                 SetState(L.T("Overtime 已启用", "Overtime enabled"), Good,
-                         L.T("主菜单右下角的版本号会带 +" + Core.ModTag() + "。\n" +
+                         L.T("主菜单右下角的版本号会带 +" + tag + "。\n" +
                              "一起玩的人必须装同一版，否则会被房主拒绝进房。",
-                             "The main menu version ends with +" + Core.ModTag() + ".\n" +
+                             "The main menu version ends with +" + tag + ".\n" +
                              "Everyone in the lobby needs this same version, or the host will refuse them."));
+                toggleBtn.Text = L.T("切回原版", "Switch to vanilla");
+                toggleBtn.BackColor = Slate;
+                toggleBtn.FlatAppearance.MouseOverBackColor = SlateHot;
+                break;
+
+            case Core.Kind.RestorableInstalled:
+                SetState(L.T("存在可恢复安装", "Restorable installation"), Good, st.InstalledTag + "\n" + st.Note);
                 toggleBtn.Text = L.T("切回原版", "Switch to vanilla");
                 toggleBtn.BackColor = Slate;
                 toggleBtn.FlatAppearance.MouseOverBackColor = SlateHot;
@@ -1552,11 +1941,11 @@ class MainForm : Form
 
             case Core.Kind.OldVersion:
                 SetState(L.T("已装 Overtime " + st.InstalledTag + "（旧版）", "Overtime " + st.InstalledTag + " installed (outdated)"), Caution,
-                         L.T("本程序是 " + Core.ModTag() + "。点下面的按钮升级（会先还原再装新版）。"
+                         L.T("本程序是 " + tag + "。点下面的按钮升级（会先还原再装新版）。"
                              + "一起玩的人都要升到同一版，否则互相进不了房。",
-                             "This program is " + Core.ModTag() + ". The button below upgrades it "
+                             "This program is " + tag + ". The button below upgrades it "
                              + "(revert, then install). Everyone you play with needs the same version."));
-                toggleBtn.Text = L.T("升级到 " + Core.ModTag(), "Upgrade to " + Core.ModTag());
+                toggleBtn.Text = L.T("升级到 " + tag, "Upgrade to " + tag);
                 toggleBtn.BackColor = Amber;
                 toggleBtn.FlatAppearance.MouseOverBackColor = AmberHot;
                 break;
@@ -1595,11 +1984,17 @@ class MainForm : Form
                 }
                 break;
         }
+        if (st.PayloadError.Length > 0 && !st.CanUninstall)
+        {
+            toggleBtn.Enabled = false;
+            toggleBtn.BackColor = Ghost;
+            toggleBtn.ForeColor = Muted;
+        }
     }
 
     void Toggle()
     {
-        if (Dir == null) return;
+        if (Dir == null || busy || !statusReady) return;
         // 别叫 busy：MainForm 已经有个 bool busy 字段（「处理中」标志），
         // 局部同名会把它遮住，后面那句 busy = true 就直接编译不过。
         string blocked = Core.BusyReason(Dir);
@@ -1613,11 +2008,13 @@ class MainForm : Form
         }
 
         // OldVersion 走安装（Install 会先用还原数据回到原版再打新补丁），不是卸载
-        bool remove = (st.Kind == Core.Kind.OursInstalled) || (st.Kind == Core.Kind.Unknown && st.CanUninstall);
+        bool remove = (st.Kind == Core.Kind.OursInstalled) || (st.Kind == Core.Kind.RestorableInstalled) || (st.Kind == Core.Kind.Unknown && st.CanUninstall);
         string dir = Dir;
 
         busy = true;
+        browse.Enabled = false;
         toggleBtn.Enabled = false; launchBtn.Enabled = false; dirBox.Enabled = false;
+        languageBtn.Enabled = false; validateBtn.Enabled = false;
         SetState(L.T("处理中…", "Working..."), Caution, "");
 
         // 校验哈希要十几秒，不能卡死界面
@@ -1642,7 +2039,9 @@ class MainForm : Form
                 BeginInvoke((Action)delegate
                 {
                     busy = false;
+                    browse.Enabled = true;
                     launchBtn.Enabled = true;
+                    languageBtn.Enabled = true; validateBtn.Enabled = true;
                     dirBox.Enabled = true;
                     Refresh2();
                     if (err != null)

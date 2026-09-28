@@ -4,11 +4,12 @@
 
 This document answers three questions for every minigame in the rotation: **what was adapted to fit
 8 players**, **whether scoring changed**, and **what was deliberately left alone**.
+It describes the existing mainline adaptations. See the [1.7 validation scope](VERIFICATION_1.7.md#english) for new local-play and shared-flow changes.
 
 Two principles run through all fifteen:
 
-1. **Four players or fewer plays vanilla.** In most minigames, not a single line of this mod
-   executes below five players.
+1. **Preserve small-lobby gameplay parameters where possible.** Most arena expansions are gated
+   by player count. Shared fixes, input, local rendering and round flow also apply below five players.
 2. **Change the layout, not the game.** Only two minigames had their mechanics genuinely altered
    (Escalator Pit and Knife at the Office) — both are explained below, with the reason. Everything
    else is either "spread four positions into eight" or a change to how points are weighted.
@@ -20,7 +21,7 @@ Two principles run through all fifteen:
 
 ## First, scoring: why some minigames had to change and others did not
 
-The scoring pipeline is vanilla — this mod does not touch it:
+Score multipliers follow this pipeline; 1.7 also corrects round-commit guards and local score handling:
 
 ```
 minigame produces player_scores[player]
@@ -247,13 +248,13 @@ scoreboard at their own station.
 
 ## Behaviour at four players or fewer
 
-**Gameplay is unaffected.** In minigames that gate on player count, no mod code runs at four or
-fewer.
+**Most gameplay parameters stay vanilla.** Count-gated expansions remain conditional, but shared
+bug fixes, input, rendering and round-flow changes can also run with 2–4 players.
 
 **A few visual differences remain.** Some arena expansions are not gated, so you will see the extra
 chairs, platforms or spawn markers in a 2-4 player session. Known cases: Green Pea, Junk Platform,
 DVD Roomba, Spine Breaker, Chisel Gauntlet, and the survivor indicators in Knife at the Office.
-**None of them affect play — they are only visible.**
+These arena extensions are primarily visual; 2–4 player regression remains part of release acceptance.
 
 The briefing screen and the end-of-round scoreboard use the 8-row layout at every player count
 (scaled down to fit eight lines).
@@ -270,9 +271,8 @@ eat, and standing still in Exploding Collar Race simply gets them harvested — 
 "everyone scored zero" no matter how many times you run it. Verifying each one properly costs a full
 eight-human session.
 
-**Their adaptation work — whether eight players can actually get in and play — has been verified on
-live sessions.** What has not been confirmed is that the resulting point spread is complete and free
-of duplicates. A glance at the settlement line in the log during a real session confirms it.
+Earlier online adaptation checks do not certify every new 1.7 local-play path. The full resulting
+point spread still needs to be checked for missing or duplicate scores during real sessions.
 
 ---
 

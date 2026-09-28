@@ -28,24 +28,33 @@
 # 想要更严的结论就跑基线对比：
 #   $env:MP8_CHECK_DIR="...\src"; 再跑一遍，只有"补丁报、原版不报"的才算我们的。
 
+param([string]$Godot = $env:GODOT, [string]$Pck = '', [string]$Overlay = '')
 $ErrorActionPreference = "Stop"
 
 $root  = Split-Path -Parent $PSScriptRoot
-$godot = "C:\Program Files (x86)\Steam\steamapps\common\Godot Engine\godot.windows.opt.tools.64.exe"
+if ([string]::IsNullOrWhiteSpace($Godot)) { $Godot = "C:\Program Files (x86)\Steam\steamapps\common\Godot Engine\godot.windows.opt.tools.64.exe" }
 $probe = Join-Path $root "tools\probe"
-$pck   = Join-Path $root "game_test\Machine Party.pck"
+if ([string]::IsNullOrWhiteSpace($Pck)) { $Pck = Join-Path $root "game_test\Machine Party.pck" }
+$Pck = [IO.Path]::GetFullPath($Pck)
 
-foreach ($needed in @($godot, $pck, (Join-Path $probe "parsecheck.gd"))) {
+$neededPaths = @($godot, $pck, (Join-Path $probe "parsecheck.gd"))
+if ($Overlay) { $Overlay = [IO.Path]::GetFullPath($Overlay); $neededPaths += $Overlay }
+foreach ($needed in $neededPaths) {
     if (-not (Test-Path $needed)) { throw "找不到 $needed" }
 }
 
-$out = Join-Path $env:TEMP "mp8_parsecheck.out"
-$err = Join-Path $env:TEMP "mp8_parsecheck.err"
+$runId = [guid]::NewGuid().ToString('N')
+$out = Join-Path $env:TEMP "mp8_parsecheck-$runId.out"
+$err = Join-Path $env:TEMP "mp8_parsecheck-$runId.err"
 
 Write-Host "挂 PCK 解析 patch\ 下所有 .gd ..." -ForegroundColor Cyan
-Start-Process $godot `
-    -ArgumentList @("--headless", "--path", "`"$probe`"", "--script", "`"$probe\parsecheck.gd`"") `
-    -NoNewWindow -Wait -RedirectStandardOutput $out -RedirectStandardError $err | Out-Null
+$probeArguments = @("--headless", "--path", "`"$probe`"", "--script", "`"$probe\parsecheck.gd`"", '--', "`"$Pck`"", "`"$(Join-Path $root 'patch')`"")
+if ($Overlay) { $probeArguments += '"' + $Overlay + '"' }
+$process = Start-Process $Godot `
+    -ArgumentList $probeArguments `
+    -WindowStyle Hidden -Wait -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+if ($process.ExitCode -eq 2 -or -not (Select-String -LiteralPath $out -Pattern '解析自检' -Quiet)) { throw "Probe did not load the PCK; see $err" }
+Write-Host "Probe logs: $out / $err"
 
 # stderr 里 "---- 文件名" 是分隔线，用它把错归到文件上。
 #
@@ -88,6 +97,10 @@ if ($real.Count -gt 0) {
 }
 
 Write-Host "✅ 基类能正常解析的脚本里，没有作用域错误。" -ForegroundColor Green
+$failedScripts = @(Select-String -LiteralPath $out -Pattern '解析失败\(err=').Count
+if ($failedScripts -gt 0) {
+    Write-Host "   原始探针有 $failedScripts 个脚本解析/编译失败，详见日志；本命令只判定作用域错误，不将其称为全部解析通过。" -ForegroundColor Yellow
+}
 if ($unknown.Count -gt 0) {
     Write-Host ("   无法判定（基类在探针里没解析出来，属探针噪音）：{0}" -f ($unknown -join ", ")) -ForegroundColor DarkGray
 }

@@ -1,0 +1,189 @@
+diff --git a/scripts/components/character customization/customization_assigner.gd b/scripts/components/character customization/customization_assigner.gd
+--- a/scripts/components/character customization/customization_assigner.gd
++++ b/scripts/components/character customization/customization_assigner.gd
+@@ -31,6 +31,174 @@ var character_material: StandardMaterial3D
+ 
+ var is_first_shake = true
+ 
++# Mixed suits are derived locally from the player's own original textures.
++# Only the new color ID travels over the existing customization protocol.
++const MP8_MIXED_SUITS: Dictionary = {
++	"mp8_sunset": ["red", "yellow"],
++	"mp8_aurora": ["green", "blue"],
++	"mp8_twilight": ["blue", "purple"],
++}
++static var _mp8_mixed_texture_cache: Dictionary = {}
++static var _mp8_height_mesh: Mesh
++static var _mp8_height_mesh_checked: bool = false
++static var _mp8_height_map_cache: Dictionary = {}
++
++static func _mp8_canonical_height_mesh() -> Mesh:
++	if _mp8_height_mesh != null or _mp8_height_mesh_checked:
++		return _mp8_height_mesh
++	_mp8_height_mesh_checked = true
++	# Read the unmodified model from the user's game. Its UV atlas is shared by
++	# whole-body, cut-off and detached-leg textures. No mesh/texture is shipped.
++	var path := "res://minigames/exploding_collar_race/models/main character2/main character2.glb"
++	if not ResourceLoader.exists(path):
++		return null
++	var scene := load(path) as PackedScene
++	if scene == null:
++		return null
++	var state := scene.get_state()
++	for i in state.get_node_count():
++		if str(state.get_node_path(i)).get_file() != "character mesh":
++			continue
++		for p in state.get_node_property_count(i):
++			if str(state.get_node_property_name(i, p)) == "mesh":
++				_mp8_height_mesh = state.get_node_property_value(i, p) as Mesh
++				return _mp8_height_mesh
++	return null
++
++static func mp8_build_height_map(source: Mesh, size: Vector2i) -> PackedFloat32Array:
++	if source == null or source.get_surface_count() == 0 or size.x <= 0 or size.y <= 0:
++		return PackedFloat32Array()
++	var key := "%d:%dx%d" % [source.get_instance_id(), size.x, size.y]
++	if _mp8_height_map_cache.has(key):
++		return _mp8_height_map_cache[key]
++	var arrays := source.surface_get_arrays(0)
++	var vertices: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
++	var uvs: PackedVector2Array = arrays[Mesh.ARRAY_TEX_UV]
++	if vertices.is_empty() or uvs.size() != vertices.size():
++		return PackedFloat32Array()
++	var indices := PackedInt32Array()
++	if arrays[Mesh.ARRAY_INDEX] != null:
++		indices = arrays[Mesh.ARRAY_INDEX]
++	if indices.is_empty():
++		for i in vertices.size():
++			indices.append(i)
++	if indices.size() % 3 != 0:
++		return PackedFloat32Array()
++	var bottom: float = source.get_aabb().position.y
++	var extent: float = source.get_aabb().size.y
++	if extent <= 0.00001:
++		return PackedFloat32Array()
++	var heights := PackedFloat32Array()
++	heights.resize(size.x * size.y)
++	heights.fill(-1.0)
++	var scale_uv := Vector2(size)
++	for triangle in range(0, indices.size(), 3):
++		var a: int = indices[triangle]
++		var b: int = indices[triangle + 1]
++		var c: int = indices[triangle + 2]
++		if mini(a, mini(b, c)) < 0 or maxi(a, maxi(b, c)) >= vertices.size():
++			continue
++		var origin: Vector2 = uvs[a] * scale_uv
++		var edge_b: Vector2 = (uvs[b] - uvs[a]) * scale_uv
++		var edge_c: Vector2 = (uvs[c] - uvs[a]) * scale_uv
++		var determinant: float = edge_b.cross(edge_c)
++		if absf(determinant) < 0.00001:
++			continue
++		var inverse: float = 1.0 / determinant
++		var lo: Vector2 = origin.min(origin + edge_b).min(origin + edge_c)
++		var hi: Vector2 = origin.max(origin + edge_b).max(origin + edge_c)
++		var h_a: float = (vertices[a].y - bottom) / extent
++		var h_b: float = (vertices[b].y - vertices[a].y) / extent
++		var h_c: float = (vertices[c].y - vertices[a].y) / extent
++		var x_begin: int = maxi(0, int(floor(lo.x)))
++		var x_end: int = mini(size.x, int(ceil(hi.x)))
++		var step_u: float = edge_c.y * inverse
++		var step_v: float = -edge_b.y * inverse
++		for y in range(maxi(0, int(floor(lo.y))), mini(size.y, int(ceil(hi.y)))):
++			var start := Vector2(x_begin + 0.5, y + 0.5) - origin
++			var u: float = start.cross(edge_c) * inverse
++			var v: float = edge_b.cross(start) * inverse
++			var row: int = y * size.x
++			for x in range(x_begin, x_end):
++				if u >= -0.00001 and v >= -0.00001 and u + v <= 1.00001:
++					# Interpolate body height, not a UV coordinate or per-triangle tint.
++					heights[row + x] = clampf(h_a + h_b * u + h_c * v, 0.0, 1.0)
++				u += step_u
++				v += step_v
++	# Extend chart edges into their texture gutters. Bilinear/mip filtering should
++	# not introduce a neutral-colored outline around otherwise matching seams.
++	for _pass in 2:
++		var padded := heights.duplicate()
++		for y in size.y:
++			for x in size.x:
++				var index: int = y * size.x + x
++				if heights[index] >= 0.0:
++					continue
++				var total: float = 0.0
++				var count: int = 0
++				if x > 0 and heights[index - 1] >= 0.0:
++					total += heights[index - 1]
++					count += 1
++				if x + 1 < size.x and heights[index + 1] >= 0.0:
++					total += heights[index + 1]
++					count += 1
++				if y > 0 and heights[index - size.x] >= 0.0:
++					total += heights[index - size.x]
++					count += 1
++				if y + 1 < size.y and heights[index + size.x] >= 0.0:
++					total += heights[index + size.x]
++					count += 1
++				if count > 0:
++					padded[index] = total / count
++		heights = padded
++	for i in heights.size():
++		heights[i] = 1.0 - smoothstep(0.12, 0.86, heights[i]) if heights[i] >= 0.0 else 0.5
++	if _mp8_height_map_cache.size() >= 4:
++		_mp8_height_map_cache.clear()
++	_mp8_height_map_cache[key] = heights
++	return heights
++
++static func mp8_mix_texture(first: Texture, second: Texture, preset: String) -> Texture:
++	if not (first is Texture2D) or not (second is Texture2D):
++		return first if first != null else second
++	var height_source := _mp8_canonical_height_mesh()
++	var source_id: int = height_source.get_instance_id() if height_source != null else 0
++	var key := "%s:%d:%d:%d" % [preset, first.get_instance_id(), second.get_instance_id(), source_id]
++	if _mp8_mixed_texture_cache.has(key):
++		return _mp8_mixed_texture_cache[key]
++	var a: Image = (first as Texture2D).get_image()
++	var b: Image = (second as Texture2D).get_image()
++	if a == null or b == null or a.is_empty() or b.is_empty() or a.get_size() != b.get_size():
++		return first
++	a = a.duplicate()
++	b = b.duplicate()
++	if a.is_compressed() and a.decompress() != OK:
++		return first
++	if b.is_compressed() and b.decompress() != OK:
++		return first
++	a.convert(Image.FORMAT_RGBA8)
++	b.convert(Image.FORMAT_RGBA8)
++	var weights := mp8_build_height_map(height_source, a.get_size())
++	var result := Image.create(a.get_width(), a.get_height(), false, Image.FORMAT_RGBA8)
++	var width: int = a.get_width()
++	var has_weights: bool = not weights.is_empty()
++	for y in a.get_height():
++		var row: int = y * width
++		for x in width:
++			# A missing reference model falls back to an even blend, never UV bands.
++			var weight: float = weights[row + x] if has_weights else 0.5
++			# Common boots, seams, logos and alpha remain exactly as authored.
++			var color_a := a.get_pixel(x, y)
++			var color_b := b.get_pixel(x, y)
++			result.set_pixel(x, y, color_a if weight <= 0.0 else (color_b if weight >= 1.0 else color_a.lerp(color_b, weight)))
++	result.generate_mipmaps()
++	var texture := ImageTexture.create_from_image(result)
++	# Normal/cut-off/leg textures have distinct resource identities.
++	if _mp8_mixed_texture_cache.size() >= 48:
++		_mp8_mixed_texture_cache.clear()
++	_mp8_mixed_texture_cache[key] = texture
++	return texture
++
+ func _ready() -> void :
+ 	if !assigning: return
+ 
+@@ -92,6 +260,10 @@ func get_assigned_hat():
+ 
+ func get_suit_texture(color_name: String) -> Texture:
+ 
++	if MP8_MIXED_SUITS.has(color_name):
++		var colors: Array = MP8_MIXED_SUITS[color_name]
++		return mp8_mix_texture(get_suit_texture(colors[0]), get_suit_texture(colors[1]), color_name)
++
+ 	var texture: Texture
+ 
+ 	if !use_cutoff_textures:

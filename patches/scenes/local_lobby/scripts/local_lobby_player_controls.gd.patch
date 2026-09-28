@@ -1,0 +1,97 @@
+diff --git a/scenes/local_lobby/scripts/local_lobby_player_controls.gd b/scenes/local_lobby/scripts/local_lobby_player_controls.gd
+--- a/scenes/local_lobby/scripts/local_lobby_player_controls.gd
++++ b/scenes/local_lobby/scripts/local_lobby_player_controls.gd
+@@ -19,6 +19,9 @@ const suit_colors = [
+ 	"green", 
+ 	"yellow", 
+ 	"purple", 
++	"mp8_sunset",
++	"mp8_aurora",
++	"mp8_twilight",
+ ]
+ 
+ @export var button_cooldown_duration: float = 0.1
+@@ -164,31 +167,14 @@ func connect_clickable_controls():
+ 	)
+ 
+ func set_container_position(set_to_default: bool):
+-	var pos: Vector2
+-	if set_to_default:
+-		match seat_index:
+-			0:
+-				pos = Vector2(190, 71)
+-			1:
+-				pos = Vector2(345, 128)
+-			2:
+-				pos = Vector2(446, 120)
+-			3:
+-				pos = Vector2(576, 112)
+-	else:
+-		match seat_index:
+-			0:
+-				pos = Vector2(190, 143)
+-			1:
+-				pos = Vector2(345, 200)
+-			2:
+-				pos = Vector2(446, 193)
+-			3:
+-				pos = Vector2(576, 184)
+-	position = pos
++	# Eight fixed cards in the scene's 960x540 logical canvas; never compact holes.
++	set_anchors_preset(Control.PRESET_TOP_LEFT)
++	scale = Vector2.ONE * 0.65
++	position = Vector2(12 + seat_index * 118, 235 if set_to_default else 285)
++	size.x = 170
+ 
+ func set_container_position_name_selection():
+-	position = Vector2(position.x, 127)
++	set_container_position(true)
+ 
+ func set_active_element_from_mouse(_active_element, _direction: int = 0):
+ 
+@@ -219,6 +205,7 @@ func clear_active_element():
+ 
+ func set_player_ready(_is_ready: bool):
+ 	is_ready = _is_ready
++	_mp8_refresh_identity()
+ 
+ 	if is_ready:
+ 		ready_toggle.texture = ready_texture
+@@ -258,7 +245,7 @@ func set_active(
+ 
+ 	if rejoin_player_data:
+ 		var customization = rejoin_player_data.get("customization", [
+-			"none", "none", suit_colors[_player_id]
++			"none", "none", suit_colors[_player_id % suit_colors.size()]
+ 		])
+ 		customization_assigner.assign_hat(customization[0])
+ 		customization_assigner.assign_glasses(customization[1])
+@@ -266,7 +253,7 @@ func set_active(
+ 	else:
+ 		customization_assigner.assign_hat("none")
+ 		customization_assigner.assign_glasses("none")
+-		customization_assigner.assign_suit_color(suit_colors[_player_id])
++		customization_assigner.assign_suit_color(suit_colors[_player_id % suit_colors.size()])
+ 
+ 	for child in get_children():
+ 		child.visible = false
+@@ -497,8 +484,8 @@ func _on_name_confirmed(_name):
+ 
+ 	set_container_position(true)
+ 
+-	name_label.text = _name
+ 	player_name = _name
++	_mp8_refresh_identity()
+ 
+ 	for child in get_children():
+ 		child.visible = true
+@@ -514,3 +501,9 @@ func _on_name_confirmed(_name):
+ 
+ 	active = true
+ 	can_control = true
++
++func _mp8_refresh_identity() -> void:
++	if assigned_player_id < 0:
++		return
++	var device_text: String = "PAD %d" % (device + 1) if is_joystick else "KEYBOARD"
++	name_label.text = "P%d  %s\n%s  %s" % [assigned_player_id + 1, player_name, device_text, "READY" if is_ready else "NOT READY"]

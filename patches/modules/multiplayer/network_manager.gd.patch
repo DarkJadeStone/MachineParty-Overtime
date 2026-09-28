@@ -1,7 +1,7 @@
 diff --git a/modules/multiplayer/network_manager.gd b/modules/multiplayer/network_manager.gd
 --- a/modules/multiplayer/network_manager.gd
 +++ b/modules/multiplayer/network_manager.gd
-@@ -1,8 +1,13 @@
+@@ -1,8 +1,35 @@
  extends Node
  
 -const MAX_PLAYERS: int = 4
@@ -11,12 +11,34 @@ diff --git a/modules/multiplayer/network_manager.gd b/modules/multiplayer/networ
 +# [MP8] mod 版本号。**发布新版就改这里**，它会被追加进 Globals.game_version，
 +# 直接决定"谁能跟谁联机"（见 _ready() 里那段版本握手）。
 +# 格式随意但要短：主菜单右下角显示的是 `原版号+本标签`，太长会顶出去。
-+const MP8_VERSION_TAG: String = "overtime-1.6"
++const MP8_VERSION_TAG: String = "overtime-1.7"
++const MP8_TEST_BUILD: bool = false # Only an explicit source test build/editor unlocks gameplay tools.
++
++
++func mp8_development_tools_allowed() -> bool :
++	return MP8_TEST_BUILD or OS.has_feature("editor")
++
++
++# One locale policy for mainline UI; language never participates in the handshake.
++func mp8_locale(raw: String = "") -> String :
++	var value: String = (TranslationServer.get_locale() if raw.is_empty() else raw).to_upper().replace("-", "_")
++	if value == "ZHT" or value == "ZH_TW" or value == "ZH_HK" or value == "ZH_MO" or value.begins_with("ZH_HANT"):
++		return "ZHT"
++	if value == "ZHS" or value == "ZH" or value == "ZH_CN" or value == "ZH_SG" or value.begins_with("ZH_HANS"):
++		return "ZHS"
++	return "EN"
++
++
++func _mp8_text(en: String, zhs: String, zht: String) -> String :
++	match mp8_locale():
++		"ZHS": return zhs
++		"ZHT": return zht
++	return en
 +
  enum NetworkBackendType{
  	Enet, Steam
  }
-@@ -18,7 +23,77 @@ var game_scene: PackedScene
+@@ -18,7 +45,77 @@ var game_scene: PackedScene
  
  var players: Dictionary
  var players_loaded: Array
@@ -95,7 +117,7 @@ diff --git a/modules/multiplayer/network_manager.gd b/modules/multiplayer/networ
  
  signal backend_ready()
  signal on_server_created()
-@@ -42,14 +117,670 @@ signal player_removed_from_join_queue(network_id)
+@@ -42,14 +139,670 @@ signal player_removed_from_join_queue(network_id)
  
  func _ready() -> void :
  
@@ -128,12 +150,13 @@ diff --git a/modules/multiplayer/network_manager.gd b/modules/multiplayer/networ
 +		print("[MP8] 版本握手：game_version = %s" % Globals.game_version)
 +
  	var args = Array(OS.get_cmdline_args())
- 	if args.has("-trailer"):
+-	if args.has("-trailer"):
++	if mp8_development_tools_allowed() and args.has("-trailer"):
  		max_player_count = MAX_DEBUG_PLAYERS
  
 -	if not OS.has_feature("editor"):
 +	# [MP8] 带 -debug-tools 启动时不强制 Steam，保留默认的 Enet 后端（本机多开测试用）
-+	if not OS.has_feature("editor") and not args.has("-debug-tools"):
++	if not OS.has_feature("editor") and not (mp8_development_tools_allowed() and args.has("-debug-tools")):
  		active_backend_type = NetworkBackendType.Steam
  		create_backend()
  
@@ -146,7 +169,7 @@ diff --git a/modules/multiplayer/network_manager.gd b/modules/multiplayer/networ
 +		_mp8_uid_selftest()
 +
 +	# [MP8] 出生点补位钩子
-+	_mp8_no_topup = args.has("mp8notopup")
++	_mp8_no_topup = mp8_development_tools_allowed() and args.has("mp8notopup")
 +	# [MP8] 侦察日志 opt-in：编辑器 / -debug-tools 测试台 / 显式 mp8audit 才打。
 +	# 发布版双击启动什么都不传 → 天然安静。
 +	var _mp8_dbg: bool = OS.has_feature("editor") or args.has("-debug-tools") or args.has("mp8audit")
@@ -171,7 +194,7 @@ diff --git a/modules/multiplayer/network_manager.gd b/modules/multiplayer/networ
 +	# 于是新房间只能进 4 个人，且没有任何提示。
 +	#
 +	# 所以：不管那个窗口里谁写过什么，这里一律拉回来，然后才上锁。
-+	_mp8_cap_want = MAX_DEBUG_PLAYERS if args.has("-trailer") else MAX_PLAYERS
++	_mp8_cap_want = MAX_DEBUG_PLAYERS if mp8_development_tools_allowed() and args.has("-trailer") else MAX_PLAYERS
 +	if max_player_count != _mp8_cap_want:
 +		push_warning("[MP8] 上锁前发现容量被改成了 %d（多半是某个 mod 在 _mod_ready 里写的），拉回 %d" % [max_player_count, _mp8_cap_want])
 +	max_player_count = _mp8_cap_want
@@ -767,7 +790,7 @@ diff --git a/modules/multiplayer/network_manager.gd b/modules/multiplayer/networ
  func is_active() -> bool:
  
  	if not multiplayer:
-@@ -81,6 +812,12 @@ func set_game_scene(_game_scene: PackedScene):
+@@ -81,6 +834,14 @@ func set_game_scene(_game_scene: PackedScene):
  
  func create_backend():
  
@@ -776,11 +799,13 @@ diff --git a/modules/multiplayer/network_manager.gd b/modules/multiplayer/networ
 +	# （见 _mp8_on_raw_peer_disconnected）。
 +	_mp8_peer_versions.clear()
 +	_mp8_peers_accepted.clear()
++	_mp8_host_version = ""
++	_mp8_hello_waiting.clear()
 +
  	if active_backend:
  
  		active_backend.free()
-@@ -269,3 +1006,420 @@ func remove_player_rpc(_network_id: int):
+@@ -269,3 +1030,396 @@ func remove_player_rpc(_network_id: int):
  		var player_info = active_backend.connected_players[_network_id]
  		active_backend.disconnected_players[_network_id] = player_info
  		active_backend.connected_players.erase(_network_id)
@@ -905,6 +930,8 @@ diff --git a/modules/multiplayer/network_manager.gd b/modules/multiplayer/networ
 +var _mp8_host_version: String = ""              # 客机侧：房主报来的完整版本串
 +var _mp8_peer_versions: Dictionary = {}         # 房主侧：network_id -> 对方版本串
 +var _mp8_peers_accepted: Dictionary = {}        # 房主侧：真正被收编过的 peer（见下）
++var _mp8_hello_waiting: Dictionary = {}        # engine-connected peers explicitly sent a hello
++var _mp8_network_reject_at: int = -5000
 +
 +
 +# 🩸 2026-09-03 实测修正：钩子原先挂的是 `on_peer_connected`，**那个信号对被拒的人根本不发**。
@@ -947,9 +974,11 @@ diff --git a/modules/multiplayer/network_manager.gd b/modules/multiplayer/networ
 +# 房主：任何人一连上（**在版本检查之前**）就先报一次自己的版本。
 +func _mp8_on_raw_peer_connected(network_id: int) -> void :
 +
-+	if not multiplayer.is_server():
++	if not multiplayer.is_server() or network_id <= 0 or network_id == get_multiplayer_authority() \
++			or not multiplayer.get_peers().has(network_id) or _mp8_hello_waiting.has(network_id):
 +		return
 +
++	_mp8_hello_waiting[network_id] = true
 +	mp8_hello_rpc.rpc_id(network_id, Globals.game_version)
 +
 +
@@ -958,6 +987,7 @@ diff --git a/modules/multiplayer/network_manager.gd b/modules/multiplayer/networ
 +
 +	var theirs: String = String(_mp8_peer_versions.get(network_id, ""))
 +	_mp8_peer_versions.erase(network_id)
++	_mp8_hello_waiting.erase(network_id)
 +
 +	if not multiplayer.is_server():
 +		return
@@ -972,17 +1002,47 @@ diff --git a/modules/multiplayer/network_manager.gd b/modules/multiplayer/networ
 +	mp8_join_blocked.emit(_mp8_blocked_text_for_host(theirs))
 +
 +
-+@rpc("any_peer", "call_remote", "reliable")
++@rpc("authority", "call_remote", "reliable")
 +func mp8_hello_rpc(full_version: String) -> void :
++	var sender: int = multiplayer.get_remote_sender_id()
++	if multiplayer.is_server() or sender <= 0 or sender != get_multiplayer_authority() \
++			or not multiplayer.get_peers().has(sender) or not _mp8_valid_version(full_version):
++		_mp8_network_reject("hello", sender)
++		return
++	if not _mp8_host_version.is_empty():
++		return
 +	_mp8_host_version = full_version
-+	mp8_hello_back_rpc.rpc_id(1, Globals.game_version)
++	mp8_hello_back_rpc.rpc_id(get_multiplayer_authority(), Globals.game_version)
 +
 +
 +@rpc("any_peer", "call_remote", "reliable")
 +func mp8_hello_back_rpc(full_version: String) -> void :
 +	if not multiplayer.is_server():
 +		return
-+	_mp8_peer_versions[multiplayer.get_remote_sender_id()] = full_version
++	var sender: int = multiplayer.get_remote_sender_id()
++	if sender <= 0 or sender == get_multiplayer_authority() or not multiplayer.get_peers().has(sender) \
++			or not _mp8_hello_waiting.has(sender) or not _mp8_valid_version(full_version):
++		_mp8_network_reject("hello-reply", sender)
++		return
++	_mp8_hello_waiting.erase(sender)
++	_mp8_peer_versions[sender] = full_version
++
++
++func _mp8_valid_version(value: String) -> bool :
++	if value.is_empty() or value.length() > 128:
++		return false
++	for i in value.length():
++		var c: int = value.unicode_at(i)
++		if not ((c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c in [43, 45, 46, 95]):
++			return false
++	return true
++
++
++func _mp8_network_reject(event: String, sender: int) -> void :
++	var now: int = Time.get_ticks_msec()
++	if now - _mp8_network_reject_at >= 5000:
++		_mp8_network_reject_at = now
++		print("[MP8-NET] rejected event=%s sender=%d" % [event, sender])
 +
 +
 +# 从完整版本串里拆出 mod 标签（没有就是空串 = 原版）。串长这样：`v2.1.2+overtime-1.5`
@@ -991,21 +1051,8 @@ diff --git a/modules/multiplayer/network_manager.gd b/modules/multiplayer/networ
 +	return "" if i < 0 else full_version.substr(i + 1)
 +
 +
-+# 版本号比大小：`overtime-1.5` → [1, 5]，逐段比。
-+# 认不出来的一律当相等（宁可少说一句，也不要说反）。
-+func _mp8_cmp_tag(a: String, b: String) -> int:
-+	var pa := a.trim_prefix("overtime-").split(".")
-+	var pb := b.trim_prefix("overtime-").split(".")
-+	for i in maxi(pa.size(), pb.size()):
-+		var x: int = int(pa[i]) if i < pa.size() and pa[i].is_valid_int() else 0
-+		var y: int = int(pb[i]) if i < pb.size() and pb[i].is_valid_int() else 0
-+		if x != y:
-+			return -1 if x < y else 1
-+	return 0
-+
-+
 +func _mp8_zh() -> bool:
-+	return TranslationServer.get_locale().to_upper().begins_with("ZH")
++	return mp8_locale() != "EN"
 +
 +
 +# ── 客机侧：被拒时显示什么 ──────────────────────────────────────────────
@@ -1052,88 +1099,43 @@ diff --git a/modules/multiplayer/network_manager.gd b/modules/multiplayer/networ
 +
 +
 +func mp8_mismatch_text() -> String:
-+
-+	var zh: bool = _mp8_zh()
 +	var mine: String = Globals.game_version
 +	var theirs: String = _mp8_host_version
-+
-+	# ③ 房主没回报版本 → 原版，或者早于 MP8_HELLO_SINCE（那些版本不回报）。
-+	#    这两者分不开，所以只陈述可观测的事实「未回报」，不断言「房主没装」。
++	print("[MP8-VERSION] mismatch self=%s host=%s" % [mine, theirs])
 +	if theirs.is_empty():
-+		if zh:
-+			return ("连接失败：版本不一致。房主未回报 Overtime 版本，可能未安装或低于 "
-+				+ MP8_HELLO_SINCE + "。\n您的版本：" + mine)
-+		return ("Version mismatch: the host reported no Overtime version.\nYour build: " + mine)
++		return _mp8_text("Host build unreported. Compare versions and sources.\nYou %s; full details in the game log.",
++			"房主未回报版本。请核对完整版本及下载来源。\n您 %s；完整信息见游戏日志。",
++			"房主未回報版本。請核對完整版本及下載來源。\n您 %s；完整資訊見遊戲日誌。") % _mp8_version_brief(mine)
++	if mine == theirs:
++		return _mp8_text("Connection refused; reported builds match.\nCheck the game log and download sources.",
++			"连接被拒，但回报的版本相同。\n请核对游戏日志及下载来源。",
++			"連線被拒，但回報的版本相同。\n請核對遊戲日誌及下載來源。")
++	if not _mp8_tag_of(mine).is_empty() and _mp8_tag_of(mine) == _mp8_tag_of(theirs) and _mp8_base_of(mine) != _mp8_base_of(theirs):
++		return _mp8_text("Same Overtime tag; game versions differ.\nYou %s / Host %s",
++			"Overtime 标签相同，游戏版本不同。\n您 %s ／ 房主 %s",
++			"Overtime 標籤相同，遊戲版本不同。\n您 %s ／ 房主 %s") % [_mp8_version_brief(_mp8_base_of(mine)), _mp8_version_brief(_mp8_base_of(theirs))]
++	return _mp8_text("Builds differ. Compare full versions and sources.\nYou %s / Host %s (game log)",
++		"版本不一致。请核对完整版本及下载来源。\n您 %s ／ 房主 %s（见游戏日志）",
++		"版本不一致。請核對完整版本及下載來源。\n您 %s ／ 房主 %s（見遊戲日誌）") % [_mp8_version_brief(mine), _mp8_version_brief(theirs)]
 +
-+	var my_tag: String = _mp8_tag_of(mine)
-+	var their_tag: String = _mp8_tag_of(theirs)
-+	var cmp: int = _mp8_cmp_tag(my_tag, their_tag)
 +
-+	# 版本行只列**有差异的那一段**：①② 差在 mod 版本，⑤ 差在游戏本体。
-+	# 两条完整串放不进 3 行，而且这几种情形玩家两边版本都知道，不需要转发完整串。
-+	# （只有情形 ③ 保留完整串 —— 那正是要发给房主去核对的东西。）
-+
-+	# ⑤ mod 版本相同却仍被拒 → 差的是游戏本体
-+	if cmp == 0:
-+		if zh:
-+			return ("连接失败：Overtime 版本相同，游戏本体版本不同。\n您 "
-+				+ _mp8_base_of(mine) + " ／ 房主 " + _mp8_base_of(theirs))
-+		return ("Version mismatch: same Overtime build, different game version.\nYou "
-+			+ _mp8_base_of(mine) + " · Host " + _mp8_base_of(theirs))
-+
-+	# ① 我的版本较旧
-+	if cmp < 0:
-+		if zh:
-+			return ("连接失败：您的 Overtime 版本低于房主，请下载新版重新安装。\n您 "
-+				+ _mp8_tag_num(mine) + " ／ 房主 " + _mp8_tag_num(theirs))
-+		return ("Version mismatch: your Overtime build is older.\nYou "
-+			+ _mp8_tag_num(mine) + " · Host " + _mp8_tag_num(theirs))
-+
-+	# ② 我的版本较新
-+	if zh:
-+		return ("连接失败：您的 Overtime 版本高于房主，请房主更新至相同版本。\n您 "
-+			+ _mp8_tag_num(mine) + " ／ 房主 " + _mp8_tag_num(theirs))
-+	return ("Version mismatch: your Overtime build is newer.\nYou "
-+		+ _mp8_tag_num(mine) + " · Host " + _mp8_tag_num(theirs))
++func _mp8_version_brief(value: String) -> String :
++	var tag: String = _mp8_tag_num(value)
++	var shown: String = tag if not tag.is_empty() else value
++	return shown if shown.length() <= 18 else shown.left(17) + "…"
 +
 +
 +# ── 房主侧：④ 有人进不来时，给房主的一行提示 ────────────────────────────
 +# 这是第四种情形（对方没装 mod）**唯一**能说话的地方，见本节开头的说明。
 +func _mp8_blocked_text_for_host(their_version: String) -> String:
-+
-+	# ⚠️ 这条的落点是**大厅消息条**（lobby_handler.send_lobby_message），
-+	#    与客机那个弹窗是两个控件，长度上限**没量过**。先按短的写。
-+	var zh: bool = _mp8_zh()
-+	var tag: String = MP8_VERSION_TAG.trim_prefix("overtime-")
-+
-+	# 不写死「低于 X」：这条是给房主看的，而房主自己的 tag 与 MP8_HELLO_SINCE
-+	# 在开发期并不相等，写两个数会自相矛盾（实测：「低于 1.6。本房间为 1.5。」）。
++	print("[MP8-VERSION] unaccepted peer=%s lobby=%s" % [their_version, Globals.game_version])
 +	if their_version.is_empty():
-+		if zh:
-+			return ("一名玩家因版本不一致被拒绝加入：对方未安装 Overtime，或版本过旧。"
-+				+ "本房间为 " + tag + "。")
-+		return ("A player was refused: no Overtime, or a build too old. This lobby is on "
-+			+ tag + ".")
-+
-+	var their_tag: String = _mp8_tag_num(their_version)
-+	if their_tag.is_empty():
-+		if zh:
-+			return "一名玩家因版本不一致被拒绝加入：对方使用原版。本房间为 " + tag + "。"
-+		return "A player was refused: they are on vanilla. This lobby is on " + tag + "."
-+
-+	var cmp: int = _mp8_cmp_tag(_mp8_tag_of(their_version), MP8_VERSION_TAG)
-+	if cmp == 0:
-+		if zh:
-+			return ("一名玩家因版本不一致被拒绝加入：Overtime 版本相同，游戏本体版本不同"
-+				+ "（对方 " + _mp8_base_of(their_version) + "）。")
-+		return ("A player was refused: same Overtime build, different game version (theirs "
-+			+ _mp8_base_of(their_version) + ").")
-+
-+	if zh:
-+		return ("一名玩家因版本不一致被拒绝加入：对方 Overtime " + their_tag
-+			+ "，本房间 " + tag + "。")
-+	return ("A player was refused: their Overtime " + their_tag
-+		+ ", this lobby " + tag + ".")
++		return _mp8_text("A connection ended without a reported build. Check versions and sources.",
++			"一名玩家未入房且未回报版本，请核对完整版本及来源。",
++			"一名玩家未入房且未回報版本，請核對完整版本及來源。")
++	return _mp8_text("Player build %s / lobby %s. Check full versions and sources in the game log.",
++		"对方 %s ／ 本房间 %s。请在游戏日志中核对完整版本及来源。",
++		"對方 %s ／ 本房間 %s。請在遊戲日誌中核對完整版本及來源。") % [_mp8_version_brief(their_version), MP8_VERSION_TAG.trim_prefix("overtime-")]
 +
 +
 +# ═════════════ [MP8] Steam 房间人数上限的重新宣示 ═════════════
@@ -1200,4 +1202,3 @@ diff --git a/modules/multiplayer/network_manager.gd b/modules/multiplayer/networ
 +	else:
 +		if Steam.has_method("setLobbyMemberLimit"):
 +			Steam.setLobbyMemberLimit(lobby_id, max_player_count)
-+

@@ -49,7 +49,7 @@ diff --git a/scripts/scenes/game/game.gd b/scripts/scenes/game/game.gd
 +		if s.begins_with("mp8game="):
 +			mp8_forced = int(s.substr(8))
 +
-+	if mp8_forced >= 0 and Globals.MinigameIdentifier.values().has(mp8_forced):
++	if NetworkManager.mp8_development_tools_allowed() and mp8_forced >= 0 and Globals.MinigameIdentifier.values().has(mp8_forced):
 +
 +		for i in session_minigame_list.size():
 +			session_minigame_list[i] = mp8_forced
@@ -63,23 +63,23 @@ diff --git a/scripts/scenes/game/game.gd b/scripts/scenes/game/game.gd
  
  func check_player_game_state():
  
-@@ -448,6 +482,12 @@ func load_minigame(minigame_identifier: Globals.MinigameIdentifier, _is_round: b
- 		DecalManager.clear_rpc.rpc()
- 		PropManager.clear_rpc.rpc()
+@@ -437,6 +471,9 @@ func player_ready_rpc(_network_id: int, _reconnect: bool):
  
-+		# [MP8] 重开投票用：本轮开始的分数快照 + 清掉上一轮的票。见文件末尾那一段。
-+		# 拍在这里正好是「本轮开始」—— 上一轮的分数在 update_scores() 里已经入账，
-+		# 之后才轮到 load_minigame（见 minigame_playing_state.gd 的 _on_minigame_finished）。
-+		_mp8_round_score_snapshot = round_score_by_network_id.duplicate(true)
-+		_mp8_vote_clear()
-+
- 	if minigame != null:
+ func load_minigame(minigame_identifier: Globals.MinigameIdentifier, _is_round: bool, _total_rounds: int = -1, ):
  
- 		minigame.minigame_loaded.disconnect(_on_minigame_loaded)
-@@ -456,8 +496,20 @@ func load_minigame(minigame_identifier: Globals.MinigameIdentifier, _is_round: b
++	_mp8_load_serial += 1
++	var load_serial: int = _mp8_load_serial
++	_mp8_round_close("load")
+ 	Globals.current_minigame_identifier = minigame_identifier
+ 
+ 	if multiplayer.is_server():
+@@ -455,10 +492,28 @@ func load_minigame(minigame_identifier: Globals.MinigameIdentifier, _is_round: b
+ 
  		minigame.cleanup_rpc.rpc()
  		await get_tree().create_timer(1.0).timeout
- 
++		if load_serial != _mp8_load_serial:
++			return # A later load/cleanup has already taken ownership of this handoff.
++
 +	# [MP8] 崩溃面包屑。硬崩（0xc0000005）会丢掉缓冲区里没刷出去的 stdout，
 +	# 所以 print() 的日志不可信——必须每写一条就关文件，强制落盘。
 +	# 落点：user://mp8_trace.txt，即
@@ -87,7 +87,7 @@ diff --git a/scripts/scenes/game/game.gd b/scripts/scenes/game/game.gd
 +	_mp8_trace("load_minigame 开始 id=%d 路径=%s" % [
 +		minigame_identifier, str(Globals.MinigamePaths.get(minigame_identifier, "<无此键>"))
 +	])
-+
+ 
  	var minigame_scene: PackedScene = load(Globals.MinigamePaths[minigame_identifier])
 +	_mp8_trace("场景 load 完成 null=%s" % str(minigame_scene == null))
 +
@@ -95,9 +95,14 @@ diff --git a/scripts/scenes/game/game.gd b/scripts/scenes/game/game.gd
 +	_mp8_trace("instantiate 完成")
 +
  	minigame = minigame_instance
++	if multiplayer.is_server():
++		# Bind before add_child: ready/finished signals can run synchronously there.
++		# Loading is deliberately eligible; a round need not reach Play to be rescued.
++		_mp8_round_open(int(minigame_identifier))
  
  	minigame.host_loaded.connect(_on_host_minigame_loaded)
-@@ -479,7 +531,154 @@ func load_minigame(minigame_identifier: Globals.MinigameIdentifier, _is_round: b
+ 	minigame.minigame_loaded.connect(_on_minigame_loaded)
+@@ -479,10 +534,161 @@ func load_minigame(minigame_identifier: Globals.MinigameIdentifier, _is_round: b
  
  	GameManager.minigame_loaded.emit(minigame_identifier)
  	GameManager.current_minigame_identifier = minigame_identifier
@@ -113,6 +118,8 @@ diff --git a/scripts/scenes/game/game.gd b/scripts/scenes/game/game.gd
 +	# 上面清票那句在 is_server() 块里，客机走不到；不在这里补一次的话，
 +	# 客机的 ESC 按钮显隐不会跟着 minigame 变。
 +	_mp8_vote_refresh_ui()
++	if multiplayer.is_server():
++		_mp8_vote_broadcast(int(_mp8_vote_roster().size() / 2) + 1)
 +
 +
 +# ═══════════════════════════════════════════════════════════════════════════
@@ -252,7 +259,41 @@ diff --git a/scripts/scenes/game/game.gd b/scripts/scenes/game/game.gd
  
  func update_scores(more_rounds: bool):
  
-@@ -643,9 +842,62 @@ func _on_peer_disconnected(_network_id: int):
++	_mp8_round_close("scores")
++	print("[MP8-HANDOFF] scores round=%d more=%s" % [session_current_minigame_round, more_rounds])
+ 	if is_current_game_cutscene():
+ 		for key in game_score_by_network_id.keys():
+ 			game_score_by_network_id[key] = 0
+@@ -490,7 +696,7 @@ func update_scores(more_rounds: bool):
+ 			round_score_by_network_id[key] = 0
+ 
+ 	for k in game_score_by_network_id.keys():
+-		game_score_by_network_id[k] += round_score_by_network_id[k]
++		game_score_by_network_id[k] += round_score_by_network_id.get(k, 0)
+ 
+ 	if not more_rounds:
+ 		for k in game_score_by_network_id.keys():
+@@ -514,6 +720,9 @@ func clear_game_scores():
+ @rpc("authority", "call_local", "reliable")
+ func clear_minigame_rpc(was_cutscene_minigame: bool):
+ 
++	_mp8_load_serial += 1 # Cancel any older load waiting for its cleanup timer.
++	_mp8_round_close("cleanup")
++	print("[MP8-HANDOFF] cleanup cutscene=%s" % was_cutscene_minigame)
+ 	MusicManager.filter_controller.begin_shift(MusicManager.filter_controller.effect_low_pass.cutoff_hz, 300, 0)
+ 
+ 	if multiplayer.is_server():
+@@ -621,6 +830,9 @@ func _on_peer_disconnected(_network_id: int):
+ 
+ 	NetworkManager.remove_player_rpc.rpc(_network_id)
+ 	PlayerManager.remove_player_rpc.rpc(_network_id)
++	if multiplayer.is_server() and _mp8_round_active:
++		_mp8_vote_yes.erase(_network_id)
++		_mp8_vote_recount()
+ 
+ 	if player_join_queue.has(_network_id):
+ 		player_join_queue.erase(_network_id)
+@@ -643,9 +855,62 @@ func _on_peer_disconnected(_network_id: int):
  		)
  		intermission_manager.screen_briefing.update_player_data_rpc.rpc(total_score_by_network_id)
  
@@ -315,7 +356,7 @@ diff --git a/scripts/scenes/game/game.gd b/scripts/scenes/game/game.gd
  func _on_minigame_pick_finished(minigame_index: int):
  	if debug_no_shuffle:
  		minigame_index = 0
-@@ -707,15 +959,62 @@ func _on_host_overlay_minigame_selected(minigame_identifier: Globals.MinigameIde
+@@ -707,15 +972,62 @@ func _on_host_overlay_minigame_selected(minigame_identifier: Globals.MinigameIde
  
  	load_minigame(minigame_identifier, false, 1)
  
@@ -380,7 +421,7 @@ diff --git a/scripts/scenes/game/game.gd b/scripts/scenes/game/game.gd
  
  func _on_score_screen_finished():
  
-@@ -774,3 +1073,560 @@ func _viewport_size_changed():
+@@ -774,3 +1086,755 @@ func _viewport_size_changed():
  	for cr in effect_rects:
  		cr.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
  		cr.set_deferred("size", vp_size)
@@ -418,12 +459,34 @@ diff --git a/scripts/scenes/game/game.gd b/scripts/scenes/game/game.gd
 +
 +const MP8_VOTE_KEY: int = KEY_F5              # F1/F2/F9 被原版调试占了，F5 空着
 +const MP8_VOTE_COUNTDOWN: float = 5.0         # 过半后的自动确认倒计时（秒）
++const MP8_VOTE_AGREE_INTERVAL_MS: int = 500
++const MP8_VOTE_COOLDOWN_MS: int = 10000
 +
 +# —— 服务器权威状态 ——
 +var _mp8_vote_yes: Dictionary = {}            # network_id -> true，只在服务器上有意义
 +var _mp8_vote_deadline: float = -1.0          # < 0 = 没在倒计时
 +var _mp8_vote_beat: float = 0.0               # 每秒广播一次的节拍器
 +var _mp8_round_score_snapshot: Dictionary = {}
++var _mp8_load_serial: int = 0
++var _mp8_round_epoch: int = 0
++var _mp8_round_active: bool = false
++var _mp8_round_instance: int = 0
++var _mp8_round_identifier: int = -1
++var _mp8_round_slot: int = -1
++var _mp8_round_number: int = 0
++var _mp8_round_snapshot_valid: bool = false
++var _mp8_vote_last_need: int = 0
++var _mp8_vote_view_epoch: int = 0
++var _mp8_vote_view_open: bool = false
++var _mp8_round_participants: Dictionary = {}
++var _mp8_vote_roster_cache: Dictionary = {}
++var _mp8_vote_last_agree_ms: Dictionary = {}
++var _mp8_vote_cooldown_until_ms: int = 0
++var _mp8_vote_view_cooldown: float = 0.0
++var _mp8_vote_view_eligible: PackedInt32Array = PackedInt32Array()
++var _mp8_vote_notice_until_ms: int = 0
++var _mp8_vote_ui_locale: String = ""
++var _mp8_vote_reject_log_ms: int = -5000
 +
 +# —— 本端看到的状态（HUD 与 ESC 按钮共用）——
 +# 广播的是**投票者 id 数组**而不是票数：客户端要靠它算出「我投没投」和「谁投了」，
@@ -472,6 +535,9 @@ diff --git a/scripts/scenes/game/game.gd b/scripts/scenes/game/game.gd
 +		"btn_vote": "Restart Round (%d/%d)",
 +		"btn_undo": "Withdraw Vote (%d/%d)",
 +		"btn_go": "Restarting · %d s",
++		"cooldown": "Restart available in %d s",
++		"next_round": "Restart vote: next round",
++		"rate": "Please wait before agreeing again",
 +	},
 +	"ZHS": {
 +		"title": "重开本轮投票",
@@ -491,6 +557,9 @@ diff --git a/scripts/scenes/game/game.gd b/scripts/scenes/game/game.gd
 +		"btn_vote": "重开本轮（%d/%d）",
 +		"btn_undo": "撤回投票（%d/%d）",
 +		"btn_go": "重开本轮 · %d 秒",
++		"cooldown": "%d 秒后可再次发起重开",
++		"next_round": "下一轮可参与重开投票",
++		"rate": "请稍候再投同意票",
 +	},
 +	"ZHT": {
 +		"title": "重開本輪投票",
@@ -510,6 +579,9 @@ diff --git a/scripts/scenes/game/game.gd b/scripts/scenes/game/game.gd
 +		"btn_vote": "重開本輪（%d/%d）",
 +		"btn_undo": "撤回投票（%d/%d）",
 +		"btn_go": "重開本輪 · %d 秒",
++		"cooldown": "%d 秒後可再次發起重開",
++		"next_round": "下一輪可參與重開投票",
++		"rate": "請稍候再投同意票",
 +	},
 +}
 +
@@ -524,6 +596,61 @@ diff --git a/scripts/scenes/game/game.gd b/scripts/scenes/game/game.gd
 +
 +
 +# --------------------- 输入 ---------------------
++
++# The server owns a generation for one concrete scene/playlist slot/round.
++# Neither a delayed request nor a pending countdown may cross this boundary.
++func _mp8_round_open(identifier: int) -> void :
++	_mp8_round_epoch += 1
++	_mp8_round_identifier = identifier
++	_mp8_round_slot = session_minigame_index
++	_mp8_round_number = session_current_minigame_round
++	_mp8_round_instance = minigame.get_instance_id()
++	_mp8_round_score_snapshot = round_score_by_network_id.duplicate(true)
++	_mp8_round_snapshot_valid = true # An empty dictionary is also a valid snapshot.
++	_mp8_round_active = true
++	_mp8_vote_view_epoch = _mp8_round_epoch
++	_mp8_vote_view_open = true
++	_mp8_round_participants.clear()
++	for id in PlayerManager.player_presences:
++		var presence = PlayerManager.player_presences[id]
++		if is_instance_valid(presence) and not presence.debug_player:
++			_mp8_round_participants[id] = true
++	_mp8_vote_roster_cache = _mp8_vote_roster()
++	_mp8_vote_view_eligible = PackedInt32Array(_mp8_vote_roster_cache.keys())
++	_mp8_vote_view_cooldown = _mp8_vote_cooldown_remaining()
++	print("[MP8-HANDOFF] open epoch=%d id=%d slot=%d round=%d" % [
++		_mp8_round_epoch, identifier, _mp8_round_slot, _mp8_round_number])
++
++
++func _mp8_round_close(reason: String) -> void :
++	if multiplayer.is_server():
++		if _mp8_round_active:
++			print("[MP8-HANDOFF] close epoch=%d reason=%s" % [_mp8_round_epoch, reason])
++			_mp8_round_epoch += 1
++		_mp8_round_active = false
++		_mp8_round_snapshot_valid = false
++	_mp8_vote_view_open = false
++	_mp8_vote_clear()
++
++
++func _mp8_round_matches() -> bool :
++	return _mp8_round_active and _mp8_round_snapshot_valid \
++		and is_instance_valid(minigame) and not minigame.is_queued_for_deletion() \
++		and minigame.get_instance_id() == _mp8_round_instance \
++		and session_current_minigame_round == _mp8_round_number \
++		and session_minigame_index == _mp8_round_slot \
++		and _mp8_round_slot >= 0 and _mp8_round_slot < session_minigame_list.size() \
++		and int(session_minigame_list[_mp8_round_slot]) == _mp8_round_identifier
++
++
++# Called by the session's Finished handler before it increments rounds or scores.
++# Claiming the round closes voting before either normal completion or restart acts.
++func mp8_claim_round_finish(instance_id: int, epoch: int) -> bool :
++	if not multiplayer.is_server() or epoch != _mp8_round_epoch \
++			or instance_id != _mp8_round_instance or not _mp8_round_matches():
++		return false
++	_mp8_round_close("finished")
++	return true
 +
 +func _unhandled_key_input(event: InputEvent) -> void :
 +
@@ -540,41 +667,105 @@ diff --git a/scripts/scenes/game/game.gd b/scripts/scenes/game/game.gd
 +# F5 与 ESC 按钮共用的入口。
 +func _mp8_vote_press() -> void :
 +
++	if not _mp8_vote_view_open:
++		return
++	var agree: bool = not _mp8_vote_view.has(_mp8_vote_local_id())
 +	# 没联机（本地/单人）时直接走本地路径 —— 没有 peer 时 rpc_id 会报错
 +	if not multiplayer.has_multiplayer_peer():
-+		_mp8_vote_rpc()
++		_mp8_vote_rpc(_mp8_vote_view_epoch, agree)
 +	else:
-+		_mp8_vote_rpc.rpc_id(1)
++		_mp8_vote_rpc.rpc_id(get_multiplayer_authority(), _mp8_vote_view_epoch, agree)
 +
 +
 +# --------------------- 服务器侧 ---------------------
 +
 +@rpc("any_peer", "call_local", "reliable")
-+func _mp8_vote_rpc() -> void :
++func _mp8_vote_rpc(epoch: int, agree: bool) -> void :
 +
 +	if not multiplayer.is_server():
 +		return
 +
 +	var who: int = multiplayer.get_remote_sender_id()
 +	if who == 0:
-+		who = 1                                    # 房主自己按的，本地调用没有 sender
++		who = multiplayer.get_unique_id()           # 只把本进程明确调用解释成房主
 +
-+	if minigame == null:
-+		print("[MP8-投票] %d 在幕间按了重开，忽略（现在没有进行中的小游戏）" % who)
++	if epoch != _mp8_round_epoch or not _mp8_round_matches():
++		if _mp8_vote_now_msec() - _mp8_vote_reject_log_ms >= 5000:
++			_mp8_vote_reject_log_ms = _mp8_vote_now_msec()
++			print("[MP8-投票] rejected stale epoch=%d current=%d sender=%d" % [epoch, _mp8_round_epoch, who])
++		if PlayerManager.player_presences.has(who):
++			_mp8_vote_broadcast(int(_mp8_vote_roster().size() / 2) + 1)
++		return
++	var roster: Dictionary = _mp8_vote_roster()
++	if not roster.has(who):
 +		return
 +
-+	if PlayerManager.player_presences.size() < 2:
-+		print("[MP8-投票] 不足 2 人，重开没有意义，忽略")
++	if roster.size() < 2:
 +		return
 +
-+	if _mp8_vote_yes.has(who):
++	if not agree:
++		if not _mp8_vote_yes.has(who):
++			return
 +		_mp8_vote_yes.erase(who)
 +		print("[MP8-投票] %d 撤票" % who)
 +	else:
++		if _mp8_vote_yes.has(who):
++			return
++		if _mp8_vote_cooldown_remaining() > 0.0:
++			_mp8_vote_broadcast(int(roster.size() / 2) + 1)
++			return
++		var now: int = _mp8_vote_now_msec()
++		if now - int(_mp8_vote_last_agree_ms.get(who, -MP8_VOTE_AGREE_INTERVAL_MS)) < MP8_VOTE_AGREE_INTERVAL_MS:
++			if who == multiplayer.get_unique_id():
++				_mp8_vote_rate_notice_rpc(_mp8_round_epoch)
++			else:
++				_mp8_vote_rate_notice_rpc.rpc_id(who, _mp8_round_epoch)
++			return
++		_mp8_vote_last_agree_ms[who] = now
 +		_mp8_vote_yes[who] = true
 +		print("[MP8-投票] %d 投票重开本轮" % who)
 +
 +	_mp8_vote_recount()
++
++
++func _mp8_vote_now_msec() -> int :
++	return Time.get_ticks_msec()
++
++
++func _mp8_vote_cooldown_remaining() -> float :
++	return maxf(0.0, float(_mp8_vote_cooldown_until_ms - _mp8_vote_now_msec()) / 1000.0)
++
++
++func _mp8_vote_roster() -> Dictionary :
++	var roster: Dictionary = {}
++	for id in _mp8_round_participants:
++		var presence = PlayerManager.player_presences.get(id)
++		if is_instance_valid(presence) and not presence.debug_player:
++			roster[id] = true
++	return roster
++
++
++func _mp8_vote_sync_roster() -> bool :
++	var roster: Dictionary = _mp8_vote_roster()
++	var changed: bool = roster != _mp8_vote_roster_cache
++	for id in _mp8_vote_yes.keys():
++		if not roster.has(id):
++			_mp8_vote_yes.erase(id)
++	for id in _mp8_vote_last_agree_ms.keys():
++		if not roster.has(id):
++			_mp8_vote_last_agree_ms.erase(id)
++	if changed:
++		_mp8_vote_roster_cache = roster
++		_mp8_vote_deadline = -1.0 # Any membership change restarts the full confirmation window.
++	return changed
++
++
++@rpc("authority", "call_local", "reliable")
++func _mp8_vote_rate_notice_rpc(epoch: int) -> void :
++	if epoch != _mp8_vote_view_epoch:
++		return
++	_mp8_vote_notice_until_ms = _mp8_vote_now_msec() + MP8_VOTE_AGREE_INTERVAL_MS
++	_mp8_vote_refresh_ui()
 +
 +
 +# 重新点票。掉线的人不该继续占着票 —— 8 人局里一个人掉线就可能让票数当场过半，
@@ -583,17 +774,17 @@ diff --git a/scripts/scenes/game/game.gd b/scripts/scenes/game/game.gd
 +
 +	if not multiplayer.is_server():
 +		return
++	if not _mp8_round_matches():
++		_mp8_round_close("recount-invalid")
++		return
 +
-+	for id in _mp8_vote_yes.keys():
-+		if not PlayerManager.player_presences.has(id):
-+			_mp8_vote_yes.erase(id)
-+			print("[MP8-投票] %d 已不在房里，撤掉他的票" % id)
-+
-+	var n: int = PlayerManager.player_presences.size()
++	_mp8_vote_sync_roster()
++	var n: int = _mp8_vote_roster_cache.size()
 +	var yes: int = _mp8_vote_yes.size()
 +	var need: int = int(floor(float(n) / 2.0)) + 1      # 过半
++	_mp8_vote_last_need = need
 +
-+	if yes >= need:
++	if n >= 2 and yes >= need and _mp8_vote_cooldown_remaining() <= 0.0:
 +		if _mp8_vote_deadline < 0.0:
 +			_mp8_vote_deadline = MP8_VOTE_COUNTDOWN
 +			print("[MP8-投票] 过半（%d/%d，需 %d）—— %.0f 秒后自动重开本轮" % [yes, n, need, MP8_VOTE_COUNTDOWN])
@@ -617,7 +808,9 @@ diff --git a/scripts/scenes/game/game.gd b/scripts/scenes/game/game.gd
 +		names.append(_mp8_vote_name_of(int(id)))
 +	_mp8_vote_state_rpc.rpc(
 +		voters, names, need, _mp8_vote_deadline,
-+		session_current_minigame_round, session_current_minigame_max_rounds
++		session_current_minigame_round, session_current_minigame_max_rounds,
++		_mp8_round_epoch, _mp8_round_matches(),
++		_mp8_vote_cooldown_remaining(), PackedInt32Array(_mp8_vote_roster().keys())
 +	)
 +
 +
@@ -643,14 +836,29 @@ diff --git a/scripts/scenes/game/game.gd b/scripts/scenes/game/game.gd
 +
 +func _mp8_vote_tick(delta: float) -> void :
 +
++	var locale: String = NetworkManager.mp8_locale()
++	if _mp8_vote_ui_locale != locale or _mp8_vote_notice_until_ms > 0:
++		_mp8_vote_ui_locale = locale
++		_mp8_vote_refresh_ui()
++		if _mp8_vote_now_msec() >= _mp8_vote_notice_until_ms:
++			_mp8_vote_notice_until_ms = 0
 +	if not multiplayer.is_server():
 +		return
-+	if _mp8_vote_yes.is_empty() and _mp8_vote_deadline < 0.0:
++	if not _mp8_round_active:
++		return
++	if not _mp8_round_matches():
++		_mp8_round_close("tick-invalid")
 +		return
 +
-+	# 倒计时期间有人掉线 -> 人数变了、门槛也变了，必须重算
-+	if _mp8_vote_yes.size() > PlayerManager.player_presences.size():
++	# An individual voter can leave even when yes <= player count. Recheck the
++	# actual roster, not only the lengths, before advancing the countdown.
++	var roster_changed: bool = _mp8_vote_sync_roster()
++	var n: int = _mp8_vote_roster_cache.size()
++	var need: int = int(floor(float(n) / 2.0)) + 1
++	if roster_changed or need != _mp8_vote_last_need or n < 2:
 +		_mp8_vote_recount()
++		if roster_changed:
++			return
 +
 +	if _mp8_vote_deadline >= 0.0:
 +		_mp8_vote_deadline -= delta
@@ -658,20 +866,38 @@ diff --git a/scripts/scenes/game/game.gd b/scripts/scenes/game/game.gd
 +			_mp8_do_restart_round()
 +			return
 +
-+	# 每秒重播一次完整状态。除了刷倒计时，这也顺带解决「中途加入的人
-+	# 看不到进行中的投票」—— 他下一秒就会收到全量状态，不用另写补发逻辑。
++	# Include idle rounds too: a reconnecting client needs the current generation
++	# before its first vote, even when nobody has voted yet.
 +	_mp8_vote_beat -= delta
 +	if _mp8_vote_beat <= 0.0:
 +		_mp8_vote_beat = 1.0
-+		var n: int = PlayerManager.player_presences.size()
-+		_mp8_vote_broadcast(int(floor(float(n) / 2.0)) + 1)
++		_mp8_vote_broadcast(need)
 +
 +
 +func _mp8_do_restart_round() -> void :
 +
-+	var n: int = PlayerManager.player_presences.size()
++	if not multiplayer.is_server() or not _mp8_round_matches():
++		_mp8_round_close("restart-invalid")
++		return
++	if _mp8_vote_sync_roster():
++		_mp8_vote_recount()
++		return
++	var n: int = _mp8_vote_roster_cache.size()
 +	var yes: int = _mp8_vote_yes.size()
-+	var mg: String = "?" if minigame == null else String(minigame.name)
++	var need: int = int(floor(float(n) / 2.0)) + 1
++	if n < 2 or yes < need or _mp8_vote_cooldown_remaining() > 0.0:
++		_mp8_vote_recount()
++		return
++	var target: int = _mp8_round_identifier
++	var snapshot: Dictionary = _mp8_round_score_snapshot.duplicate(true)
++	for id in snapshot.keys():
++		if not _mp8_vote_roster_cache.has(id):
++			snapshot.erase(id)
++	var mg: String = String(minigame.name)
++	# Close synchronously before any side effect. A Finished callback from the
++	# replaced instance can no longer commit scores or load another round.
++	_mp8_vote_cooldown_until_ms = _mp8_vote_now_msec() + MP8_VOTE_COOLDOWN_MS
++	_mp8_round_close("restart")
 +
 +	# 强制日志 —— 整个功能里最值钱的一行，不受任何排查开关门控。
 +	# 玩家什么时候重开、在哪个小游戏、几个人、第几轮，全在这里。
@@ -682,17 +908,10 @@ diff --git a/scripts/scenes/game/game.gd b/scripts/scenes/game/game.gd
 +	])
 +
 +	# 回滚本轮已经入账的分数（理由见本节开头）
-+	if not _mp8_round_score_snapshot.is_empty():
-+		round_score_by_network_id = _mp8_round_score_snapshot.duplicate(true)
-+
-+	_mp8_vote_clear()      # 它自己会把空状态播出去
-+
-+	if session_minigame_index < 0 or session_minigame_index >= session_minigame_list.size():
-+		printerr("[MP8-重开] 歌单下标 %d 越界（共 %d 项），放弃重开" % [session_minigame_index, session_minigame_list.size()])
-+		return
++	round_score_by_network_id = snapshot
 +
 +	# 跟「进下一轮」同一条路：_total_rounds 用默认 -1，轮次计数不重置
-+	load_minigame(session_minigame_list[session_minigame_index], true)
++	load_minigame(target, true)
 +
 +
 +func _mp8_vote_clear() -> void :
@@ -700,6 +919,9 @@ diff --git a/scripts/scenes/game/game.gd b/scripts/scenes/game/game.gd
 +	_mp8_vote_yes.clear()
 +	_mp8_vote_deadline = -1.0
 +	_mp8_vote_beat = 0.0
++	_mp8_vote_last_need = 0
++	_mp8_vote_last_agree_ms.clear()
++	_mp8_vote_notice_until_ms = 0
 +	_mp8_vote_view = PackedInt32Array()
 +	_mp8_vote_view_secs = -1.0
 +	_mp8_vote_refresh_ui()
@@ -708,7 +930,8 @@ diff --git a/scripts/scenes/game/game.gd b/scripts/scenes/game/game.gd
 +	# 每秒心跳只在「有票」时才播，清空之后就没人再告诉客机了。
 +	# （正常推进下一轮也会走到这里 —— 那才是最容易出现残留的路径。）
 +	if multiplayer.has_multiplayer_peer() and multiplayer.is_server():
-+		_mp8_vote_state_rpc.rpc(PackedInt32Array(), PackedStringArray(), 0, -1.0, 0, 0)
++		_mp8_vote_state_rpc.rpc(PackedInt32Array(), PackedStringArray(), 0, -1.0, 0, 0,
++			_mp8_round_epoch, _mp8_round_active, _mp8_vote_cooldown_remaining(), PackedInt32Array())
 +
 +
 +# --------------------- 显示层（每端各自）---------------------
@@ -716,15 +939,22 @@ diff --git a/scripts/scenes/game/game.gd b/scripts/scenes/game/game.gd
 +@rpc("authority", "call_local", "reliable")
 +func _mp8_vote_state_rpc(
 +	voters: PackedInt32Array, names: PackedStringArray,
-+	need: int, secs: float, rnd: int, rnd_max: int
++	need: int, secs: float, rnd: int, rnd_max: int,
++	epoch: int, round_open: bool, cooldown: float = 0.0, eligible: PackedInt32Array = PackedInt32Array()
 +) -> void :
 +
++	if epoch < _mp8_vote_view_epoch:
++		return
++	_mp8_vote_view_epoch = epoch
++	_mp8_vote_view_open = round_open
 +	_mp8_vote_view = voters
 +	_mp8_vote_view_names = names
 +	_mp8_vote_view_need = need
 +	_mp8_vote_view_secs = secs
 +	_mp8_vote_view_round = rnd
 +	_mp8_vote_view_round_max = rnd_max
++	_mp8_vote_view_cooldown = cooldown
++	_mp8_vote_view_eligible = eligible
 +	_mp8_vote_refresh_ui()
 +
 +
@@ -737,7 +967,7 @@ diff --git a/scripts/scenes/game/game.gd b/scripts/scenes/game/game.gd
 +func _mp8_t(key: String) -> String :
 +
 +	var en: Dictionary = MP8_VOTE_L10N["EN"]
-+	var tbl: Dictionary = MP8_VOTE_L10N.get(String(TranslationServer.get_locale()).to_upper(), en)
++	var tbl: Dictionary = MP8_VOTE_L10N.get(NetworkManager.mp8_locale(), en)
 +	return String(tbl.get(key, en.get(key, key)))
 +
 +
@@ -766,7 +996,7 @@ diff --git a/scripts/scenes/game/game.gd b/scripts/scenes/game/game.gd
 +
 +func _mp8_vote_refresh_ui() -> void :
 +
-+	var n: int = PlayerManager.player_presences.size()
++	var n: int = _mp8_vote_view_eligible.size()
 +	var yes: int = _mp8_vote_view.size()
 +	var me: int = _mp8_vote_local_id()
 +	var i_voted: bool = _mp8_vote_view.has(me)
@@ -774,8 +1004,15 @@ diff --git a/scripts/scenes/game/game.gd b/scripts/scenes/game/game.gd
 +
 +	# —— ESC 菜单那颗按钮：局内一直在，文案跟着状态走 ——
 +	if is_instance_valid(_mp8_vote_btn):
-+		_mp8_vote_btn.visible = (minigame != null)
-+		if counting:
++		_mp8_vote_btn.visible = _mp8_vote_view_open and is_instance_valid(minigame)
++		_mp8_vote_btn.disabled = not _mp8_vote_view_eligible.has(me) or (_mp8_vote_view_cooldown > 0.0 and not i_voted)
++		if not _mp8_vote_view_eligible.has(me):
++			_mp8_vote_btn.text = _mp8_t("next_round")
++		elif _mp8_vote_view_cooldown > 0.0 and not i_voted:
++			_mp8_vote_btn.text = _mp8_t("cooldown") % int(ceil(_mp8_vote_view_cooldown))
++		elif _mp8_vote_notice_until_ms > _mp8_vote_now_msec() and not i_voted:
++			_mp8_vote_btn.text = _mp8_t("rate")
++		elif counting:
 +			_mp8_vote_btn.text = _mp8_t("btn_go") % int(ceil(_mp8_vote_view_secs))
 +		elif yes <= 0:
 +			_mp8_vote_btn.text = _mp8_t("btn")
@@ -940,4 +1177,3 @@ diff --git a/scripts/scenes/game/game.gd b/scripts/scenes/game/game.gd
 +	if is_instance_valid(_mp8_vote_btn):
 +		_mp8_vote_btn.queue_free()
 +	_mp8_vote_btn = null
-+

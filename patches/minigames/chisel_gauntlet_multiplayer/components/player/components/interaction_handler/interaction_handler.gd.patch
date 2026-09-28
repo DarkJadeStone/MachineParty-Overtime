@@ -1,0 +1,48 @@
+diff --git a/minigames/chisel_gauntlet_multiplayer/components/player/components/interaction_handler/interaction_handler.gd b/minigames/chisel_gauntlet_multiplayer/components/player/components/interaction_handler/interaction_handler.gd
+--- a/minigames/chisel_gauntlet_multiplayer/components/player/components/interaction_handler/interaction_handler.gd
++++ b/minigames/chisel_gauntlet_multiplayer/components/player/components/interaction_handler/interaction_handler.gd
+@@ -394,6 +394,19 @@ func process_local_mouse_and_keyboard_input(_delta: float):
+ 	if not active:
+ 		return
+ 
++	# TextureRect placement is not encoded in a SubViewport's screen transform.
++	# Use the same rectangle as the handler and reject stale highlights outside it
++	# before testing action_1, including keyboard seats away from the top-left.
++	var screen_rect: Rect2 = local_viewport.get_meta("mp8_input_rect", Rect2())
++	var mouse_position: Vector2 = ChiselGauntletLocalHandler.mp8_screen_to_view(
++		get_viewport().get_mouse_position(), screen_rect, Vector2(local_viewport.size))
++	if mouse_position.x < 0:
++		if is_instance_valid(highlighted_segment):
++			highlighted_segment.actual_mesh.set_instance_shader_parameter("strength", 0.0)
++		highlighted_segment = null
++		left_interactable.emit()
++		return
++
+ 	if DynamicInput.is_action_just_pressed(device_id, "action_1"):
+ 		if highlighted_segment:
+ 			match (highlighted_segment.index):
+@@ -416,8 +429,6 @@ func process_local_mouse_and_keyboard_input(_delta: float):
+ 						chiseled_segment.emit()
+ 						return
+ 
+-	var mouse_position = get_viewport().get_mouse_position()
+-	mouse_position = local_viewport.get_screen_transform().affine_inverse() * mouse_position
+ 
+ 	var origin = local_camera.project_ray_origin(mouse_position)
+ 	var end = origin + local_camera.project_ray_normal(mouse_position) * 5.0
+@@ -466,6 +477,9 @@ func _process(_delta: float) -> void :
+ 		return
+ 
+ 	if GameManager.local_game:
++		var presence = PlayerManager.player_presences.get(device_id)
++		if presence == null or not presence.local_controller_connected:
++			return
+ 		if not using_joystick:
+ 			process_local_mouse_and_keyboard_input(_delta)
+ 			return
+@@ -594,3 +608,5 @@ func _on_input_device_changed(input_device: GameManager.InputDevice):
+ 			CursorManager.set_active(true)
+ 			CursorManager.set_mouse_mode(Input.MouseMode.MOUSE_MODE_VISIBLE)
+ 			CursorManager.set_cursor(true, true)
++
++

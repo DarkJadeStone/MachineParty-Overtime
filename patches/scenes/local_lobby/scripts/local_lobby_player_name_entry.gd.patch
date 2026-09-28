@@ -1,0 +1,11 @@
+diff --git a/scenes/local_lobby/scripts/local_lobby_player_name_entry.gd b/scenes/local_lobby/scripts/local_lobby_player_name_entry.gd
+--- a/scenes/local_lobby/scripts/local_lobby_player_name_entry.gd
++++ b/scenes/local_lobby/scripts/local_lobby_player_name_entry.gd
+@@ -112,6 +112,7 @@ func set_active(
+ 	_is_joystick: int, 
+ 	_player_name: String = ""
+ ):
++	assigned_player_id = _player_id
+ 	device_id = _device_id
+ 	is_joystick = _is_joystick
+ 

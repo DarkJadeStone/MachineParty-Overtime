@@ -1,0 +1,121 @@
+diff --git a/scripts/components/character customization/customization_selection.gd b/scripts/components/character customization/customization_selection.gd
+--- a/scripts/components/character customization/customization_selection.gd
++++ b/scripts/components/character customization/customization_selection.gd
+@@ -30,6 +30,7 @@ class_name CustomizationSelection extends Node
+ var color_caret_pos_x_array = [594, 651, 707, 763, 818]
+ 
+ var allowed_to_exit = true
++var _mp8_mixed_buttons: Dictionary = {}
+ 
+ var customizations = [
+ 	"beer_hat", 
+@@ -49,11 +50,15 @@ var suit_colors = [
+ 	"green", 
+ 	"yellow", 
+ 	"purple", 
++	"mp8_sunset",
++	"mp8_aurora",
++	"mp8_twilight",
+ ]
+ 
+ func _ready() -> void :
+ 
+ 	Globals.load_preferences()
++	_mp8_add_mixed_suits()
+ 
+ 	var spawn_offset_x = 3
+ 	var counter = 0
+@@ -122,6 +127,9 @@ func get_gibberish_name(_str: String):
+ 		"green": return "0010055"
+ 		"yellow": return "0010056"
+ 		"purple": return "0010057"
++		"mp8_sunset": return "0010058"
++		"mp8_aurora": return "0010059"
++		"mp8_twilight": return "0010060"
+ 	return "--"
+ 
+ func camera_info():
+@@ -162,6 +170,9 @@ func select_suit_color(color_name: String):
+ 	update_suit_caret_position(color_name)
+ 
+ func update_suit_caret_position(color_name: String):
++	ninepatch_color_selection.visible = not _mp8_mixed_buttons.has(color_name)
++	for preset in _mp8_mixed_buttons:
++		_mp8_mixed_buttons[preset].set_pressed_no_signal(preset == color_name)
+ 	var x = 0
+ 	match color_name:
+ 		"red": x = 594
+@@ -171,6 +182,73 @@ func update_suit_caret_position(color_name: String):
+ 		"purple": x = 818
+ 	ninepatch_color_selection.position = Vector2(x, ninepatch_color_selection.position.y)
+ 
++func _mp8_add_mixed_suits() -> void:
++	if not _mp8_mixed_buttons.is_empty():
++		return
++	# The original UI is authored on a 960 x 540 canvas. Add a second swatch
++	# row and move its following controls together, retaining the scene's scale.
++	for control in [info_label_selection, info_label_color, info_label_hat, info_label_glasses]:
++		control.position.y += 20
++	for button in [reset_button, save_and_exit_button]:
++		button.get_parent().position.y += 20
++	var panel = ui_root.get_node_or_null("NinePatchRect misc under outline")
++	if panel is Control:
++		panel.size.y += 20
++	var ids := ["mp8_sunset", "mp8_aurora", "mp8_twilight"]
++	var pairs := [[Color("d64d3f"), Color("eac75b")], [Color("55a874"), Color("447abd")], [Color("447abd"), Color("ab68b7")]]
++	var locale := TranslationServer.get_locale().to_lower()
++	var names := ["Sunset", "Aurora", "Twilight"]
++	if locale.begins_with("zh"):
++		names = ["落日", "极光", "暮色"] if not (locale == "zht" or locale.contains("tw") or locale.contains("hk") or locale.contains("hant")) else ["落日", "極光", "暮色"]
++	var solids: Array[Button] = []
++	for color in ["red", "blue", "green", "yellow", "purple"]:
++		var solid = ui_root.get_node_or_null("suit color selection %s/Button" % color)
++		if solid is Button:
++			solids.append(solid)
++	for index in ids.size():
++		var button := Button.new()
++		button.name = "OvertimeMixedSuit%d" % index
++		button.position = Vector2(594 + index * 95, 371)
++		button.size = Vector2(89, 17)
++		button.toggle_mode = true
++		button.tooltip_text = names[index]
++		for state in ["normal", "hover", "pressed", "focus"]:
++			var style := StyleBoxFlat.new()
++			style.bg_color = Color("181b1b")
++			style.border_color = Color("fff4c9") if state in ["pressed", "focus"] else Color("59615e")
++			style.set_border_width_all(2 if state in ["pressed", "focus"] else 1)
++			style.set_content_margin_all(0)
++			button.add_theme_stylebox_override(state, style)
++		ui_root.add_child(button)
++		var gradient := Gradient.new()
++		gradient.colors = PackedColorArray(pairs[index])
++		var texture := GradientTexture2D.new()
++		texture.gradient = gradient
++		texture.width = 85
++		texture.height = 13
++		var swatch := TextureRect.new()
++		swatch.texture = texture
++		swatch.position = Vector2(2, 2)
++		swatch.size = Vector2(85, 13)
++		swatch.mouse_filter = Control.MOUSE_FILTER_IGNORE
++		button.add_child(swatch)
++		button.pressed.connect(select_suit_color.bind(ids[index]))
++		button.mouse_entered.connect(customization_hovered.bind(ids[index]))
++		button.focus_entered.connect(customization_hovered.bind(ids[index]))
++		_mp8_mixed_buttons[ids[index]] = button
++	for index in ids.size():
++		var button: Button = _mp8_mixed_buttons[ids[index]]
++		button.focus_neighbor_left = button.get_path_to(_mp8_mixed_buttons[ids[maxi(index - 1, 0)]])
++		button.focus_neighbor_right = button.get_path_to(_mp8_mixed_buttons[ids[mini(index + 1, 2)]])
++		button.focus_neighbor_bottom = button.get_path_to(save_and_exit_button)
++		if solids.size() == 5:
++			button.focus_neighbor_top = button.get_path_to(solids[index * 2])
++	if solids.size() == 5:
++		for index in solids.size():
++			solids[index].focus_neighbor_bottom = solids[index].get_path_to(_mp8_mixed_buttons[ids[mini(int(index / 2), 2)]])
++	save_and_exit_button.focus_neighbor_top = save_and_exit_button.get_path_to(_mp8_mixed_buttons[ids[1]])
++	reset_button.focus_neighbor_top = reset_button.get_path_to(_mp8_mixed_buttons[ids[0]])
++
+ func reset_cosmetics():
+ 	customization_assigner.remove_glasses()
+ 	customization_assigner.remove_hat()

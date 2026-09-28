@@ -315,7 +315,25 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
  var last_spectate_camera_transform: Transform3D
  
  var local_duck_players: Dictionary[int, DuckHuntDuckPlayer]
-@@ -216,17 +514,47 @@ func spawn_players():
+@@ -113,7 +411,7 @@ func process_local(_delta: float):
+ 
+ 	var duck_player_positions: Array[Vector3]
+ 	for duck_player in local_duck_players.values():
+-		if duck_player.health > 0:
++		if is_instance_valid(duck_player) and duck_player.health > 0:
+ 			duck_player_positions.append(duck_player.global_position)
+ 
+ 	if duck_player_positions.is_empty():
+@@ -202,6 +500,8 @@ func all_players_loaded():
+ 
+ func spawn_players():
+ 
++	if GameManager.local_game:
++		local_handler.clear_views()
+ 	await get_tree().create_timer(1, false).timeout
+ 
+ 	players_acknowledged.clear()
+@@ -216,17 +516,47 @@ func spawn_players():
  		local_game_players_order[player_presence] = null
  
  
@@ -366,7 +384,7 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
  
  	var spawn_positions = duck_player_spawn_positions.get_children()
  	spawn_positions.shuffle()
-@@ -235,7 +563,7 @@ func spawn_players():
+@@ -235,7 +565,7 @@ func spawn_players():
  	var counter: int = 0
  	for network_id in PlayerManager.player_presences.keys():
  
@@ -375,7 +393,15 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
  			continue
  
  		player_presence = PlayerManager.player_presences[network_id]
-@@ -261,19 +589,12 @@ func spawn_players():
+@@ -255,25 +585,19 @@ func spawn_players():
+ 		local_game_players_order[player_presence.network_id] = player_character
+ 
+ 		if GameManager.local_game:
+-			acknowledge_role_rpc(network_id)
+ 			local_duck_players[player_presence.network_id] = player_character
++			player_character.player_name_label.text = "P%d · %s" % [
++				_mp8_local_seat(player_presence) + 1, player_presence.network_name]
+ 
  		counter += 1
  
  	duck_player_count = duck_players.size()
@@ -399,7 +425,7 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
  	var hunter_initialization_delay = 8.0
  	if current_round > 0:
  		hunter_initialization_delay = 5.0
-@@ -281,16 +602,43 @@ func spawn_players():
+@@ -281,16 +605,78 @@ func spawn_players():
  	if GameManager.local_game:
  		hunter_initialization_delay -= 2.0
  
@@ -442,13 +468,48 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
  		duck_player_added_rpc.rpc(network_id)
  
 -	local_handler.setup(local_multiplayer_camera_viewport, hunter_player.local_viewport)
-+	# [MP8] 本地分屏取景器只支持一个视口，用第一个猎人的；加个空判防止没猎人时崩
-+	if hunter_player:
-+		local_handler.setup(local_multiplayer_camera_viewport, hunter_player.local_viewport)
++	if GameManager.local_game and not hunter_players.is_empty():
++		_mp8_local_setup_views()
++		# Release the role gate only after every actor and its viewport exists.
++		# Local identities include keyboard -1 and controller 0; neither is a peer ID.
++		_mp8_ack_local_roles()
++
++func _mp8_local_seat(presence) -> int:
++	var fallback: int = maxi(0, PlayerManager.player_presences.keys().find(presence.network_id))
++	return int(presence.get_meta("mp8_local_seat", fallback))
++
++func _mp8_local_setup_views() -> void:
++	var views: Array[SubViewport] = []
++	for camera in local_multiplayer_camera_parent.find_children("*", "Camera3D", true, false):
++		_mp8_configure_duck_camera(camera)
++	var labels := PackedStringArray()
++	var duck_seats := PackedStringArray()
++	for id in local_duck_players.keys():
++		duck_seats.append("P%d" % (_mp8_local_seat(PlayerManager.player_presences[id]) + 1))
++	var zh: bool = TranslationServer.get_locale().to_upper().begins_with("ZH")
++	labels.append(("鸭群 · " if zh else "Ducks · ") + " / ".join(duck_seats))
++	var ordered: Array = hunter_players.duplicate()
++	ordered.sort_custom(func(a, b): return _mp8_local_seat(a.player_presence) < _mp8_local_seat(b.player_presence))
++	for i in ordered.size():
++		var hunter = ordered[i]
++		hunter.mp8_setup_local_view(i)
++		views.append(hunter.local_viewport)
++		labels.append("P%d · %s · %s" % [_mp8_local_seat(hunter.player_presence) + 1,
++			hunter.player_presence.network_name, "猎人" if zh else "Hunter"])
++	local_handler.setup(local_multiplayer_camera_viewport, views, labels, ui_role_label.get_theme_font("font"))
++
++func _mp8_configure_duck_camera(camera: Camera3D) -> void:
++	camera.set_cull_mask_value(11, true) # Aiming beams warn every duck.
++	camera.set_cull_mask_value(12, false)
++	camera.set_cull_mask_value(13, false)
++
++func _mp8_ack_local_roles() -> void:
++	for id in PlayerManager.player_presences.keys():
++		acknowledge_role_rpc(id)
  
  func force_game_end():
  
-@@ -317,9 +665,15 @@ func check_game_end():
+@@ -317,9 +703,15 @@ func check_game_end():
  	if resetting:
  		return
  
@@ -465,7 +526,7 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
  	if not possible_hunters.is_empty():
  		resetting = true
  		await get_tree().create_timer(3.0).timeout
-@@ -337,12 +691,23 @@ func check_game_end():
+@@ -337,12 +729,23 @@ func check_game_end():
  func set_hunter_name_rpc(_hunter_name: String):
  	hunter_name = _hunter_name
  
@@ -493,13 +554,22 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
  
  @rpc("authority", "call_local", "reliable")
  func duck_player_added_rpc(_network_id):
-@@ -368,6 +733,56 @@ func set_hunter_rpc(_network_id):
+@@ -368,18 +771,83 @@ func set_hunter_rpc(_network_id):
  
  	acknowledge_role_rpc.rpc(multiplayer.get_unique_id())
  
 +# [MP8] 双猎人版：收一串 id，判断自己在不在里面
 +@rpc("any_peer", "call_local", "reliable")
 +func set_hunters_rpc(_network_ids: Array):
++
++	if GameManager.local_game:
++		is_hunter = false
++		for id in PlayerManager.player_presences.keys():
++			if not PlayerManager.player_presences[id].using_joystick:
++				is_hunter = _network_ids.has(id)
++				break
++		_mp8_setup_countdown()
++		return # Local readiness is acknowledged after all actor/view setup.
 +
 +	is_hunter = _network_ids.has(multiplayer.get_unique_id())
 +	if is_hunter:
@@ -550,7 +620,10 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
  @rpc("any_peer", "call_local", "reliable")
  func acknowledge_role_rpc(_network_id: int):
  	if not multiplayer.is_server():
-@@ -376,10 +791,14 @@ func acknowledge_role_rpc(_network_id: int):
+ 		return
+ 
++	if GameManager.local_game and (not PlayerManager.player_presences.has(_network_id) or players_acknowledged.has(_network_id)):
++		return
  	players_acknowledged.append(_network_id)
  
  	if players_acknowledged.size() == PlayerManager.player_presences.keys().size():
@@ -566,7 +639,7 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
  			state_machine.transition_to_rpc.rpc(&"RoleReveal")
  
  @rpc("any_peer", "call_local", "reliable")
-@@ -429,7 +848,9 @@ func remove_player_rpc(_network_id: int):
+@@ -429,7 +897,9 @@ func remove_player_rpc(_network_id: int):
  			remove_spectate_player_rpc.rpc(_network_id)
  			duck_players.erase(_network_id)
  		if player_instance is DuckHuntHunterPlayer:
@@ -577,7 +650,7 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
  			duck_player_count -= 1
  
  		player_instance.queue_free()
-@@ -450,6 +871,16 @@ func player_disconnected(_network_id: int):
+@@ -450,6 +920,16 @@ func player_disconnected(_network_id: int):
  
  	if multiplayer.is_server():
  		await get_tree().create_timer(1.0).timeout
@@ -594,7 +667,7 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
  		check_game_end()
  
  func _on_duck_player_spectate(_network_id):
-@@ -498,13 +929,20 @@ func _on_player_finished(_network_id: int):
+@@ -498,13 +978,20 @@ func _on_player_finished(_network_id: int):
  			local_duck_players.erase(_network_id)
  
  	if duck_players.has(_network_id):
@@ -619,7 +692,7 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
  
  	check_game_end()
  
-@@ -517,15 +955,76 @@ func _on_player_died(_network_id: int):
+@@ -517,15 +1004,76 @@ func _on_player_died(_network_id: int):
  	if duck_players.has(_network_id):
  		duck_players.erase(_network_id)
  		remove_spectate_player_rpc.rpc(_network_id)
@@ -699,7 +772,7 @@ diff --git a/minigames/duck_hunt/scripts/duck_hunt.gd b/minigames/duck_hunt/scri
  func _on_countdown_expired():
  	super._on_countdown_expired()
  
-@@ -534,3 +1033,131 @@ func _on_countdown_expired():
+@@ -534,3 +1082,131 @@ func _on_countdown_expired():
  func _on_unpaused():
  
  	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED

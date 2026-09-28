@@ -1,7 +1,63 @@
 diff --git a/minigames/chisel_gauntlet_multiplayer/components/player/scripts/chisel_gauntlet_player.gd b/minigames/chisel_gauntlet_multiplayer/components/player/scripts/chisel_gauntlet_player.gd
 --- a/minigames/chisel_gauntlet_multiplayer/components/player/scripts/chisel_gauntlet_player.gd
 +++ b/minigames/chisel_gauntlet_multiplayer/components/player/scripts/chisel_gauntlet_player.gd
-@@ -289,6 +289,21 @@ func set_timer_label_text_rpc(text: String):
+@@ -73,6 +73,8 @@ func _physics_process(_delta: float) -> void :
+ 
+ 	if PauseMenu.active:
+ 		return
++	if GameManager.local_game and player_presence != null and not player_presence.local_controller_connected:
++		return
+ 
+ 	if not alive:
+ 
+@@ -106,27 +108,37 @@ func _on_solution_submitted(solution: Array[int]):
+ 
+ func setup_local_visuals(player_index: int):
+ 
+-	var starting_layer = 10 + (player_index * 2)
++	# Retail wall blood decals target layer 10. Keep it out of every player
++	# pair; shared scene layers 1/2 and the wall mask retain their meaning.
++	player_index = clampi(player_index, 0, 7)
++	var hand_layer := _mp8_local_layer(player_index, false)
++	var body_layer := _mp8_local_layer(player_index, true)
++	for layer in range(3, 20):
++		if layer != 10:
++			local_camera.set_cull_mask_value(layer, false)
+ 
+ 	visuals_third_person.visible = true
+ 	visuals_first_person.visible = true
+ 
+ 	for mesh in local_first_person_meshes:
+-		mesh.layers = 1 << starting_layer
++		mesh.layers = 1 << (hand_layer - 1)
+ 
+-	local_camera.set_cull_mask_value(starting_layer + 1, true)
+-	local_camera.set_cull_mask_value(starting_layer + 1 + 1, false)
++	local_camera.set_cull_mask_value(hand_layer, true)
++	local_camera.set_cull_mask_value(body_layer, false)
+ 
+-	for i in 4:
++	for i in 8:
+ 		if i == player_index:
+ 			continue
+-		var other_player_layer = 10 + (i * 2)
+-		local_camera.set_cull_mask_value(other_player_layer + 1 + 1, true)
++		local_camera.set_cull_mask_value(_mp8_local_layer(i, true), true)
+ 
+-	customization_assigner.set_visibility_layer(1 << (starting_layer + 1))
++	customization_assigner.set_visibility_layer(1 << (body_layer - 1))
+ 
+ 	for mesh in local_third_person_meshes:
+-		mesh.layers = 1 << (starting_layer + 1)
++		mesh.layers = 1 << (body_layer - 1)
++
++func _mp8_local_layer(seat: int, third_person: bool) -> int:
++	var layer := 3 + clampi(seat, 0, 7) * 2 + int(third_person)
++	return layer + int(layer >= 10)
+ 
+ 
+ 
+@@ -289,6 +301,21 @@ func set_timer_label_text_rpc(text: String):
  @rpc("any_peer", "call_local", "reliable")
  func look_at_rpc(target: ChiselGauntletPlayer.LookAtTarget):
  	if !alive: return
@@ -23,7 +79,7 @@ diff --git a/minigames/chisel_gauntlet_multiplayer/components/player/scripts/chi
  	match target:
  
  		ChiselGauntletPlayer.LookAtTarget.None:
-@@ -381,12 +396,16 @@ func set_player_presence(network_id: int):
+@@ -381,12 +408,16 @@ func set_player_presence(network_id: int):
  
  @rpc("any_peer", "call_local", "reliable")
  func teleport_rpc(
@@ -42,7 +98,7 @@ diff --git a/minigames/chisel_gauntlet_multiplayer/components/player/scripts/chi
  @rpc("any_peer", "call_local", "reliable")
  func set_spectate_position_rpc(_position: Vector3):
  
-@@ -400,3 +419,192 @@ func trigger_achievement_rpc():
+@@ -400,3 +431,205 @@ func trigger_achievement_rpc():
  		if ach_active:
  			AchievementManager.set_achievement("ACH_05")
  			ach_active = false
@@ -143,14 +199,13 @@ diff --git a/minigames/chisel_gauntlet_multiplayer/components/player/scripts/chi
 +# 藏的是**本机**这一份场景树里其他玩家的第三人称视觉 —— 纯客户端行为，不发 RPC，
 +# 不影响任何判定，别人那边看自己照常。
 +#
-+# ⚠️ **不碰 setup_local_visuals 那套可见性层**：那套按 `10 + index*2` 分层，
-+# 8 个座位会顶到第 26 层，而 Godot 的 VisualInstance3D 只有 20 层；
-+# 它还写死了 `for i in 4`。那是另一笔账（本 mod 从没动过它，与原版逐字节一致），
-+# 在这里绕开它、直接开关节点的 visible，不去趟那摊浑水。
++# 本地同屏使用第 3–19 层（保留墙壁贴花第 10 层），只改当前相机的掩码。
++# 下方原有 visible 切换仅用于联机各端独立的场景树。
 +#
 +# ⚠️ 只记录**自己藏过的**，恢复时也只恢复这些：中途被淘汰的人视觉本来就是关的，
 +# 无差别 `visible = true` 会把他们凭空复活回画面里。
 +var _mp8_hidden_others: Array[Node3D] = []
++var _mp8_local_hidden_mask: int = 0
 +
 +
 +func _mp8_is_local_view() -> bool :
@@ -183,6 +238,20 @@ diff --git a/minigames/chisel_gauntlet_multiplayer/components/player/scripts/chi
 +
 +
 +func _mp8_hide_others(hide_them: bool) -> void :
++
++	# Split screens share one world. Hide bodies only in this camera, never by
++	# changing the shared visual node that the other seven cameras also render.
++	if GameManager.local_game:
++		if hide_them:
++			if _mp8_local_hidden_mask == 0:
++				for index in 8:
++					var bit: int = 1 << (_mp8_local_layer(index, true) - 1)
++					_mp8_local_hidden_mask |= local_camera.cull_mask & bit
++				local_camera.cull_mask &= ~_mp8_local_hidden_mask
++		else:
++			local_camera.cull_mask |= _mp8_local_hidden_mask
++			_mp8_local_hidden_mask = 0
++		return
 +
 +	# 只有"我自己这台机器上的我"才需要管镜头里有什么
 +	if not _mp8_is_local_view():

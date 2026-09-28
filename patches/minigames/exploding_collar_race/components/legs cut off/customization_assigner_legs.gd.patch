@@ -1,0 +1,15 @@
+diff --git a/minigames/exploding_collar_race/components/legs cut off/customization_assigner_legs.gd b/minigames/exploding_collar_race/components/legs cut off/customization_assigner_legs.gd
+--- a/minigames/exploding_collar_race/components/legs cut off/customization_assigner_legs.gd
++++ b/minigames/exploding_collar_race/components/legs cut off/customization_assigner_legs.gd
+@@ -28,6 +28,11 @@ func get_character_material():
+ 
+ func get_suit_texture(color_name: String) -> Texture:
+ 
++	if CustomizationAssigner.MP8_MIXED_SUITS.has(color_name):
++		var colors: Array = CustomizationAssigner.MP8_MIXED_SUITS[color_name]
++		return CustomizationAssigner.mp8_mix_texture(
++			get_suit_texture(colors[0]), get_suit_texture(colors[1]), color_name)
++
+ 	var texture: Texture
+ 
+ 	match color_name:

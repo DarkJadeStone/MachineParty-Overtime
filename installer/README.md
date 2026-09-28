@@ -1,203 +1,85 @@
-# Machine Party-Overtime
+# Machine Party — Overtime 1.7
 
-Raises the multiplayer cap from **4 to 8 players** — and reworks arenas, scoring and some
-mechanics per minigame so that eight actually works. Free and open source.
-**Game version: v2.1.2 (Steam).**
+Free, unofficial community mod for **Machine Party v2.1.2 (Steam)**.
+Online lobbies require the same complete version: `v2.1.2+overtime-1.7`.
+联机双方应显示 `v2.1.2+overtime-1.7`；不能与 1.6、1.7-dev 或其他 fork 混连。
 
-🎬 **See it in action**: https://www.bilibili.com/video/BV1Lo8b6QEh7/
+## Install / 安装
 
-> ## ⚠️ This mod is completely FREE. If you paid for it, you were scammed.
-> Get it only from the official Releases page. Nobody is authorised to sell it.
+1. Exit the game completely. / 完全退出游戏。
+2. Extract **the entire downloaded ZIP** to a folder. Keep `overtime_launcher.exe` and
+   `overtime_payload.zip` together. Do not run the exe inside the archive.
+   / 将下载的 ZIP **完整解压**到文件夹，让程序和补丁包放在一起。不要直接在压缩包里运行。
+3. Run `overtime_launcher.exe`, select Chinese or English, check the game directory, then
+   choose **Enable Overtime**. / 运行启动器，选择语言，核对游戏目录后点击「启用 Overtime」。
+4. Start the game normally from Steam. Everyone joining an online lobby needs the **same
+   complete Mod version**. / 照常从 Steam 启动游戏；联机双方必须使用完全相同的 Mod 版本。
 
----
+The launcher remains usable for detection and uninstall when the payload is missing.
+To enable or upgrade, re-extract the complete archive; a missing or damaged package is
+rejected before modifying an existing installation.
+缺少补丁包时仍能检查状态和卸载；启用或升级请重新完整解压。损坏或缺失的包会在改动现有安装前被拒绝。
 
-## Install
+## Windows security / Windows 安全提示
 
-1. **Fully exit the game.** (Wait until Steam stops showing you as In-Game.)
-2. Run **`overtime_launcher.exe`**.
-3. Press **Enable Overtime**.
+The program and payload are separate, inspectable files. Mod-only updates can reuse an
+unchanged launcher executable. The launcher requests normal user privileges and does not
+download executable code, install a background service, add startup tasks or change
+Defender settings. Enabling the mod still modifies your selected game's PCK data file.
+程序与补丁数据分开，只有 Mod 变化时可复用同一个启动器。启动器使用普通用户权限，不下载并运行程序，
+不安装后台服务、不添加开机启动、不修改 Defender 设置。启用 Mod 仍然需要修改所选游戏的 PCK 数据包。
 
-That is the whole thing. No runtime to install, nothing else to download.
+These executables are **unsigned**. Packaging changes do not guarantee that
+Defender or SmartScreen will accept a download. If Windows reports a named threat, record
+the threat name, filename and SHA-256 for the project issue; do not disable protection or
+add exclusions. SmartScreen reputation warnings and antivirus detections are different
+checks. A release should be tested with current, enabled Defender, and false detections
+submitted to Microsoft.
+本程序**尚未代码签名**，不能保证 Defender 或 SmartScreen 不再拦截。若出现具体病毒名称，
+请记录名称、被拦文件及 SHA-256 并反馈。不要关闭防护或添加排除项。SmartScreen 信誉提示与杀毒检测
+是不同机制；正式发布前仍需在更新并开启 Defender 的环境中测试，并向微软提交误报复核。
 
-**Installed correctly** = the version in the bottom right of the main menu ends with `+overtime`.
+`SHA256SUMS.txt` and `BUILDINFO.json` describe the build contents. Hashes detect a mismatch;
+they are not a publisher signature or an antivirus certificate.
+这两个文件用于核对构建内容；哈希不是发布者签名，也不是安全认证。
 
-> Windows may show "Windows protected your PC" because this exe is not code-signed
-> (a signing certificate costs money). Click **More info → Run anyway**. If you would rather not,
-> the source is public — build it yourself.
+## Restore / 还原
 
-## The launcher does not stay running
+Choose **Switch to vanilla** to restore and verify the original PCK. Keep
+`overtime_restore.dat` beside the installed PCK. It records the original index and length
+needed to undo the patch. Do not delete it while the mod is installed.
+点击「切回原版」后，程序会还原并校验原始 PCK。启用期间请保留游戏目录的 `overtime_restore.dat`。
 
-**Overtime is not loaded at runtime.** Enabling it rewrites your game data once, and that is the
-end of it:
+An interrupted write can be recovered using this record. On a failed upgrade, recovery
+returns to the validated original game data; it does not promise to reinstall the old mod.
+If recovery cannot be verified, the launcher reports the failure and retains evidence.
+写入中断可用还原记录恢复。升级失败时回滚目标是校验过的原始游戏数据，不保证重新装回旧版 Mod。
+无法验证恢复结果时会明确报错并保留故障记录。
 
-- Once enabled, **launch the game from Steam exactly as you always have.** The mod is already in
-  your game files.
-- Nothing runs in the background, nothing starts with Windows, nothing hooks the game process.
-- The **Play** button is a convenience — it just asks Steam to start the game. Ignoring it changes
-  nothing.
-- You only open the launcher again to **switch back to vanilla**, switch back to Overtime, or check
-  which state you are in.
+Steam updates or “Verify integrity” can replace the PCK. Unknown game builds are rejected.
+Use **Browse** to choose the directory containing `Machine Party.pck`; do not run as
+administrator to work around a package or version error.
+Steam 更新或验证文件可能替换 PCK。不匹配的游戏版本会被拒绝。找不到游戏时用「浏览」选择 PCK
+所在文件夹；不要为了绕过补丁包或版本错误而以管理员身份运行。
 
-## What the buttons do
+## Options / 可选方式
 
-| Button | What it does |
-| --- | --- |
-| **Enable Overtime** / **Switch to vanilla** | Flips between the two. Takes about a second. |
-| **Play** | Asks Steam to launch the game. Optional. |
-| **Steam repair** | Opens Steam's "verify integrity of game files". Use it if something is broken and you have no way back. |
-| **Install log** | Shows exactly what the launcher did. **Attach this when reporting a problem.** |
-| **Game log** | Opens the folder holding the game's current `godot.log`. Attach that one when reporting an in-game bug (a crash, a black screen). It only opens a local folder — nothing is uploaded anywhere. |
+- **Play** asks Steam to start the game; the launcher can then close.
+  /「启动游戏」交给 Steam 启动，启动器无需常驻。
+- **Install log / Game log** open local logs; nothing is uploaded automatically.
+  / 安装日志、游戏日志只在本机打开，不会自动上传。
+- The separate CLI archive supports `overtime_install.exe --verify-package` and
+  `--uninstall`; see `--help` for path selection. Do not use its advanced force mode for
+  normal installations. / 命令行包可验证补丁或卸载，正常安装不要使用强制模式。
+- The separate **MPML** overlay package is an alternative installation route. Restore
+  vanilla before switching routes, and do not install both over the same PCK.
+  / MPML 覆盖包是另一种安装方式，切换前先还原，不能与 PCK 安装器叠加使用。
 
-## Three things you must know
+The source release contains diffs against scripts extracted from your own legitimate copy,
+plus the independent installer and build tools. No original art or sound assets are included.
+参考 NotAsher999 与 JaredMerritt 的 fork 中的功能方向、问题定位和修复思路，在本项目主线中重写实现；
+已阅读对方实现，不宣称严格净室开发。具体来源见仓库 docs/CREDITS.md。公开源码通过差异补丁发布，需自行从正版提取
+原始脚本；包内不附带原版美术与音频资源。
 
-1. **You need a legitimate copy of the game.** This program contains no game files; it patches
-   your own installation.
-2. **Everyone in the lobby must run the same mod version.** The version is part of the multiplayer
-   handshake and the host refuses mismatches. This is deliberate — mixing modded and unmodded
-   players fails mid-match in ways that are very hard to diagnose. So **while Overtime is enabled
-   you cannot play with unmodded friends**; switch back to vanilla first (one click).
-3. **Reverting is exact.** After switching back, the launcher verifies the result is byte-for-byte
-   identical to the original game data before telling you it succeeded.
-
-## FAQ
-
-**The mod disappeared after a few days.**
-Steam updated the game, or you ran "Verify integrity of game files" — both replace the game data.
-Just enable it again. If the *game version* changed, the launcher will stop and tell you: wait for
-an Overtime build that targets it. It will not patch a version it does not know.
-
-**"The current PCK does not match the vanilla build this mod knows."**
-Your game is not v2.1.2 (it updated), or another mod is installed. **Nothing was changed.** Safest
-fix: Steam → right click the game → Properties → Installed Files → Verify integrity, then check
-whether Overtime has a build for your version.
-
-**Can I use this together with a mod loader?**
-**Not right now.** Overtime installs by rewriting the game's `.pck`, so it is mutually exclusive with
-MachinePartyModLoader and any other tool that also modifies the PCK — pick one. The reason: the
-player cap lives in `const MAX_PLAYERS`, and GDScript inlines constants at compile time, so it
-cannot be changed at runtime, only by replacing compiled bytecode inside the PCK. Loaders that
-override scripts by `extends`-ing them cannot reach an inlined constant.
-
-**The launcher cannot find my game.**
-Use **Browse…** and pick the folder that contains `Machine Party.pck`
-(Steam → right click the game → Manage → Browse local files).
-
-**My friend cannot join / version mismatch.**
-You are on different Overtime versions, or one of you has it disabled. Compare the version strings
-in the bottom right of the main menu.
-
-**Will this get me banned / break achievements?**
-It replaces the game's own script data pack only — it does not touch the exe, any Steam dll, or
-achievement logic. It is still an unofficial modification: if something breaks, **revert to vanilla
-before reporting the bug to the developers.**
-
-## Source
-
-Fully open source. The repository publishes diffs against the game's own scripts — no game code or
-assets are redistributed — plus the launcher's complete source, so you can rebuild it yourself from
-your own legitimate copy.
-
-Unofficial third-party modification. Not affiliated with, authorized by, or endorsed by the
-developer or publisher of Machine Party.
-
----
-
-# Machine Party-Overtime
-
-把联机上限提到 **8 人** —— 并且逐个小游戏重做了场地、算分与部分玩法，不只是改大人数常量。
-免费、开源。**适用游戏版本：v2.1.2（Steam）。**
-
-🎬 **演示视频（B 站）**：https://www.bilibili.com/video/BV1Lo8b6QEh7/
-
-> ## ⚠️ 本 mod 完全免费。如果你为它花过钱，说明你被骗了。
-> 只从官方 Releases 页面下载。任何人都无权拿它收费。
-
----
-
-## 安装
-
-1. **完全退出游戏**（等 Steam 不再显示你「游戏中」）。
-2. 运行 **`overtime_launcher.exe`**。
-3. 点 **启用 Overtime**。
-
-就这些。不用装运行库，不用再下别的东西。
-
-**装好的标志**：主菜单右下角的版本号后面带 `+overtime`。
-
-> **Windows 可能弹「已保护你的电脑」**：因为这个 exe 没有买代码签名证书（那要花钱）。
-> 点「更多信息」→「仍要运行」。不放心就别装 —— 源码是公开的，可以自己编。
-
-## 启动器不需要常驻
-
-**Overtime 不是运行时加载的。** 启用一次就是改写一次游戏数据，改完就结束了：
-
-- 启用之后，**照常从 Steam 启动游戏**，跟以前一模一样。mod 已经在你的游戏文件里了。
-- 没有后台进程、不开机自启、不注入游戏进程。
-- **「启动游戏」按钮只是顺手** —— 它就是让 Steam 帮你启动游戏，不点也完全不影响。
-- 只有在你想**切回原版**、想**切回 Overtime**、或者想**看看现在是什么状态**时，才需要再打开它。
-
-## 几个按钮分别做什么
-
-| 按钮 | 作用 |
-| --- | --- |
-| **启用 Overtime** / **切回原版** | 在两者之间切换，大约一秒 |
-| **启动游戏** | 让 Steam 启动游戏。可有可无 |
-| **Steam 修复** | 打开 Steam 的「验证游戏文件的完整性」。出了问题又没别的办法时用它 |
-| **安装日志** | 看它到底做了什么。**报安装问题时请把这个一起发来** |
-| **游戏日志** | 直接打开游戏当前 `godot.log` 所在的文件夹。报**游戏内**的 bug（崩退、黑屏）时发这个。它只打开本地文件夹，**不会上传任何东西** |
-
-## 先说清楚三件事
-
-1. **你必须自己有正版 Machine Party。** 这个程序里**没有任何游戏文件** ——
-   只有 mod 改过的几十个脚本（几百 KB），补丁是打在你自己那份游戏上的。
-2. **一起玩的人必须都装，而且是同一版。** 版本号写进了联机握手，对不上会被房主直接拒绝。
-   这是故意的：装了和没装的混在一起玩，会在半局中间以很难查的方式出问题。
-   代价是**启用 Overtime 期间不能跟没装的朋友玩**，想一起玩就先切回原版（一次点击）。
-3. **还原是精确的。** 切回原版之后，程序会算一遍哈希、确认结果与原版**逐字节相同**才告诉你成功。
-
-## 常见问题
-
-**装完玩了几天，mod 没了？**
-Steam 更新了游戏，或者你点过「验证游戏文件的完整性」—— 两者都会把数据包换回原版。
-重新启用一次即可。**但如果是游戏版本变了**，启动器会停下来告诉你，要等 Overtime 出适配版本 ——
-它不会去打一个自己不认识的版本。
-
-**提示「当前数据包跟本 mod 认识的原版对不上」？**
-说明你那份游戏不是 v2.1.2（更新了），或者装过别的 mod。**程序没有动你的文件。**
-最稳的办法：先用 Steam「验证游戏文件的完整性」拿回原版，再看 Overtime 有没有出适配版本。
-
-**能和 mod loader 一起用吗？**
-**目前不能。** Overtime 是靠重打游戏数据包（`.pck`）安装的，跟 MachinePartyModLoader
-以及任何同样改 PCK 的工具**互斥，请二选一**。原因：人数上限写在 `const MAX_PLAYERS` 里，
-而 GDScript 的常量是编译期内联的，运行时改不了，只能替换包里已编译的字节码；
-而那类用 `extends` 继承原脚本做覆盖的加载器，够不到一个已经内联的常量。
-
-**启动器找不到我的游戏？**
-点「**浏览…**」，选那个装着 `Machine Party.pck` 的目录
-（Steam 里右键游戏 → 管理 → 浏览本地文件，打开的就是它）。
-
-**朋友进不来，提示版本不匹配？**
-两边的 Overtime 版本不一样（或者一边没启用）。对一下主菜单右下角的版本号。
-
-**还原数据（`overtime_restore.dat`）能删吗？**
-删了就没法一键切回原版了，只能靠 Steam「验证游戏文件的完整性」。它只有几 KB，留着吧。
-
-**会不会被封号 / 影响成就？**
-mod 只替换游戏自己的脚本数据包，不碰 exe、不碰 Steam 相关的 dll，也不改成就逻辑。
-但它毕竟是非官方修改：出了任何问题，**先还原成原版再向游戏开发者反馈**。
-
-## 它到底改了什么
-
-- 联机人数上限 4 → 8（大厅席位、出生点、记分板等一起跟着改）
-- **逐个小游戏**做 8 人适配：出生点、道具数量、场地摆位、算分名次；
-  其中两个小游戏的玩法机制也改了（仓库的 `docs/MINIGAMES.md` 里逐条写明）
-- 给游戏版本号加 `+overtime` 后缀，让装了和没装的互相进不了房
-
-**没改**：游戏的美术资源、音频、成就逻辑、任何与付费/授权相关的东西。
-
-## 源码
-
-完全开源。仓库里公开的是**相对游戏脚本的差异补丁**（不转发任何游戏代码与资产），
-加上启动器的完整源码 —— 你可以拿自己那份正版从头把它编出来。
-
-非官方第三方修改，与 Machine Party 的开发商、发行商无关，未获其背书。
+Not affiliated with or endorsed by Machine Party's developer or publisher.
+非官方第三方修改，未获游戏开发商或发行商背书。禁止将免费 Mod 冒充收费产品。

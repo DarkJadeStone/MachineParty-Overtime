@@ -241,10 +241,34 @@ diff --git a/minigames/knife_at_the_office/scripts/knife_at_the_office.gd b/mini
  		player_character.item_found.connect(_on_item_found)
  		player_character.infected.connect(_on_player_infected)
  		player_character.dead.connect(_on_player_died)
-@@ -154,6 +346,836 @@ func spawn_players():
+@@ -145,15 +337,859 @@ func spawn_players():
+ 
+ 	if GameManager.local_game:
+ 		local_handler.set_players(players.values())
++		_mp8_prepare_local_world()
+ 
+ 		for i in players.size():
+ 			var network_id = players.keys()[i]
+ 			var player = players[network_id]
+-			var starting_layer = 11 + (i * 2)
++			# Preserve world layers 1..4; each seat owns one of eight FoW pairs.
++			var starting_layer = 5 + (i * 2)
+ 			player.set_local_values(starting_layer)
  			for mesh in fow_meshes:
  				mesh.set_layer_mask_value(starting_layer, true)
  
++func _mp8_prepare_local_world() -> void:
++	# The retail projector beam uses layer 10, now P3's private fog output.
++	# Move only this shared visual, and keep projector illumination/shadows
++	# on world geometry rather than the per-seat fog compositing meshes.
++	var beam := get_node_or_null("Geometry/projector beam") as MeshInstance3D
++	if beam != null:
++		beam.layers = 1
++	var projector := get_node_or_null("projector light new") as Light3D
++	if projector != null:
++		projector.light_cull_mask &= 15
++		projector.shadow_caster_mask &= 15
++
 +# [MP8] 出生点 4 → 8：**凸包内最远点插入**（T4b 已验证的算法，照抄 network_manager
 +# 的 `_mp8_spread_inside`，一字未改地搬过来）。
 +#
@@ -1078,7 +1102,7 @@ diff --git a/minigames/knife_at_the_office/scripts/knife_at_the_office.gd b/mini
  func all_players_loaded():
  	super.all_players_loaded()
  
-@@ -189,10 +1211,19 @@ func end_game():
+@@ -189,10 +1225,19 @@ func end_game():
  
  	await get_tree().create_timer(1.0).timeout
  
@@ -1099,7 +1123,7 @@ diff --git a/minigames/knife_at_the_office/scripts/knife_at_the_office.gd b/mini
  	player_scores_finalized.emit(player_scores)
  
  	await get_tree().create_timer(1.0).timeout
-@@ -206,9 +1237,21 @@ func start_2nd_phase_music():
+@@ -206,9 +1251,21 @@ func start_2nd_phase_music():
  	MusicManager.play_kato_2nd_phase_music()
  	speaker_syringe_found.play()
  
@@ -1121,7 +1145,7 @@ diff --git a/minigames/knife_at_the_office/scripts/knife_at_the_office.gd b/mini
  
  
  func player_disconnected(_network_id: int):
-@@ -220,6 +1263,15 @@ func player_disconnected(_network_id: int):
+@@ -220,6 +1277,15 @@ func player_disconnected(_network_id: int):
  	remove_player_rpc.rpc(_network_id)
  	await get_tree().create_timer(1.0).timeout
  
@@ -1137,7 +1161,7 @@ diff --git a/minigames/knife_at_the_office/scripts/knife_at_the_office.gd b/mini
  	check_game_end()
  
  
-@@ -230,7 +1282,15 @@ func remove_player_rpc(_network_id: int):
+@@ -230,7 +1296,15 @@ func remove_player_rpc(_network_id: int):
  	var player_instance = players.get(_network_id, null)
  	if player_instance:
  
@@ -1154,7 +1178,7 @@ diff --git a/minigames/knife_at_the_office/scripts/knife_at_the_office.gd b/mini
  		player_instance.queue_free()
  
  		player_scores.erase(_network_id)
-@@ -258,36 +1318,190 @@ func enable_player_fow_rpc():
+@@ -258,36 +1332,190 @@ func enable_player_fow_rpc():
  		p.set_fow_rpc.rpc(true)
  
  @rpc("any_peer", "call_local", "reliable")
@@ -1355,7 +1379,7 @@ diff --git a/minigames/knife_at_the_office/scripts/knife_at_the_office.gd b/mini
  		start_projector_hide_hunt_loop_rpc.rpc()
  	projector_started = true
  	await get_tree().create_timer(1.5).timeout
-@@ -295,12 +1509,17 @@ func _on_item_found(_network_id):
+@@ -295,12 +1523,17 @@ func _on_item_found(_network_id):
  	if not hunting_phase:
  		hunting_phase = true
  

@@ -1,0 +1,60 @@
+diff --git a/scripts/scenes/game/states/minigame_playing_state.gd b/scripts/scenes/game/states/minigame_playing_state.gd
+--- a/scripts/scenes/game/states/minigame_playing_state.gd
++++ b/scripts/scenes/game/states/minigame_playing_state.gd
+@@ -1,13 +1,23 @@
+ extends State
+ 
++var _mp8_finish_source: WeakRef
++var _mp8_finish_callback: Callable
++
+ func enter(_msg: Dictionary = {}) -> void :
+ 	state_time = 0.0
+ 
+ 	if multiplayer.is_server():
+-		owner.minigame.minigame_finished.connect(_on_minigame_finished)
++		# Bind the concrete instance and generation, not owner's mutable minigame.
++		_mp8_finish_source = weakref(owner.minigame)
++		_mp8_finish_callback = _on_minigame_finished
++		# LocalGame uses this same state resource and retains its original flow.
++		if owner.has_method("mp8_claim_round_finish"):
++			_mp8_finish_callback = _on_minigame_finished.bind(
++				owner.minigame.get_instance_id(), owner._mp8_round_epoch)
++		owner.minigame.minigame_finished.connect(_mp8_finish_callback)
+ 
+ func exit(_msg: Dictionary = {}) -> void :
+-	pass
++	_mp8_disconnect_finished()
+ 
+ func update(_delta: float) -> void :
+ 	pass
+@@ -15,11 +25,18 @@ func update(_delta: float) -> void :
+ func update_physics(_delta: float) -> void :
+ 	pass
+ 
++func _mp8_disconnect_finished() -> void :
++	var source = _mp8_finish_source.get_ref() if _mp8_finish_source != null else null
++	if is_instance_valid(source) and source.minigame_finished.is_connected(_mp8_finish_callback):
++		source.minigame_finished.disconnect(_mp8_finish_callback)
+ 
+-
+-func _on_minigame_finished(_network_id: int):
+-
+-	owner.minigame.minigame_finished.disconnect(_on_minigame_finished)
++func _on_minigame_finished(_network_id: int, instance_id: int = 0, epoch: int = -1):
++	# Claim before advancing either scores or the playlist. A pending restart and
++	# an old/duplicate Finished signal must not both advance the same round.
++	if owner.has_method("mp8_claim_round_finish"):
++		if not owner.mp8_claim_round_finish(instance_id, epoch):
++			return
++	_mp8_disconnect_finished()
+ 	MusicManager.filter_controller.begin_shift(300, 20000, 12)
+ 
+ 	if multiplayer.is_server():
+@@ -43,7 +60,6 @@ func _on_minigame_finished(_network_id: int):
+ 		owner.update_scores(more_rounds)
+ 
+ 		if more_rounds:
+-
+ 			owner.load_minigame(owner.session_minigame_list[owner.session_minigame_index], true)
+ 			return
+ 

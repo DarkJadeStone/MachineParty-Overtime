@@ -31,7 +31,7 @@ $out  = Join-Path $root "patch_gdc"
 $gt   = Join-Path $root "game_test"
 $orig = Join-Path $gt "Machine Party.pck.orig"
 
-$needs = @($exe, $p)
+$needs = @($exe, (Join-Path $root 'tools\gdre\gdre_tools.pck'), $p)
 if (-not $CompileOnly) { $needs += $orig }
 foreach ($needed in $needs) {
     if (-not (Test-Path $needed)) { throw "找不到 $needed" }
@@ -73,7 +73,7 @@ foreach ($s in $sources) { $cargs += "--compile=`"$($s.FullName)`"" }
 $cargs += @("--bytecode=4.5.2", "--output=`"$out`"")
 
 $cerr = Join-Path $env:TEMP "mp8_compile.err"
-Start-Process $exe -ArgumentList $cargs -NoNewWindow -Wait `
+$compilerProcess = Start-Process $exe -ArgumentList $cargs -WindowStyle Hidden -Wait -PassThru `
     -RedirectStandardOutput (Join-Path $env:TEMP "mp8_compile.out") -RedirectStandardError $cerr
 
 # 每个源文件都必须产出一个同名 .gdc，缺一个就是编译失败
@@ -82,7 +82,7 @@ foreach ($s in $sources) {
     $gdc = Join-Path $out ($s.BaseName + ".gdc")
     if (-not (Test-Path $gdc)) { $missing += $s.Name }
 }
-if ($missing.Count -gt 0) {
+if ($missing.Count -gt 0 -or $compilerProcess.ExitCode -ne 0) {
     Write-Host "编译失败，缺少产物：$($missing -join ', ')" -ForegroundColor Red
     ((Get-Content $cerr -Raw) -split "`r|`n") |
         Where-Object { $_ -match "rror|ailed" } | Select-Object -First 20
@@ -112,7 +112,7 @@ $newPck = Join-Path $gt "new.pck"
 if (Test-Path $newPck) { Remove-Item $newPck -Force }
 $pargs += "--output=`"$newPck`""
 
-Start-Process $exe -ArgumentList $pargs -NoNewWindow -Wait `
+Start-Process $exe -ArgumentList $pargs -WindowStyle Hidden -Wait `
     -RedirectStandardError (Join-Path $env:TEMP "mp8_pack.err")
 
 if (-not (Test-Path $newPck)) { throw "打包失败：没有产出 new.pck" }

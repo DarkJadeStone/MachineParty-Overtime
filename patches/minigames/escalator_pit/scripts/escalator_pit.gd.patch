@@ -1,7 +1,7 @@
 diff --git a/minigames/escalator_pit/scripts/escalator_pit.gd b/minigames/escalator_pit/scripts/escalator_pit.gd
 --- a/minigames/escalator_pit/scripts/escalator_pit.gd
 +++ b/minigames/escalator_pit/scripts/escalator_pit.gd
-@@ -42,6 +42,1242 @@ var camera_progress: float = PI + (PI * 0.5)
+@@ -42,6 +42,1255 @@ var camera_progress: float = PI + (PI * 0.5)
  
  var collective_speed: float = 0.0
  
@@ -87,6 +87,8 @@ diff --git a/minigames/escalator_pit/scripts/escalator_pit.gd b/minigames/escala
 +var _mp8_cam_side: float = 0.0    # 左右两台相机各自平移多少米
 +var _mp8_swing: float = 1.0       # 摇摆幅度倍率
 +var _mp8_fov: float = 0.0         # fov 覆盖值（0 = 用原版）
++var _mp8_local_camera_position: Vector3
++var _mp8_local_camera_saved: bool = false
 +var _mp8_plat: float = -1.0       # base platform 的单独拉伸倍率（-1 = 跟随全局）
 +var _mp8_light_check: Array[Node3D] = []   # 复制出来的灯，进树后打真实世界坐标自证
 +
@@ -475,6 +477,20 @@ diff --git a/minigames/escalator_pit/scripts/escalator_pit.gd b/minigames/escala
 +
 +	if _mp8_step <= 0.0:
 +		return
++	if GameManager.local_game:
++		# One shared view must contain both banks. Device IDs are not peer IDs;
++		# never apply the online per-player left/right offset to this camera.
++		_mp8_cam_side = 0.0
++		_mp8_swing = 1.0
++		_mp8_apply_swing()
++		if not _mp8_local_camera_saved:
++			_mp8_local_camera_position = camera_3d.position
++			_mp8_local_camera_saved = true
++		var viewport_size: Vector2 = get_viewport().get_visible_rect().size
++		var aspect: float = viewport_size.x / maxf(viewport_size.y, 1.0)
++		var pull: float = MP8_WIDE_SCALE_DEFAULT * maxf(1.0, (16.0 / 9.0) / maxf(aspect, 0.1))
++		camera_3d.position = _mp8_local_camera_position + Vector3.BACK * (_mp8_local_camera_position.length() * (pull - 1.0))
++		return
 +
 +	_mp8_apply_swing()
 +
@@ -504,9 +520,6 @@ diff --git a/minigames/escalator_pit/scripts/escalator_pit.gd b/minigames/escala
 +# ⚠️ Animation 是资源，会被**跨局缓存**住 —— 反复放大会一局比一局甩得更狠。
 +#    所以第一次先把原始键值存进这条轨的 meta，之后永远从 meta 重算（可重复调用不累积）。
 +func _mp8_apply_swing() -> void :
-+
-+	if is_equal_approx(_mp8_swing, 1.0):
-+		return
 +
 +	var mv: Animation = _mp8_cam_anim(&"move")
 +	if mv == null:
@@ -1244,7 +1257,7 @@ diff --git a/minigames/escalator_pit/scripts/escalator_pit.gd b/minigames/escala
  func _ready() -> void :
  	super._ready()
  
-@@ -52,10 +1288,20 @@ func _ready() -> void :
+@@ -52,10 +1301,22 @@ func _ready() -> void :
  		kill_area.area_entered.connect(_on_kill_area_entered)
  		finish_area.area_entered.connect(_on_finish_area_entered)
  
@@ -1257,6 +1270,8 @@ diff --git a/minigames/escalator_pit/scripts/escalator_pit.gd b/minigames/escala
  
 +	# [MP8] 相机：摇摆幅度 / fov（左右两台的平移在 spawn_players 里逐人发）
 +	_mp8_setup_camera()
++	if GameManager.local_game:
++		get_viewport().size_changed.connect(_mp8_setup_camera)
 +
 +	# [MP8] 场地手调（只有传了 mp8escedit 才开）
 +	if _mp8_edit_on:
@@ -1265,7 +1280,7 @@ diff --git a/minigames/escalator_pit/scripts/escalator_pit.gd b/minigames/escala
  	if GameManager.local_game:
  		await get_tree().create_timer(1.0).timeout
  		minigame_ready.emit(1)
-@@ -63,6 +1309,11 @@ func _ready() -> void :
+@@ -63,6 +1324,11 @@ func _ready() -> void :
  func initialize(_round_number: int, _total_rounds: int, _scores: Dictionary = {}):
  	super.initialize(_round_number, _total_rounds, _scores)
  
@@ -1277,7 +1292,7 @@ diff --git a/minigames/escalator_pit/scripts/escalator_pit.gd b/minigames/escala
  	spawn_players()
  
  	state_machine.transition_to_rpc.rpc(&"Round", {"round": _round_number, "total": _total_rounds})
-@@ -78,18 +1329,24 @@ func _process(delta: float) -> void :
+@@ -78,18 +1344,24 @@ func _process(delta: float) -> void :
  	if not multiplayer.is_server():
  		return
  
@@ -1309,13 +1324,13 @@ diff --git a/minigames/escalator_pit/scripts/escalator_pit.gd b/minigames/escala
  
  func _physics_process(_delta: float) -> void :
  
-@@ -133,6 +1390,14 @@ func spawn_players():
+@@ -133,6 +1405,14 @@ func spawn_players():
  
  		player_scores[player_presence.network_id] = 0
  
 +		# [MP8] 两台原版相机：这个玩家在左半场还是右半场，就把他那台机器的相机整体挪过去。
 +		# 归属按**出生点的实际 x**判，不用下标算术（残骸平台翻转配对那个坑：编号不可信，位置才可信）。
-+		if _mp8_cam_side > 0.0:
++		if not GameManager.local_game and _mp8_cam_side > 0.0:
 +			var side: float = _mp8_cam_side
 +			if player_spawn_positions[counter].position.x < 0.0:
 +				side = -_mp8_cam_side
@@ -1324,7 +1339,7 @@ diff --git a/minigames/escalator_pit/scripts/escalator_pit.gd b/minigames/escala
  		counter += 1
  
  func check_game_end():
-@@ -144,9 +1409,7 @@ func check_game_end():
+@@ -144,9 +1424,7 @@ func check_game_end():
  		ap.show_win_indicator_rpc.rpc()
  
  
@@ -1335,7 +1350,7 @@ diff --git a/minigames/escalator_pit/scripts/escalator_pit.gd b/minigames/escala
  
  	player_scores_finalized.emit(player_scores)
  
-@@ -156,6 +1419,48 @@ func check_game_end():
+@@ -156,6 +1434,48 @@ func check_game_end():
  	state_machine.transition_to_rpc.rpc(&"Finish")
  	set_effects_visibility_rpc.rpc(false)
  
@@ -1384,7 +1399,7 @@ diff --git a/minigames/escalator_pit/scripts/escalator_pit.gd b/minigames/escala
  func fade_in_ambience():
  
  	for speaker_controller in ambience_speaker_controllers:
-@@ -177,6 +1482,17 @@ func player_disconnected(_network_id: int):
+@@ -177,6 +1497,17 @@ func player_disconnected(_network_id: int):
  		player_instance.queue_free()
  
  	if multiplayer.is_server():
@@ -1402,7 +1417,7 @@ diff --git a/minigames/escalator_pit/scripts/escalator_pit.gd b/minigames/escala
  		check_game_end()
  
  
-@@ -195,17 +1511,33 @@ func _on_countdown_expired():
+@@ -195,17 +1526,33 @@ func _on_countdown_expired():
  		player.set_active_rpc.rpc(true)
  	state_machine.transition_to_rpc.rpc(&"Play")
  
@@ -1440,7 +1455,7 @@ diff --git a/minigames/escalator_pit/scripts/escalator_pit.gd b/minigames/escala
  
  		body.owner.finish_rpc.rpc()
  
-@@ -223,7 +1555,14 @@ func _on_kill_area_entered(body):
+@@ -223,7 +1570,14 @@ func _on_kill_area_entered(body):
  		active_players.erase(body.owner)
  		body.owner.kill_rpc.rpc()
  

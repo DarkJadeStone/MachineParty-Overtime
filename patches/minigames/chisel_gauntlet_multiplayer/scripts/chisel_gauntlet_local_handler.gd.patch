@@ -1,0 +1,210 @@
+diff --git a/minigames/chisel_gauntlet_multiplayer/scripts/chisel_gauntlet_local_handler.gd b/minigames/chisel_gauntlet_multiplayer/scripts/chisel_gauntlet_local_handler.gd
+--- a/minigames/chisel_gauntlet_multiplayer/scripts/chisel_gauntlet_local_handler.gd
++++ b/minigames/chisel_gauntlet_multiplayer/scripts/chisel_gauntlet_local_handler.gd
+@@ -54,18 +54,17 @@ var keyboard_values: Array
+ var texture_rects: Array[TextureRect]
+ var overlay_templates: Dictionary[ChiselGauntletPlayer, LocalOverlayTemplate]
+ 
+-func _process(_delta: float) -> void :
+-
+-	if keyboard_player:
+-
+-		var size = local_canvas_root.get_viewport_rect().end
+-		var mouse_position = local_canvas_root.get_global_mouse_position()
+-		var mouse_normalized = mouse_position / size
+-		var reciprocal: Vector2 = Vector2(
+-			1.0 / keyboard_values[1].x, 1.0 / keyboard_values[1].y
+-		)
+-
+-		fake_cursor.position = mouse_normalized * (keyboard_rect.size * reciprocal)
++func _process(_delta: float) -> void:
++	if not is_instance_valid(keyboard_player) or not is_instance_valid(keyboard_rect):
++		return
++	var screen_rect: Rect2 = keyboard_player.local_viewport.get_meta("mp8_input_rect", Rect2())
++	var local_point := mp8_screen_to_view(get_viewport().get_mouse_position(), screen_rect, keyboard_rect.size)
++	# Round states own `visible`. Only mask out-of-pane / paused input here,
++	# otherwise this loop re-shows a cursor hidden by RoundFinished.
++	var inside: bool = local_point.x >= 0 and not PauseMenu.active
++	fake_cursor.modulate.a = 1.0 if inside else 0.0
++	if inside:
++		fake_cursor.position = local_point
+ 
+ func show_all_tags(duration: float = 1.0):
+ 
+@@ -84,58 +83,131 @@ func hide_player_tag(player: ChiselGauntletPlayer):
+ 		overlay_templates[player].fade_out_name_label(0.5)
+ 
+ func center_mouse():
+-
+-	if keyboard_player:
+-
+-		var mouse_normalized = Vector2(0.5, 0.5)
+-		Input.warp_mouse(mouse_normalized * keyboard_rect.size)
++	if is_instance_valid(keyboard_player) and is_instance_valid(keyboard_rect):
++		var rect: Rect2 = keyboard_player.local_viewport.get_meta("mp8_input_rect", Rect2())
++		# mp8_input_rect is in root viewport coordinates, not window pixels.
++		get_viewport().warp_mouse(rect.get_center())
+ 
+ func set_players(players: Array[ChiselGauntletPlayer]):
+-
++	_mp8_clear_views()
++	_mp8_players.assign(players)
++	_mp8_players.sort_custom(func(a, b): return _mp8_seat(a) < _mp8_seat(b))
+ 	jumbotron_viewport.render_target_clear_mode = SubViewport.CLEAR_MODE_ALWAYS
+ 	jumbotron_viewport.render_target_update_mode = SubViewport.UPDATE_WHEN_VISIBLE
+-
+-	var player_count = players.size()
+-	var layout = Layouts[player_count]
+-	var viewport_rect: Rect2 = local_canvas_root.get_viewport_rect()
+-
+-	for i in players.size():
+-		var player: ChiselGauntletPlayer = players[i]
+-		var values = layout[i]
+-
+-		player.local_viewport.size = viewport_rect.end * values[1]
+-		var texture = player.local_viewport.get_texture()
+-		var texture_rect: = TextureRect.new()
+-		texture_rect.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+-		texture_rect.texture = texture
+-		texture_rect.clip_children = CanvasItem.CLIP_CHILDREN_AND_DRAW
+-
+-		local_canvas_root.add_child(texture_rect)
+-		texture_rect.position = viewport_rect.end * values[0]
+-		texture_rect.size = viewport_rect.end * values[1]
+-
+-		if not keyboard_player:
+-			if not player.player_presence.using_joystick:
+-				keyboard_player = player
+-				keyboard_rect = texture_rect
+-				keyboard_values = values
+-				fake_cursor.reparent(texture_rect)
+-				keyboard_player.interaction_handler.entered_interactable.connect(_on_entered_interactible)
+-				keyboard_player.interaction_handler.left_interactable.connect(_on_left_interactible)
+-
+-
+-
+-		var overlay_template = LOCAL_OVERLAY_TEMPLATE.instantiate()
+-		overlay_template.name_label.text = player.player_presence.network_name
+-
+-		local_after_post_processing_root.add_child(overlay_template)
+-		overlay_template.position = viewport_rect.end * values[0]
+-		overlay_template.size = viewport_rect.end * values[1]
+-
+-		overlay_templates[player] = overlay_template
++	for player in _mp8_players:
++		var display := TextureRect.new()
++		display.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
++		display.texture = player.local_viewport.get_texture()
++		display.clip_children = CanvasItem.CLIP_CHILDREN_AND_DRAW
++		display.mouse_filter = Control.MOUSE_FILTER_IGNORE
++		local_canvas_root.add_child(display)
++		texture_rects.append(display)
++		var overlay = LOCAL_OVERLAY_TEMPLATE.instantiate()
++		overlay.name_label.text = _mp8_player_tag(player)
++		overlay.mouse_filter = Control.MOUSE_FILTER_IGNORE
++		local_after_post_processing_root.add_child(overlay)
++		overlay_templates[player] = overlay
++		if not player.player_presence.using_joystick:
++			keyboard_player = player
++			keyboard_rect = display
++			fake_cursor.reparent(display)
++			player.interaction_handler.entered_interactable.connect(_on_entered_interactible)
++			player.interaction_handler.left_interactable.connect(_on_left_interactible)
++	_mp8_relayout()
+ 
+ func _on_entered_interactible():
+ 	fake_cursor_texture_rect.texture = cursor_hover_texture
+ 
+ func _on_left_interactible():
+ 	fake_cursor_texture_rect.texture = cursor_pointer_texture
++
++
++var _mp8_players: Array[ChiselGauntletPlayer] = []
++
++# One normalized layout drives textures, HUD, viewport sizes and pointer mapping.
++static func mp8_layout(count: int) -> Array[Rect2]:
++	var result: Array[Rect2] = []
++	if count <= 0:
++		return result
++	count = mini(count, 8)
++	if count <= 4:
++		for pair in Layouts[count]:
++			result.append(Rect2(pair[0], pair[1]))
++		return result
++	var columns: int = 3 if count <= 6 else 4
++	for i in count:
++		result.append(Rect2(Vector2(float(i % columns) / columns, float(i / columns) / 2.0),
++			Vector2(1.0 / columns, 0.5)))
++	return result
++
++static func mp8_pixel_rect(rect: Rect2, canvas_size: Vector2) -> Rect2:
++	var first := (rect.position * canvas_size).floor()
++	var last := (rect.end * canvas_size).floor()
++	return Rect2(first, (last - first).max(Vector2.ONE))
++
++static func mp8_screen_to_view(point: Vector2, screen_rect: Rect2, viewport_size: Vector2) -> Vector2:
++	if screen_rect.size.x <= 0 or screen_rect.size.y <= 0 or not screen_rect.has_point(point):
++		return Vector2(-1, -1)
++	return (point - screen_rect.position) / screen_rect.size * viewport_size
++
++func _mp8_seat(player) -> int:
++	var fallback: int = maxi(0, PlayerManager.player_presences.keys().find(player.player_presence.network_id))
++	return int(player.player_presence.get_meta("mp8_local_seat", fallback))
++
++func _mp8_player_tag(player) -> String:
++	var device: String = "Pad" if player.player_presence.using_joystick else "KB"
++	return "P%d · %s · %s" % [_mp8_seat(player) + 1, player.player_presence.network_name, device]
++
++func _ready() -> void:
++	get_viewport().size_changed.connect(_mp8_relayout)
++	if is_instance_valid(local_canvas_root):
++		local_canvas_root.resized.connect(_mp8_relayout)
++
++func _mp8_relayout() -> void:
++	if _mp8_players.is_empty() or not is_instance_valid(local_canvas_root):
++		return
++	var canvas_size: Vector2 = local_canvas_root.size
++	if canvas_size.x <= 0 or canvas_size.y <= 0:
++		canvas_size = local_canvas_root.get_viewport_rect().size
++	var layout := mp8_layout(_mp8_players.size())
++	for i in _mp8_players.size():
++		var player = _mp8_players[i]
++		if not is_instance_valid(player):
++			continue
++		var rect := mp8_pixel_rect(layout[i], canvas_size)
++		var display: TextureRect = texture_rects[i]
++		display.position = rect.position
++		display.size = rect.size
++		player.local_viewport.size = Vector2i(rect.size)
++		var transform := display.get_global_transform_with_canvas()
++		player.local_viewport.set_meta("mp8_input_rect",
++			Rect2(transform * Vector2.ZERO, (transform * rect.size) - (transform * Vector2.ZERO)))
++		_mp8_place_overlay(player, rect)
++
++func _mp8_place_overlay(player, rect: Rect2) -> void:
++	var overlay = overlay_templates[player]
++	overlay.position = rect.position
++	overlay.size = rect.size
++
++func _mp8_clear_views() -> void:
++	if is_instance_valid(keyboard_player):
++		var interaction = keyboard_player.interaction_handler
++		if interaction.entered_interactable.is_connected(_on_entered_interactible):
++			interaction.entered_interactable.disconnect(_on_entered_interactible)
++		if interaction.left_interactable.is_connected(_on_left_interactible):
++			interaction.left_interactable.disconnect(_on_left_interactible)
++	if is_instance_valid(fake_cursor) and fake_cursor.get_parent() != local_canvas_root:
++		fake_cursor.reparent(local_canvas_root)
++	keyboard_player = null
++	keyboard_rect = null
++	for display in texture_rects:
++		if is_instance_valid(display):
++			display.get_parent().remove_child(display)
++			display.queue_free()
++	texture_rects.clear()
++	for overlay in overlay_templates.values():
++		if is_instance_valid(overlay):
++			overlay.get_parent().remove_child(overlay)
++			overlay.queue_free()
++	overlay_templates.clear()
++	_mp8_players.clear()

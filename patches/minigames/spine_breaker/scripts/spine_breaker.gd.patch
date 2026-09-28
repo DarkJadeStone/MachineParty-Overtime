@@ -1,7 +1,16 @@
 diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_breaker/scripts/spine_breaker.gd
 --- a/minigames/spine_breaker/scripts/spine_breaker.gd
 +++ b/minigames/spine_breaker/scripts/spine_breaker.gd
-@@ -24,23 +24,334 @@ var player_count: int = 0
+@@ -2,6 +2,8 @@ extends Minigame
+ 
+ class_name SpineBreakerMinigame
+ 
++const MP8_LAYOUT_LIMIT: float = 10000.0
++
+ const player_scene = preload("uid://b774mjndcdeqg")
+ 
+ @export_category("Nodes")
+@@ -24,19 +26,332 @@ var player_count: int = 0
  
  var playing: bool = false
  
@@ -91,7 +100,8 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
 +# ⚠️ 它同时也是**正常节奏的旋钮**，别在正式游玩时传：
 +#    周期 = 引信 + 本值，两台错开量就是靠这两个值不等长维持的（见 MP8_DEVICE_WAIT 那段）。
 +func _mp8_wait_forced() -> float :
-+
++	if not NetworkManager.mp8_development_tools_allowed():
++		return 0.0
 +	for a in OS.get_cmdline_args():
 +		var s: String = str(a)
 +		if s.begins_with("mp8devwait="):
@@ -185,7 +195,8 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
 +# 故意做成"覆盖全部" —— 它的用途正是**手动制造锁步**来复现"两个人同时死"那个现象
 +# （两台引信一样长就会同帧杀人，见 MP8_DEVICE_FUSE 那段）。
 +func _mp8_fuse_forced() -> float :
-+
++	if not NetworkManager.mp8_development_tools_allowed():
++		return 0.0
 +	for a in OS.get_cmdline_args():
 +		var s: String = str(a)
 +		if s.begins_with("mp8spinefuse="):
@@ -328,16 +339,12 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
 +		# [MP8] 原版信号不带参数，两台机器就分不清是谁在要新目标 —— 用 bind 把自己带上
 +		device.request_new_target.connect(_on_device_requested_target.bind(device))
  
++	# Local Ready listeners initialize synchronously; the spawn pool must exist.
++	_mp8_ready()
  	if GameManager.local_game:
  		await get_tree().create_timer(1.0).timeout
  		minigame_ready.emit(1)
- 
-+	_mp8_ready()
-+
- func _physics_process(_delta: float) -> void :
- 
- 	if not playing:
-@@ -51,7 +362,7 @@ func _physics_process(_delta: float) -> void :
+@@ -51,7 +366,7 @@ func _physics_process(_delta: float) -> void :
  			continue
  
  		var query = PhysicsRayQueryParameters3D.create(
@@ -346,7 +353,7 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
  			p.global_position
  		)
  
-@@ -91,16 +402,31 @@ func initialize(_round_number: int, _total_rounds: int, _scores: Dictionary = {}
+@@ -91,16 +406,31 @@ func initialize(_round_number: int, _total_rounds: int, _scores: Dictionary = {}
  
  func spawn_players():
  
@@ -383,7 +390,7 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
  		var player_character = player_scene.instantiate()
  		players_node.add_child(player_character, true)
  
-@@ -115,7 +441,16 @@ func spawn_players():
+@@ -115,7 +445,16 @@ func spawn_players():
  
  		player_scores[network_id] = 0
  
@@ -401,7 +408,7 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
  
  func cleanup():
  
-@@ -131,6 +466,15 @@ func player_disconnected(_network_id: int):
+@@ -131,6 +470,15 @@ func player_disconnected(_network_id: int):
  	remove_player_rpc.rpc(_network_id)
  	await get_tree().create_timer(1.0).timeout
  
@@ -417,7 +424,7 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
  	check_game_end()
  
  func check_game_end():
-@@ -144,17 +488,33 @@ func check_game_end():
+@@ -144,17 +492,33 @@ func check_game_end():
  	finished = true
  
  	set_playing_rpc.rpc(false)
@@ -453,7 +460,7 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
  	player_scores_finalized.emit(player_scores)
  
  	await get_tree().create_timer(2.0).timeout
-@@ -172,7 +532,11 @@ func remove_player_rpc(_network_id: int):
+@@ -172,7 +536,11 @@ func remove_player_rpc(_network_id: int):
  	if player_instance:
  
  		if multiplayer.is_server():
@@ -466,7 +473,7 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
  
  		player_instance.queue_free()
  		players.erase(_network_id)
-@@ -187,18 +551,175 @@ func set_playing_rpc(_playing: bool):
+@@ -187,18 +555,175 @@ func set_playing_rpc(_playing: bool):
  func _on_countdown_tick(time_left: int):
  	super._on_countdown_tick(time_left)
  
@@ -649,7 +656,7 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
  
  func _on_countdown_expired():
  	super._on_countdown_expired()
-@@ -211,14 +732,19 @@ func _on_countdown_expired():
+@@ -211,14 +736,19 @@ func _on_countdown_expired():
  
  	set_playing_rpc.rpc(true)
  
@@ -673,7 +680,7 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
  
  func _on_player_died(_network_id: int):
  
-@@ -226,6 +752,932 @@ func _on_player_died(_network_id: int):
+@@ -226,6 +756,944 @@ func _on_player_died(_network_id: int):
  		active_players.erase(_network_id)
  		dead_players.append(_network_id)
  
@@ -700,7 +707,7 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
 +
 +	# 手调模式**故意不跟 -debug-tools 走**：它要抢一批按键，挂在 -debug-tools 上
 +	# 会让每次普通测试都莫名其妙被抢键。发布版天然干净（照抄 -GunEdit 的规矩）。
-+	_mp8_edit_on = args.has("mp8spineedit")
++	_mp8_edit_on = args.has("mp8spineedit") and multiplayer.is_server() and NetworkManager.mp8_development_tools_allowed()
 +
 +	_mp8_init_pool(args.has("mp8spinenofile"))
 +
@@ -971,14 +978,22 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
 +# ⚠️ 不直接在服务器上设 global_position 了事：device 的物理只在服务器跑
 +# （它 _ready() 里对非服务器 set_physics_process(false)），客户端那份得靠这条 RPC 对齐，
 +# 否则开局各机看到的装置位置不一样。
-+@rpc("any_peer", "call_local", "reliable")
++@rpc("authority", "call_local", "reliable")
 +func mp8_device_place_rpc(dev_path: NodePath, pos: Vector3) -> void :
-+
++	if not _mp8_server_command() or not _mp8_valid_layout_position(pos):
++		return
 +	var d = get_node_or_null(dev_path)
-+	if d == null or not is_instance_valid(d):
++	if d == null or not is_instance_valid(d) or not _mp8_devices.has(d):
 +		return
 +	d.global_position = pos
 +	d.velocity = Vector3.ZERO
++
++func _mp8_server_command() -> bool:
++	var sender: int = multiplayer.get_remote_sender_id()
++	return sender == get_multiplayer_authority() or (sender == 0 and multiplayer.is_server())
++
++func _mp8_valid_layout_position(pos: Vector3) -> bool:
++	return pos.is_finite() and absf(pos.x) <= MP8_LAYOUT_LIMIT and absf(pos.y) <= MP8_LAYOUT_LIMIT and absf(pos.z) <= MP8_LAYOUT_LIMIT
 +
 +
 +# ───────────────────────────── 第二台装置
@@ -992,9 +1007,10 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
 +#
 +# ⚠️ 用 load() 不用 preload()：preload 在脚本**加载期**解析，路径一旦写错就是
 +# 整个脚本加载失败 → 8 个屏全黑（坑第 24 条那种）。load 失败只是这里拿到 null。
-+@rpc("any_peer", "call_local", "reliable")
++@rpc("authority", "call_local", "reliable")
 +func mp8_ensure_devices_rpc(want: int) -> void :
-+
++	if not _mp8_server_command() or want < 1 or want > 4:
++		return
 +	if device == null or not is_instance_valid(device):
 +		return
 +
@@ -1103,9 +1119,10 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
 +# ⚠️ 原版的 active / deactivated 两个字段**故意不碰** —— 全脚本没有任何地方读它们
 +# （active 只在 device 那个恒 return 的 navigation handler 里读到），
 +# 属于死变量，动它反而可能唤醒某条没人走过的分支。
-+@rpc("any_peer", "call_local", "reliable")
++@rpc("authority", "call_local", "reliable")
 +func mp8_device_reset_rpc() -> void :
-+
++	if not _mp8_server_command():
++		return
 +	for d in _mp8_devices:
 +
 +		if not is_instance_valid(d):
@@ -1416,7 +1433,8 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
 +
 +
 +func _unhandled_key_input(event: InputEvent) -> void :
-+
++	if not multiplayer.is_server() or not NetworkManager.mp8_development_tools_allowed():
++		return
 +	if not _mp8_edit_on or _mp8_pool.is_empty():
 +		return
 +	var key := event as InputEventKey
@@ -1528,10 +1546,11 @@ diff --git a/minigames/spine_breaker/scripts/spine_breaker.gd b/minigames/spine_
 +
 +# 试摆：把在场的人按点池顺序摆到前 N 个点上，直接看 8 个人站上去是什么样。
 +# ⚠️ 走 RPC 是因为要动**所有**玩家的位置，不是本地视觉件。
-+@rpc("any_peer", "call_local", "reliable")
++@rpc("authority", "call_local", "reliable")
 +func mp8_spine_tryout_rpc() -> void :
-+
-+	if not multiplayer.is_server():
++	if not multiplayer.is_server() or not _mp8_server_command():
++		return
++	if not _mp8_edit_on or not NetworkManager.mp8_development_tools_allowed():
 +		return
 +
 +	var list: Array = players.values()
