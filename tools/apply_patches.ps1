@@ -46,6 +46,7 @@ if (Test-Path $Out) {
     else { throw "$Out 已存在。确认可以覆盖后加 -Force 重跑。" }
 }
 New-Item -ItemType Directory -Force $Out | Out-Null
+$Out = (Resolve-Path $Out).Path
 
 Write-Host "打补丁：$($list.Count) 个"
 
@@ -53,6 +54,12 @@ $missing = @()
 $failed  = @()
 $ok      = 0
 
+# ⚠️ $Out 默认在仓库里面（<仓库>\patch）。git apply 在某个仓库里运行时，补丁路径按仓库根算，
+#    对不上就打印 "Skipped patch" 然后照样返回 0 —— 70 个全跳过，脚本还报全部成功。
+#    把 $Out 的上一级设成天花板，git 就找不到外层仓库，按当前目录打补丁。
+$ceilingBefore = $env:GIT_CEILING_DIRECTORIES
+$env:GIT_CEILING_DIRECTORIES = Split-Path -Parent $Out
+try {
 foreach ($p in $list) {
     # patches\modules\multiplayer\network_manager.gd.patch
     #   -> modules\multiplayer\network_manager.gd
@@ -74,7 +81,11 @@ foreach ($p in $list) {
     $code = $LASTEXITCODE
     Pop-Location
 
-    if ($code -ne 0) { $failed += $rel } else { $ok++ }
+    # 每个补丁都会改动文件；打完和原版一模一样就是没打上，返回码再是 0 也算失败。
+    if ($code -ne 0 -or (Get-FileHash $dest).Hash -eq (Get-FileHash $from).Hash) { $failed += $rel } else { $ok++ }
+}
+} finally {
+    $env:GIT_CEILING_DIRECTORIES = $ceilingBefore
 }
 
 Write-Host ""
