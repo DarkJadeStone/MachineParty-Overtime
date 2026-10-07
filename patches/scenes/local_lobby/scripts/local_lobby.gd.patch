@@ -10,35 +10,43 @@ diff --git a/scenes/local_lobby/scripts/local_lobby.gd b/scenes/local_lobby/scri
  
  @export var players_node: Node3D
  @export var local_lobby_player_controls: Array[LocalLobbyPlayerControls]
-@@ -48,6 +48,48 @@ signal player_joined(player, data)
+@@ -48,6 +48,56 @@ signal player_joined(player, data)
  signal player_left(player)
  signal player_ready_toggled(player)
  
 +func _enter_tree() -> void:
 +	_mp8_expand_seats()
 +
-+# Duplicate a model and its own controls as one seat. Exported Node references
-+# outside the duplicated subtree need explicit rebinding (especially the dresser).
++# 本地大厅和联机大厅是同一个房间，做法也照搬联机的 _mp8_extend_lobby：
++# 原版 4 个座位的坐姿烘进了各自的 Armature，每位偏移不同，所以一个都不挪；
++# 第 5–8 位是第 1–4 位的副本，整排平移 MP8_LOCAL_ROW2_OFFSET，椅子同样复制一排，摄像机拉远。
++# Exported Node references outside the duplicated subtree need explicit rebinding (especially the dresser).
 +func _mp8_expand_seats() -> void:
-+	var model_source: Node = players_node.get_child(0)
++	var n: int = local_lobby_player_controls.size()
++	if n >= MAX_PLAYERS:
++		return
 +	var control_source = local_lobby_player_controls[0]
-+	var assigner_path: NodePath = model_source.get_path_to(control_source.customization_assigner)
-+	while local_lobby_player_controls.size() < MAX_PLAYERS:
-+		var seat: int = local_lobby_player_controls.size()
-+		var model: Node = model_source.duplicate(14)
++	for seat in range(n, MAX_PLAYERS):
++		var model_source: Node3D = players_node.get_child(seat % n)
++		var assigner_path: NodePath = model_source.get_path_to(local_lobby_player_controls[seat % n].customization_assigner)
++		var model: Node3D = model_source.duplicate(14)
 +		model.name = "MP8Player%d" % (seat + 1)
 +		_mp8_remap_clone_exports(model_source, model, model_source, model)
 +		players_node.add_child(model)
++		model.position = model_source.position + MP8_LOCAL_ROW2_OFFSET
 +		var controls = control_source.duplicate(14) as LocalLobbyPlayerControls
 +		_mp8_remap_clone_exports(control_source, controls, control_source, controls)
 +		controls.customization_assigner = model.get_node(assigner_path)
 +		controls.seat_index = seat
 +		control_source.get_parent().add_child(controls)
 +		local_lobby_player_controls.append(controls)
-+	for seat in MAX_PLAYERS:
-+		var model = players_node.get_child(seat)
-+		model.position = Vector3(-8.4 + seat * 2.4, 0.0, 0.0)
-+		model.scale = Vector3.ONE * 0.68
++	NetworkManager._mp8_clone_chairs(players_node, MP8_LOCAL_ROW2_OFFSET)
++	var cam = players_node.get_parent().get_node_or_null("Camera3D")
++	if cam:
++		cam.position = Vector3(cam.position.x, cam.position.y * 1.08, cam.position.z * 1.22)
++
++# 比联机的 (0.6, 0, 5.2) 更靠前、更居中：按实机截图量过，这个偏移下第二排不挡第一排任何人的头。
++const MP8_LOCAL_ROW2_OFFSET := Vector3(0.2, 0.0, 5.8)
 +
 +func _mp8_remap_clone_exports(source: Node, copy: Node, source_root: Node, copy_root: Node) -> void:
 +	for property in source.get_property_list():
@@ -59,7 +67,7 @@ diff --git a/scenes/local_lobby/scripts/local_lobby.gd b/scenes/local_lobby/scri
  func _ready():
  
  	Globals.locale_changed.connect(check_if_locale_requires_vertical_adjustment)
-@@ -95,6 +137,7 @@ func _ready():
+@@ -95,6 +145,7 @@ func _ready():
  	for local_control in local_lobby_player_controls:
  		local_control.set_speakers(speaker_hover, speaker_press)
  		local_control.player_ready_changed.connect(_on_player_ready_changed)
@@ -67,7 +75,7 @@ diff --git a/scenes/local_lobby/scripts/local_lobby.gd b/scenes/local_lobby/scri
  
  	if GameManager.local_game:
  		try_rejoin_existing_players()
-@@ -117,12 +160,17 @@ func try_rejoin_existing_players():
+@@ -117,12 +168,17 @@ func try_rejoin_existing_players():
  	var rejoin_player_data: Array
  	for player_id in PlayerManager.player_presences.keys():
  		var player_presence: PlayerPresence = PlayerManager.player_presences[player_id]
@@ -86,7 +94,7 @@ diff --git a/scenes/local_lobby/scripts/local_lobby.gd b/scenes/local_lobby/scri
  		})
  
  	PlayerManager.reset()
-@@ -212,6 +260,8 @@ func register_buttons():
+@@ -212,6 +268,8 @@ func register_buttons():
  
  func _process(_delta):
  
@@ -95,7 +103,7 @@ diff --git a/scenes/local_lobby/scripts/local_lobby.gd b/scenes/local_lobby/scri
  	if not active:
  		return
  
-@@ -243,12 +293,12 @@ func tick_countdown(delta):
+@@ -243,12 +301,12 @@ func tick_countdown(delta):
  		label_countdown.text = "! %s !" % str("%0.2f" % countdown_progress)
  
  func countdown_end_reached():
@@ -109,7 +117,7 @@ diff --git a/scenes/local_lobby/scripts/local_lobby.gd b/scenes/local_lobby/scri
  
  	set_ambience(false)
  	MusicManager.fade_out_menu_music(1)
-@@ -313,6 +363,8 @@ func next_player() -> int:
+@@ -313,6 +371,8 @@ func next_player() -> int:
  	return -1
  
  func join(device: int, is_joystick: bool):
@@ -118,7 +126,7 @@ diff --git a/scenes/local_lobby/scripts/local_lobby.gd b/scenes/local_lobby/scri
  	var player = next_player()
  	if player >= 0:
  
-@@ -348,7 +400,9 @@ func join(device: int, is_joystick: bool):
+@@ -348,7 +408,9 @@ func join(device: int, is_joystick: bool):
  				MultiplayerInput.set_ui_action_device(device)
  
  func rejoin(data):
@@ -129,7 +137,7 @@ diff --git a/scenes/local_lobby/scripts/local_lobby.gd b/scenes/local_lobby/scri
  	if player >= 0:
  		player_data[player] = {
  			"device": data.device_id, 
-@@ -383,6 +437,8 @@ func rejoin(data):
+@@ -383,6 +445,8 @@ func rejoin(data):
  	pass
  
  func leave(player_id: int):
@@ -138,7 +146,7 @@ diff --git a/scenes/local_lobby/scripts/local_lobby.gd b/scenes/local_lobby/scri
  	if player_data.has(player_id):
  
  		if player_id == 0:
-@@ -403,7 +459,7 @@ func leave(player_id: int):
+@@ -403,7 +467,7 @@ func leave(player_id: int):
  		players_ready.erase(player_id)
  		player_left.emit(player_id)
  
@@ -147,7 +155,7 @@ diff --git a/scenes/local_lobby/scripts/local_lobby.gd b/scenes/local_lobby/scri
  
  func main_player_left():
  
-@@ -423,7 +479,7 @@ func get_unjoined_devices():
+@@ -423,7 +487,7 @@ func get_unjoined_devices():
  
  func update_player_manager():
  
@@ -156,7 +164,7 @@ diff --git a/scenes/local_lobby/scripts/local_lobby.gd b/scenes/local_lobby/scri
  
  	var presence: PlayerPresence
  	for player_id in player_data.keys():
-@@ -433,6 +489,8 @@ func update_player_manager():
+@@ -433,6 +497,8 @@ func update_player_manager():
  		presence = PlayerPresence.new()
  		presence.local = true
  		presence.local_main = player_data[player_id]["is_main"]
@@ -165,7 +173,7 @@ diff --git a/scenes/local_lobby/scripts/local_lobby.gd b/scenes/local_lobby/scri
  		presence.device_id = player_data[player_id]["device"]
  		presence.using_joystick = player_data[player_id]["is_joystick"]
  		presence.network_name = local_lobby_player_controls[player_id].player_name
-@@ -444,6 +502,7 @@ func update_player_manager():
+@@ -444,6 +510,7 @@ func update_player_manager():
  		]
  		presence.active = false
  		presence.debug_player = false
@@ -173,7 +181,7 @@ diff --git a/scenes/local_lobby/scripts/local_lobby.gd b/scenes/local_lobby/scri
  		presence.set_local()
  
  		PlayerManager.player_presences[player_data[player_id]["device"]] = presence
-@@ -468,6 +527,8 @@ func set_skip_intro_text(skipping_intro: bool):
+@@ -468,6 +535,8 @@ func set_skip_intro_text(skipping_intro: bool):
  
  
  func _on_joy_connection_changed(_device: int, _connected: bool):
@@ -182,7 +190,7 @@ diff --git a/scenes/local_lobby/scripts/local_lobby.gd b/scenes/local_lobby/scri
  
  	for player_id in player_data.keys():
  		var data = player_data[player_id]
-@@ -494,6 +555,8 @@ func _on_player_left(player_id):
+@@ -494,6 +563,8 @@ func _on_player_left(player_id):
  
  func _on_player_ready_changed(_player_id: int, _is_ready: bool):
  
@@ -191,7 +199,7 @@ diff --git a/scenes/local_lobby/scripts/local_lobby.gd b/scenes/local_lobby/scri
  	if players_ready.has(_player_id):
  		players_ready[_player_id] = _is_ready
  
-@@ -505,7 +568,7 @@ func _on_player_ready_changed(_player_id: int, _is_ready: bool):
+@@ -505,7 +576,7 @@ func _on_player_ready_changed(_player_id: int, _is_ready: bool):
  		else:
  			all_ready = false
  
