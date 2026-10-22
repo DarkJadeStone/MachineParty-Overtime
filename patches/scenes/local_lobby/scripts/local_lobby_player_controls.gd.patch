@@ -11,7 +11,7 @@ diff --git a/scenes/local_lobby/scripts/local_lobby_player_controls.gd b/scenes/
  ]
  
  @export var button_cooldown_duration: float = 0.1
-@@ -164,31 +167,14 @@ func connect_clickable_controls():
+@@ -164,31 +167,17 @@ func connect_clickable_controls():
  	)
  
  func set_container_position(set_to_default: bool):
@@ -41,6 +41,9 @@ diff --git a/scenes/local_lobby/scripts/local_lobby_player_controls.gd b/scenes/
 +	set_anchors_preset(Control.PRESET_TOP_LEFT)
 +	scale = Vector2.ONE * 0.65
 +	position = Vector2(12 + seat_index * 118, 235 if set_to_default else 285)
++	# 房主的皇冠是这个 VBox 的一行，会把整张卡往下顶；上移这一行，8 张卡的名字才齐平。
++	if main_player_icon.visible:
++		position.y -= (main_player_icon.get_combined_minimum_size().y + get_theme_constant("separation")) * scale.y
 +	size.x = 170
  
  func set_container_position_name_selection():
@@ -49,7 +52,7 @@ diff --git a/scenes/local_lobby/scripts/local_lobby_player_controls.gd b/scenes/
  
  func set_active_element_from_mouse(_active_element, _direction: int = 0):
  
-@@ -219,6 +205,7 @@ func clear_active_element():
+@@ -219,6 +208,7 @@ func clear_active_element():
  
  func set_player_ready(_is_ready: bool):
  	is_ready = _is_ready
@@ -57,7 +60,7 @@ diff --git a/scenes/local_lobby/scripts/local_lobby_player_controls.gd b/scenes/
  
  	if is_ready:
  		ready_toggle.texture = ready_texture
-@@ -258,7 +245,7 @@ func set_active(
+@@ -258,7 +248,7 @@ func set_active(
  
  	if rejoin_player_data:
  		var customization = rejoin_player_data.get("customization", [
@@ -66,7 +69,7 @@ diff --git a/scenes/local_lobby/scripts/local_lobby_player_controls.gd b/scenes/
  		])
  		customization_assigner.assign_hat(customization[0])
  		customization_assigner.assign_glasses(customization[1])
-@@ -266,7 +253,7 @@ func set_active(
+@@ -266,7 +256,7 @@ func set_active(
  	else:
  		customization_assigner.assign_hat("none")
  		customization_assigner.assign_glasses("none")
@@ -75,17 +78,25 @@ diff --git a/scenes/local_lobby/scripts/local_lobby_player_controls.gd b/scenes/
  
  	for child in get_children():
  		child.visible = false
-@@ -497,8 +484,8 @@ func _on_name_confirmed(_name):
+@@ -495,15 +485,14 @@ func _on_name_confirmed(_name):
+ 	if is_joystick:
+ 		press_speaker.play()
  
- 	set_container_position(true)
- 
+-	set_container_position(true)
+-
 -	name_label.text = _name
  	player_name = _name
 +	_mp8_refresh_identity()
  
  	for child in get_children():
  		child.visible = true
-@@ -514,3 +501,9 @@ func _on_name_confirmed(_name):
+ 
+ 	main_player_icon.visible = main_player
++	set_container_position(true)
+ 
+ 	name_entry_selector.set_inactive()
+ 	name_accept_button.visible = false
+@@ -514,3 +503,10 @@ func _on_name_confirmed(_name):
  
  	active = true
  	can_control = true
@@ -94,4 +105,5 @@ diff --git a/scenes/local_lobby/scripts/local_lobby_player_controls.gd b/scenes/
 +	if assigned_player_id < 0:
 +		return
 +	var device_text: String = "PAD %d" % (device + 1) if is_joystick else "KEYBOARD"
-+	name_label.text = "P%d  %s\n%s  %s" % [assigned_player_id + 1, player_name, device_text, "READY" if is_ready else "NOT READY"]
++	# 三行：两行版里 KEYBOARD  NOT READY 会压进右边那张卡的文字。
++	name_label.text = "P%d  %s\n%s\n%s" % [assigned_player_id + 1, player_name, device_text, "READY" if is_ready else "NOT READY"]

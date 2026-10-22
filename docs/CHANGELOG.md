@@ -4,6 +4,27 @@
 
 历史公告保留当时的版本、范围与验证状态，不代表 1.7 的安装方式或验证结论。各版下载文件以对应 Release 为准。
 
+## 未发布 — 本地大厅 8 人座位
+
+- 本地大厅改用联机大厅的排法：原版 4 个座位不动，第 5–8 位复制第 1–4 位整排前移 (0.2, 0, 5.8)，椅子同样复制一排，摄像机拉远。
+  原来 8 个模型被重新等距排开，但坐姿烘在各自的骨架里，结果人离开椅子，P1 进了左墙，P7、P8 在房间外。
+- 名牌改成三行（P 号与名字 / 设备 / 准备状态）；原来第二行的 `KEYBOARD  NOT READY` 会压进右边那张卡。
+- 房主卡的皇冠不再把整张卡往下顶，8 张卡的名字齐平。
+- 联机握手串仍是 `overtime-1.7`，与 1.7 玩家互通。
+
+> **English — unreleased: 8 seats in the local lobby.**
+>
+> - The local lobby now uses the online lobby's method. The 4 original seats stay as authored. Seats 5–8 are copies of
+>   seats 1–4 in a second row at (0.2, 0, 5.8), with a matching row of chairs, and the camera pulls back. Before, all 8
+>   models were re-spaced in a line, but each seat's pose is baked into its skeleton, so players sat off their chairs,
+>   P1 sat inside the left wall, and P7 and P8 sat outside the room.
+> - Panel labels use three lines (seat and name / device / ready state). On two lines, `KEYBOARD  NOT READY` ran into
+>   the next panel's text.
+> - The host's crown no longer pushes that panel down, so all 8 names sit at one height.
+> - The handshake tag is still `overtime-1.7`, so it plays online with 1.7 players.
+
+---
+
 ## 1.7 — 本地同屏、渐变外观与安装器重构
 
 - 新增本地 5–8 人席位与分屏，保留设备身份，完善猎鸭双猎人视角。
